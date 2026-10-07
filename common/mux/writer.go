@@ -18,7 +18,6 @@ type Writer struct {
 	transferType protocol.TransferType
 	globalID     [8]byte
 	inbound      *session.Inbound
-	counter      *Counter
 }
 
 func NewWriter(id uint16, dest net.Destination, writer buf.Writer, transferType protocol.TransferType, globalID [8]byte, inbound *session.Inbound) *Writer {
@@ -66,13 +65,7 @@ func (w *Writer) writeMetaOnly() error {
 	if err := meta.WriteTo(b); err != nil {
 		return err
 	}
-	if err := w.writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
-		return err
-	}
-	if w.counter != nil && meta.SessionStatus == SessionStatusNew {
-		w.counter.Next()
-	}
-	return nil
+	return w.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 }
 
 func writeMetaWithFrame(writer buf.Writer, meta FrameMetadata, data buf.MultiBuffer) error {
@@ -97,13 +90,7 @@ func (w *Writer) writeData(mb buf.MultiBuffer) error {
 	meta := w.getNextFrameMeta()
 	meta.Option.Set(OptionData)
 
-	if err := writeMetaWithFrame(w.writer, meta, mb); err != nil {
-		return err
-	}
-	if w.counter != nil {
-		w.counter.Next()
-	}
-	return nil
+	return writeMetaWithFrame(w.writer, meta, mb)
 }
 
 // WriteMultiBuffer implements buf.Writer.
@@ -145,8 +132,5 @@ func (w *Writer) Close() error {
 	common.Must(meta.WriteTo(frame))
 
 	w.writer.WriteMultiBuffer(buf.MultiBuffer{frame})
-	if w.counter != nil && meta.SessionStatus == SessionStatusEnd {
-		w.counter.Next()
-	}
 	return nil
 }

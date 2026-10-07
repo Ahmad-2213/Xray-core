@@ -96,6 +96,8 @@ type ServerWorker struct {
 	resumeHasToken bool
 	resumeUser     string
 	resumeEpoch    uint64
+	gate           *carrierGate
+	ackMu          ackState
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
@@ -116,7 +118,6 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
-	writer.counter = s.tx
 	if err := buf.Copy(s.input, writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
@@ -124,6 +125,15 @@ func handle(ctx context.Context, s *Session, output buf.Writer) {
 
 	writer.Close()
 	s.Close(false)
+}
+
+// out returns the stable response-write target: the gate once a v2
+// Resume was seen, the raw carrier pipe otherwise.
+func (w *ServerWorker) out() buf.Writer {
+	if w.gate != nil {
+		return w.gate
+	}
+	return w.link.Writer
 }
 
 func (w *ServerWorker) monitor() {
@@ -264,7 +274,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			x.Mux.Close(false)
 			return errors.New("failed to add new session")
 		}
-		go handle(ctx, x.Mux, w.link.Writer)
+		go handle(ctx, x.Mux, w.out())
 		return nil
 	}
 
@@ -281,7 +291,6 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		parent:       w.sessionManager,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
-		tx:           &w.tx,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
@@ -290,7 +299,8 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		s.Close(false)
 		return errors.New("failed to add new session")
 	}
-	go handle(ctx, s, w.link.Writer)
+	w.countRx(meta)
+	go handle(ctx, s, w.out())
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
@@ -309,6 +319,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
+	w.countRx(meta)
 
 	s, found := w.sessionManager.Get(meta.SessionID)
 	if !found {
@@ -332,6 +343,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 }
 
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	w.countRx(meta)
 	if s, found := w.sessionManager.Get(meta.SessionID); found {
 		s.Close(false)
 	}
@@ -373,8 +385,11 @@ func (w *ServerWorker) handleFrame(ctx context.Context, reader *buf.BufferedRead
 }
 
 func (w *ServerWorker) run(ctx context.Context) {
+	parked := false
 	defer func() {
-		common.Must(w.done.Close())
+		if !parked {
+			common.Must(w.done.Close())
+		}
 	}()
 
 	reader := &buf.BufferedReader{Reader: w.link.Reader}
@@ -393,6 +408,7 @@ func (w *ServerWorker) run(ctx context.Context) {
 			err := w.handleFrame(ctx, reader)
 			if err != nil {
 				if w.parkForResume(ctx) {
+					parked = true
 					return
 				}
 				if errors.Cause(err) != io.EOF {
@@ -421,7 +437,9 @@ func (w *ServerWorker) tryRecordAnnounce(ctx context.Context, reader *buf.Buffer
 
 // parkForResume suspends instead of closing when a v2 token is known:
 // the session table is handed to the handover map for 10s so a fresh
-// carrier Resume can adopt it. Returns true when parked.
+// carrier Resume can adopt it. The manager is swapped so the monitor
+// closes nothing; pipes are interrupted (retained bytes replay later).
+// Returns true when parked.
 func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if !w.resumeHasToken {
 		return false
@@ -430,12 +448,27 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if user == "" {
 		user = serverUserOf(ctx)
 	}
+	if w.gate != nil {
+		w.gate.setSuspended(true)
+	}
 	hsPut(w.resumeToken, &suspendedWorker{
 		manager: w.sessionManager,
-		tx:      w.tx.Value(),
+		gate:    w.gate,
+		tx:      w.gateTx(),
 		rx:      w.rx.Value(),
 		epoch:   w.resumeEpoch,
 		user:    user,
 	})
+	w.sessionManager = NewSessionManager()
+	common.Interrupt(w.link.Writer)
+	common.Interrupt(w.link.Reader)
 	return true
+}
+
+// gateTx returns transmitted frames (0 when no gate yet).
+func (w *ServerWorker) gateTx() uint64 {
+	if w.gate == nil {
+		return 0
+	}
+	return w.gate.TxCount()
 }

@@ -187,7 +187,6 @@ type Session struct {
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
-	tx           *Counter
 }
 
 // Close closes all resources associated with this session.
