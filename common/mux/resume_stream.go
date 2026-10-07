@@ -77,6 +77,7 @@ func CountedFrameForTest(status SessionStatus, opt bitmask.Byte, metaLen int, ne
 func ParseMetaPrefixForTest(b []byte) (SessionStatus, bitmask.Byte, int, byte, bool, bool) {
 	return parseMetaPrefix(b)
 }
+
 type storedFrame struct {
 	seq uint64
 	sid uint16

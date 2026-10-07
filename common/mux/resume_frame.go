@@ -76,6 +76,7 @@ func EncodeAckForTest(p AckPayload) *buf.Buffer { return encodeAck(p) }
 func ValidateRebindForTest(entryTx, entryEpoch uint64, entryUser string, rp ResumePayload, user string) error {
 	return validateRebind(entryTx, entryEpoch, entryUser, rp, user)
 }
+
 func HalfOpenTrippedForTest(unacked int64, idle, timeout time.Duration) bool {
 	return halfOpenTripped(unacked, idle, timeout)
 }
