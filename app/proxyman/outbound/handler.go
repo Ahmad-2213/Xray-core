@@ -126,6 +126,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				config.Concurrency = 8 // same as before
 			}
 			if config.Concurrency > 0 {
+				resume := mux.LookupResumePolicy(h.tag)
 				h.mux = &mux.ClientManager{
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
@@ -136,6 +137,8 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 								MaxConcurrency: uint32(config.Concurrency),
 								MaxConnection:  128,
 							},
+							Resume:      resume,
+							OutboundTag: h.tag,
 						},
 					},
 				}
@@ -147,6 +150,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				h.xudp = nil // same as before
 			}
 			if config.XudpConcurrency > 0 {
+				resume := mux.LookupResumePolicy(h.tag)
 				h.xudp = &mux.ClientManager{
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
@@ -157,6 +161,8 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 								MaxConcurrency: uint32(config.XudpConcurrency),
 								MaxConnection:  128,
 							},
+							Resume:      resume,
+							OutboundTag: h.tag,
 						},
 					},
 				}
