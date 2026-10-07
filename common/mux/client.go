@@ -163,7 +163,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		meta.Option.Set(OptionData)
 		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch, RxCount: 0})
 		if err := writeMetaWithFrame(upLinkWriter, meta, buf.MultiBuffer{payload}); err != nil {
-			payload.Release()
+			// WriteMultiBuffer owns the buffer on all paths; just fall back.
 			useV2 = false
 			target = muxCoolAddress
 		}
@@ -508,8 +508,8 @@ func (m *ClientWorker) maybeSendAck() {
 
 	meta := FrameMetadata{SessionStatus: SessionStatusAck}
 	meta.Option.Set(OptionData)
+	// Ownership transfers to WriteMultiBuffer (releases on all paths).
 	payload := encodeAck(AckPayload{RxCount: count})
-	defer payload.Release()
 	_ = writeMetaWithFrame(m.link.Writer, meta, buf.MultiBuffer{payload})
 }
 
