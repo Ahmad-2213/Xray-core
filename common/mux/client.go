@@ -2,7 +2,6 @@ package mux
 
 import (
 	"context"
-	goerrors "errors"
 	"io"
 	"sync"
 	"sync/atomic"

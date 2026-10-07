@@ -153,12 +153,12 @@ func (m *ClientWorker) startSupervisor(p proxy.Outbound, d internet.Dialer, targ
 				common.Must(m.done.Close())
 				return
 			}
-			d := delays[di%len(delays)]
+			dl := delays[di%len(delays)]
 			di++
 			select {
 			case <-m.done.Wait():
 				return
-			case <-time.After(d):
+			case <-time.After(dl):
 			}
 			m.redialAttempt(p, d, target)
 		}
