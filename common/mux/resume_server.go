@@ -32,9 +32,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if len(mb) == 0 || len(mb[0].Bytes()) < resumePayloadLen {
 		return errors.New("short resume payload")
 	}
-	b := &buf.Buffer{}
-	b.Write(mb[0].Bytes())
-	rp, err := decodeResume(b)
+	rp, err := decodeResume(mb[0].Bytes())
 	if err != nil {
 		return err
 	}

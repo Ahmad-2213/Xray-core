@@ -36,15 +36,15 @@ func encodeResume(p ResumePayload) *buf.Buffer {
 	return b
 }
 
-func decodeResume(b *buf.Buffer) (ResumePayload, error) {
-	var p ResumePayload
-	if b.Len() < resumePayloadLen {
-		return p, errors.New("short resume payload: ", b.Len())
+func decodeResume(p []byte) (ResumePayload, error) {
+	var r ResumePayload
+	if len(p) < resumePayloadLen {
+		return r, errors.New("short resume payload: ", len(p))
 	}
-	copy(p.Token[:], b.BytesRange(0, 16))
-	p.Epoch = binary.BigEndian.Uint64(b.BytesRange(16, 24))
-	p.RxCount = binary.BigEndian.Uint64(b.BytesRange(24, 32))
-	return p, nil
+	copy(r.Token[:], p[:16])
+	r.Epoch = binary.BigEndian.Uint64(p[16:24])
+	r.RxCount = binary.BigEndian.Uint64(p[24:32])
+	return r, nil
 }
 
 func encodeAck(p AckPayload) *buf.Buffer {
@@ -54,11 +54,15 @@ func encodeAck(p AckPayload) *buf.Buffer {
 	return b
 }
 
-func decodeAck(b *buf.Buffer) (AckPayload, error) {
-	var p AckPayload
-	if b.Len() < ackPayloadLen {
-		return p, errors.New("short ack payload: ", b.Len())
+func decodeAck(p []byte) (AckPayload, error) {
+	var a AckPayload
+	if len(p) < ackPayloadLen {
+		return a, errors.New("short ack payload: ", len(p))
 	}
-	p.RxCount = binary.BigEndian.Uint64(b.BytesRange(0, 8))
-	return p, nil
+	a.RxCount = binary.BigEndian.Uint64(p[:8])
+	return a, nil
 }
+
+// Exported for unit tests (package mux_test).
+func DecodeResumeForTest(p []byte) (ResumePayload, error) { return decodeResume(p) }
+func DecodeAckForTest(p []byte) (AckPayload, error)       { return decodeAck(p) }

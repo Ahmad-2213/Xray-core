@@ -38,3 +38,12 @@ func TestResumeRegistry(t *testing.T) {
 		t.Fatal("default must stay disabled")
 	}
 }
+
+func TestResumeFrameRejectsShort(t *testing.T) {
+	if _, err := mux.DecodeResumeForTest([]byte{1, 2, 3}); err == nil {
+		t.Fatal("short resume payload must be rejected")
+	}
+	if _, err := mux.DecodeAckForTest([]byte{1}); err == nil {
+		t.Fatal("short ack payload must be rejected")
+	}
+}
