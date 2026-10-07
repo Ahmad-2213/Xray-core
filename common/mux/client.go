@@ -260,6 +260,7 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 		}
 		c.gate = newCarrierGate(stream.Writer, c.done.Wait(), policy)
 	}
+	c.attachCarrier(stream.Writer, stream.Reader)
 
 	go c.fetchOutput()
 	go c.monitor()
