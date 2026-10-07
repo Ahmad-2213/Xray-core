@@ -83,7 +83,7 @@ type carrierGate struct {
 	policy    ResumePolicy
 
 	tx             Counter
-	store          []storedFrame
+	frames         []storedFrame
 	baseSeq        uint64
 	storedByte     int64
 	onCarrierError func()
@@ -155,10 +155,10 @@ func (g *carrierGate) swapTarget(t buf.Writer) {
 // ack frees retained frames up to n (cumulative) and unblocks writers.
 func (g *carrierGate) ack(n uint64) {
 	g.mu.Lock()
-	for len(g.store) > 0 && g.store[0].seq <= n {
-		g.storedByte -= int64(len(g.store[0].raw))
-		g.store[0].raw = nil
-		g.store = g.store[1:]
+	for len(g.frames) > 0 && g.frames[0].seq <= n {
+		g.storedByte -= int64(len(g.frames[0].raw))
+		g.frames[0].raw = nil
+		g.frames = g.frames[1:]
 		g.baseSeq++
 	}
 	g.mu.Unlock()
@@ -173,13 +173,6 @@ func (g *carrierGate) lastAckRecv() time.Time {
 	g.ackRecvMu.Lock()
 	defer g.ackRecvMu.Unlock()
 	return g.lastAckTime
-}
-
-// setOnCarrierError installs the detector callback (park + interrupt).
-func (g *carrierGate) setOnCarrierError(f func()) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.onCarrierError = f
 }
 
 // WriteMultiBuffer stores counted frames (private copies) and forwards.
@@ -283,7 +276,7 @@ func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 	g.tx.n++
 	seq := g.tx.n
 	g.tx.mu.Unlock()
-	g.store = append(g.store, storedFrame{seq: seq, sid: sid, raw: raw})
+	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw})
 	g.storedByte += int64(len(raw))
 	g.mu.Unlock()
 	return seq, true, nil
@@ -293,7 +286,7 @@ func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 func (g *carrierGate) rawCopyOf(seq uint64) ([]byte, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for _, f := range g.store {
+	for _, f := range g.frames {
 		if f.seq == seq {
 			cp := make([]byte, len(f.raw))
 			copy(cp, f.raw)
@@ -396,7 +389,7 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	}
 	target := g.target
 	var frames [][]byte
-	for _, f := range g.store {
+	for _, f := range g.frames {
 		if f.seq > peerRx {
 			cp := make([]byte, len(f.raw))
 			copy(cp, f.raw)

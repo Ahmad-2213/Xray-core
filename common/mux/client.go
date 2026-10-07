@@ -264,9 +264,6 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 
 	go c.fetchOutput()
 	go c.monitor()
-	if policy.Enabled {
-		go c.watchHalfOpen()
-	}
 
 	return c, nil
 }
