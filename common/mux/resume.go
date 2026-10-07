@@ -21,6 +21,8 @@ import (
 	"crypto/rand"
 	"sync"
 	"time"
+
+	"github.com/xtls/xray-core/common/errors"
 )
 
 // Session status extensions for resume. v1 statuses 0x01-0x04 are untouched.
@@ -112,6 +114,29 @@ func tokenString(t [16]byte) string {
 func (m *ClientWorker) tokenString() string { return tokenString(m.token) }
 
 func (w *ServerWorker) tokenString() string { return tokenString(w.resumeToken) }
+
+// validateRebind guards adoption of a parked worker: epochs must advance
+// (replays/duplicates rejected), the peer may not claim more than we sent,
+// and the rebind must carry the same user the park was bound to.
+func validateRebind(entryTx, entryEpoch uint64, entryUser string, rp ResumePayload, user string) error {
+	if entryUser != "" && user != "" && entryUser != user {
+		return errors.New("resume user mismatch")
+	}
+	if rp.Epoch <= entryEpoch {
+		return errors.New("stale resume epoch")
+	}
+	if rp.RxCount > entryTx {
+		return errors.New("resume count beyond sent")
+	}
+	return nil
+}
+
+// halfOpenTripped fires the unilateral half-open detector: bytes retained
+// (unacked) while no Ack arrived for longer than the timeout means the read
+// side is stalled even though writes succeed.
+func halfOpenTripped(unacked int64, idle, timeout time.Duration) bool {
+	return unacked > 0 && idle > timeout
+}
 
 // NewToken generates an unguessable 128-bit resume token. It must be bound
 // by the caller to the authenticated (VLESS) user session: the server only

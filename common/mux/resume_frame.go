@@ -6,6 +6,7 @@ package mux
 
 import (
 	"encoding/binary"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -64,5 +65,17 @@ func decodeAck(p []byte) (AckPayload, error) {
 }
 
 // Exported for unit tests (package mux_test).
-func DecodeResumeForTest(p []byte) (ResumePayload, error) { return decodeResume(p) }
-func DecodeAckForTest(p []byte) (AckPayload, error)       { return decodeAck(p) }
+func DecodeResumeForTest(p []byte) (ResumePayload, error) {
+	return decodeResume(p)
+}
+func DecodeAckForTest(p []byte) (AckPayload, error) { return decodeAck(p) }
+func EncodeResumeForTest(p ResumePayload) *buf.Buffer {
+	return encodeResume(p)
+}
+func EncodeAckForTest(p AckPayload) *buf.Buffer { return encodeAck(p) }
+func ValidateRebindForTest(entryTx, entryEpoch uint64, entryUser string, rp ResumePayload, user string) error {
+	return validateRebind(entryTx, entryEpoch, entryUser, rp, user)
+}
+func HalfOpenTrippedForTest(unacked int64, idle, timeout time.Duration) bool {
+	return halfOpenTripped(unacked, idle, timeout)
+}

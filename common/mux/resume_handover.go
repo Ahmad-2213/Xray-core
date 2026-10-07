@@ -84,3 +84,41 @@ func hsPutBack(token [16]byte, e *suspendedWorker) {
 	e.expires = time.Now().Add(hsTTL)
 	hsEntries[token] = e
 }
+
+// Test hooks (package mux_test). Tokens are the only shared key; entries
+// stay unexported. Reset first: the table is process-global.
+func HsResetForTest() {
+	hsMu.Lock()
+	defer hsMu.Unlock()
+	hsEntries = make(map[[16]byte]*suspendedWorker)
+}
+
+func HsLenForTest() int {
+	hsMu.Lock()
+	defer hsMu.Unlock()
+	return len(hsEntries)
+}
+
+func HsPutForTest(token [16]byte, tx, rx, epoch uint64, user string) {
+	hsPut(token, &suspendedWorker{tx: tx, rx: rx, epoch: epoch, user: user})
+}
+
+func HsPeekForTest(token [16]byte) (tx, rx, epoch uint64, user string, ok bool) {
+	e, ok := hsPeek(token)
+	if !ok {
+		return 0, 0, 0, "", false
+	}
+	return e.tx, e.rx, e.epoch, e.user, true
+}
+
+func HsTakeForTest(token [16]byte) (tx, rx, epoch uint64, user string, ok bool) {
+	e, ok := hsTake(token)
+	if !ok {
+		return 0, 0, 0, "", false
+	}
+	return e.tx, e.rx, e.epoch, e.user, true
+}
+
+func HsPutBackForTest(token [16]byte, tx, rx, epoch uint64, user string) {
+	hsPutBack(token, &suspendedWorker{tx: tx, rx: rx, epoch: epoch, user: user})
+}

@@ -69,6 +69,14 @@ func parseMetaPrefix(b []byte) (status SessionStatus, opt bitmask.Byte, metaLen 
 	return status, opt, metaLen, netByte, hasNet, true
 }
 
+// Exported for unit tests (package mux_test).
+func CountedFrameForTest(status SessionStatus, opt bitmask.Byte, metaLen int, netByte byte, hasNet bool) bool {
+	return countedFrame(status, opt, metaLen, netByte, hasNet)
+}
+
+func ParseMetaPrefixForTest(b []byte) (SessionStatus, bitmask.Byte, int, byte, bool, bool) {
+	return parseMetaPrefix(b)
+}
 type storedFrame struct {
 	seq uint64
 	sid uint16

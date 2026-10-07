@@ -97,17 +97,9 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		if !ok {
 			return errors.New("expired resume token")
 		}
-		if entry.user != "" && user != "" && entry.user != user {
+		if err := validateRebind(entry.tx, entry.epoch, entry.user, rp, user); err != nil {
 			hsPutBack(rp.Token, entry)
-			return errors.New("resume user mismatch")
-		}
-		if rp.Epoch <= entry.epoch {
-			hsPutBack(rp.Token, entry)
-			return errors.New("stale resume epoch")
-		}
-		if rp.RxCount > entry.tx {
-			hsPutBack(rp.Token, entry)
-			return errors.New("resume count beyond sent")
+			return err
 		}
 		// Adopt the parked table, gate (with retain store) and rx baseline.
 		entry.manager.Reparent(w.sessionManager)
@@ -201,7 +193,7 @@ func (w *ServerWorker) watchHalfOpen() {
 		if w.gate == nil || w.done.Done() {
 			continue
 		}
-		if w.gate.UnackedBytes() > 0 && time.Since(w.gate.lastAckRecv()) > 4*time.Second {
+		if halfOpenTripped(w.gate.UnackedBytes(), time.Since(w.gate.lastAckRecv()), 4*time.Second) {
 			// Park via a synthetic path: reuse run()'s park by closing
 			// nothing, just parking directly.
 			w.parkForResume(context.Background())

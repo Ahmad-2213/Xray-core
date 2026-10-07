@@ -280,7 +280,7 @@ func (m *ClientWorker) watchHalfOpen(p proxy.Outbound, d internet.Dialer, target
 		if timeout <= 0 {
 			timeout = 4 * time.Second
 		}
-		if m.gate.UnackedBytes() > 0 && time.Since(m.gate.lastAckRecv()) > timeout {
+		if halfOpenTripped(m.gate.UnackedBytes(), time.Since(m.gate.lastAckRecv()), timeout) {
 			m.enterSuspend()
 			m.startSupervisor(p, d, target)
 		}
