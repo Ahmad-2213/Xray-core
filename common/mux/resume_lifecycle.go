@@ -44,6 +44,21 @@ func banV2(host string, ttl time.Duration) {
 	noV2Until[host] = time.Now().Add(ttl)
 }
 
+// shouldFallbackV1 detects a carrier that died before a single counted
+// frame in either direction: the peer is not v2 (old server), so the worker
+// must close and let fresh workers use v1 instead of suspending pointlessly.
+func shouldFallbackV1(tx, rx uint64, age time.Duration) bool {
+	return tx == 0 && rx == 0 && age < 5*time.Second
+}
+
+func BanV2ForTest(host string, ttl time.Duration) { banV2(host, ttl) }
+
+func IsV2BannedForTest(host string) bool { return isV2Banned(host) }
+
+func ShouldFallbackV1ForTest(tx, rx uint64, age time.Duration) bool {
+	return shouldFallbackV1(tx, rx, age)
+}
+
 // out returns the stable session-write target: the gate when resume is
 // enabled, the raw carrier pipe otherwise.
 func (m *ClientWorker) out() buf.Writer {
@@ -119,7 +134,7 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 	}
 	// Instant-death handshake failure (e.g. old server): ban v2 so fresh
 	// workers fall back, instead of suspending pointlessly.
-	if m.gate.TxCount() == 0 && m.rx.Value() == 0 && time.Since(m.createdAt) < 5*time.Second {
+	if shouldFallbackV1(m.gate.TxCount(), m.rx.Value(), time.Since(m.createdAt)) {
 		banV2(muxCoolAddressV2.String(), m.resume.NoV2CacheTTL)
 		common.Must(m.done.Close())
 		return

@@ -1,12 +1,19 @@
 package mux_test
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/common/bitmask"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/mux"
+	"github.com/xtls/xray-core/common/net"
 )
 
 func TestResumePolicyDefaults(t *testing.T) {
@@ -270,5 +277,277 @@ func TestHalfOpenTrippedMatrix(t *testing.T) {
 	}
 	if mux.HalfOpenTrippedForTest(100, 0, 4*time.Second) {
 		t.Fatal("fresh acks must not trip")
+	}
+}
+
+// ---- Phase 3: gate fault injection over a scripted carrier ----
+
+var errTestCarrierDead = errors.New("test carrier dead")
+
+type flakyCarrierForTest struct {
+	mu       sync.Mutex
+	failLeft int
+	frames   [][]byte
+}
+
+func (w *flakyCarrierForTest) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	var raw []byte
+	for _, b := range mb {
+		raw = append(raw, b.Bytes()...)
+	}
+	buf.ReleaseMulti(mb)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.failLeft > 0 {
+		w.failLeft--
+		return errTestCarrierDead
+	}
+	w.frames = append(w.frames, raw)
+	return nil
+}
+
+func (w *flakyCarrierForTest) recorded() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.frames...)
+}
+
+func countedFrameBytesForTest(t *testing.T, sid uint16, status mux.SessionStatus, payload string) buf.MultiBuffer {
+	t.Helper()
+	meta := mux.FrameMetadata{SessionID: sid, SessionStatus: status, Option: mux.OptionData}
+	if status == mux.SessionStatusNew {
+		meta.Target = net.TCPDestination(net.DomainAddress("example.com"), 80)
+	}
+	b := buf.New()
+	if err := meta.WriteTo(b); err != nil {
+		t.Fatal("meta WriteTo failed:", err)
+	}
+	if payload == "" {
+		return buf.MultiBuffer{b}
+	}
+	p := buf.New()
+	if _, err := p.Write([]byte(payload)); err != nil {
+		t.Fatal("payload write failed:", err)
+	}
+	return buf.MultiBuffer{b, p}
+}
+
+func TestGateTransientLossRetriedInOrder(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{failLeft: 3}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	for i := 1; i <= 5; i++ {
+		mb := countedFrameBytesForTest(t, uint16(i), mux.SessionStatusNew, fmt.Sprintf("msg-%d", i))
+		if err := g.WriteMultiBuffer(mb); err != nil {
+			t.Fatalf("frame %d not absorbed: %v", i, err)
+		}
+	}
+	if got := g.TxCount(); got != 5 {
+		t.Fatalf("TxCount = %d, want 5", got)
+	}
+	frames := carrier.recorded()
+	if len(frames) != 5 {
+		t.Fatalf("recorded %d frames, want exactly 5 (no loss, no dup)", len(frames))
+	}
+	for i, f := range frames {
+		if want := fmt.Sprintf("msg-%d", i+1); !bytes.Contains(f, []byte(want)) {
+			t.Fatalf("frame %d out of order or corrupt: %q", i, f)
+		}
+	}
+	if g.UnackedBytes() == 0 {
+		t.Fatal("retained bytes must stay until acked")
+	}
+	mux.GateAckForTest(g, 5)
+	if g.UnackedBytes() != 0 {
+		t.Fatal("full ack must free all retained bytes")
+	}
+}
+
+func TestGateSuspendBlocksUntilResume(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	mux.GateSuspendForTest(g, true)
+	res := make(chan error, 1)
+	go func() {
+		res <- g.WriteMultiBuffer(countedFrameBytesForTest(t, 1, mux.SessionStatusNew, "held"))
+	}()
+	select {
+	case err := <-res:
+		t.Fatalf("write passed while suspended: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if len(carrier.recorded()) != 0 {
+		t.Fatal("nothing may forward while suspended")
+	}
+	mux.GateSuspendForTest(g, false)
+	select {
+	case err := <-res:
+		if err != nil {
+			t.Fatal("write failed after resume:", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write stuck after resume")
+	}
+	frames := carrier.recorded()
+	if len(frames) != 1 || !bytes.Contains(frames[0], []byte("held")) {
+		t.Fatalf("resumed write lost or duplicated: %q", frames)
+	}
+	mux.GateAckForTest(g, 1)
+	if g.UnackedBytes() != 0 {
+		t.Fatal("ack must free the resumed frame")
+	}
+}
+
+func TestGateAckFreesAndFlushReplaysSuffix(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	for i := 1; i <= 3; i++ {
+		mb := countedFrameBytesForTest(t, uint16(i), mux.SessionStatusKeep, fmt.Sprintf("k%d", i))
+		if err := g.WriteMultiBuffer(mb); err != nil {
+			t.Fatalf("frame %d not absorbed: %v", i, err)
+		}
+	}
+	before := g.UnackedBytes()
+	if before == 0 {
+		t.Fatal("nothing retained")
+	}
+	mux.GateAckForTest(g, 2)
+	after := g.UnackedBytes()
+	if after == 0 || after >= before {
+		t.Fatalf("partial ack must free a prefix: before %d after %d", before, after)
+	}
+	rebind := &flakyCarrierForTest{}
+	mux.GateSwapTargetForTest(g, rebind)
+	if err := mux.GateFlushSinceForTest(g, 2); err != nil {
+		t.Fatal("flush failed:", err)
+	}
+	frames := rebind.recorded()
+	if len(frames) != 1 || !bytes.Contains(frames[0], []byte("k3")) {
+		t.Fatalf("rebind must replay exactly the unacked suffix: %q", frames)
+	}
+}
+
+func TestGateCapBlocksUntilDone(t *testing.T) {
+	policy := mux.DefaultResumePolicy()
+	policy.MaxWorkerBuffer = 16
+	done := make(chan struct{})
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, policy)
+	res := make(chan error, 1)
+	go func() {
+		mb := countedFrameBytesForTest(t, 1, mux.SessionStatusNew, "this-payload-far-exceeds-sixteen-bytes")
+		res <- g.WriteMultiBuffer(mb)
+	}()
+	select {
+	case err := <-res:
+		t.Fatalf("cap-blocked write returned early: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(done)
+	select {
+	case err := <-res:
+		if err == nil {
+			t.Fatal("closed worker must surface an error, not success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cap-blocked write ignored worker close")
+	}
+}
+
+func TestGateAckCoalescedWhileSuspended(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	mux.GateSuspendForTest(g, true)
+	mux.GateWriteAckForTest(g, 3)
+	mux.GateWriteAckForTest(g, 7)
+	mux.GateWriteAckForTest(g, 6)
+	if err := mux.GateFlushSinceForTest(g, 99); err != nil {
+		t.Fatal("flush failed:", err)
+	}
+	var all []byte
+	for _, f := range carrier.recorded() {
+		all = append(all, f...)
+	}
+	if len(all) < 8 {
+		t.Fatalf("coalesced ack missing: %d bytes", len(all))
+	}
+	if got := binary.BigEndian.Uint64(all[len(all)-8:]); got != 7 {
+		t.Fatalf("coalesced ack = %d, want latest (7)", got)
+	}
+}
+
+// ---- Phase 3: v1/v2 interop matrix ----
+
+func TestV2StatusesDoNotAliasV1(t *testing.T) {
+	if byte(mux.SessionStatusResume) != 0x05 || byte(mux.SessionStatusAck) != 0x06 {
+		t.Fatal("v2 statuses must stay 0x05/0x06")
+	}
+	for _, s := range []mux.SessionStatus{mux.SessionStatusNew, mux.SessionStatusKeep, mux.SessionStatusEnd, mux.SessionStatusKeepAlive} {
+		if s == mux.SessionStatusResume || s == mux.SessionStatusAck {
+			t.Fatalf("v1 status %02x aliases a v2 status", byte(s))
+		}
+	}
+	// v1 parsers read v2 metas structurally (fail-fast happens at dispatch,
+	// never at parse): sid/status/option survive a WriteTo round trip.
+	for _, status := range []mux.SessionStatus{mux.SessionStatusResume, mux.SessionStatusAck} {
+		meta := mux.FrameMetadata{SessionID: 9, SessionStatus: status, Option: mux.OptionData}
+		b := buf.New()
+		if err := meta.WriteTo(b); err != nil {
+			t.Fatal("v2 meta WriteTo failed:", err)
+		}
+		raw := append([]byte(nil), b.Bytes()...)
+		b.Release()
+		nb := buf.New()
+		if _, err := nb.Write(raw[2:]); err != nil {
+			t.Fatal("buffer fill failed:", err)
+		}
+		var back mux.FrameMetadata
+		if err := back.UnmarshalFromBuffer(nb, false); err != nil {
+			t.Fatal("v1 parser must read v2 meta structurally:", err)
+		}
+		nb.Release()
+		if back.SessionID != 9 || back.SessionStatus != status || back.Option != mux.OptionData {
+			t.Fatalf("v2 meta corrupted: %+v", back)
+		}
+	}
+}
+
+func TestV2BanTTL(t *testing.T) {
+	host := "v2ban-test.invalid"
+	if mux.IsV2BannedForTest(host) {
+		t.Fatal("fresh host must not be banned")
+	}
+	mux.BanV2ForTest(host, 50*time.Millisecond)
+	if !mux.IsV2BannedForTest(host) {
+		t.Fatal("ban must apply")
+	}
+	if mux.IsV2BannedForTest("other.invalid") {
+		t.Fatal("ban must be per-host")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if mux.IsV2BannedForTest(host) {
+		t.Fatal("ban must expire")
+	}
+}
+
+func TestFallbackV1Matrix(t *testing.T) {
+	if !mux.ShouldFallbackV1ForTest(0, 0, time.Second) {
+		t.Fatal("instant-death handshake must fall back to v1")
+	}
+	if mux.ShouldFallbackV1ForTest(0, 0, 6*time.Second) {
+		t.Fatal("old carrier must not fall back")
+	}
+	if mux.ShouldFallbackV1ForTest(1, 0, time.Second) {
+		t.Fatal("frames sent means v2 works")
+	}
+	if mux.ShouldFallbackV1ForTest(0, 5, time.Second) {
+		t.Fatal("frames received means v2 works")
 	}
 }
