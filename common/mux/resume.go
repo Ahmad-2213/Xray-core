@@ -134,3 +134,10 @@ func (c *Counter) Value() uint64 {
 	defer c.mu.Unlock()
 	return c.n
 }
+
+// Set overwrites the counter, used when adopting another worker's baseline.
+func (c *Counter) Set(v uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n = v
+}

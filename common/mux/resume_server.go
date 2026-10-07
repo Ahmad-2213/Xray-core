@@ -2,13 +2,15 @@ package mux
 
 // Server-side Resume/Ack handling. Resume arrives as the first frame of a
 // fresh v2 carrier and rebinds a suspended worker's sessions; Ack only
-// advances accounting in Phase 1 (no retain store yet).
+// advances accounting.
 
 import (
 	"context"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
 )
 
 func serverUserOf(ctx context.Context) string {
@@ -18,6 +20,55 @@ func serverUserOf(ctx context.Context) string {
 		}
 	}
 	return ""
+}
+
+// countRx applies the shared counting rule to received frames. New is
+// counted by the caller only after successful dispatch (a failed dispatch
+// kills the worker today; counting it would ack a never-created session and
+// hang the client stream on rebind instead of failing it).
+func (w *ServerWorker) countRx(meta *FrameMetadata) {
+	switch meta.SessionStatus {
+	case SessionStatusNew:
+		if meta.Target.Network == net.Network_TCP {
+			w.rx.Next()
+			w.maybeSendAck()
+		}
+	case SessionStatusKeep:
+		if !meta.Option.Has(OptionData) {
+			return
+		}
+		if meta.Target.Network == net.Network_UDP {
+			return
+		}
+		w.rx.Next()
+		w.maybeSendAck()
+	case SessionStatusEnd:
+		w.rx.Next()
+		w.maybeSendAck()
+	}
+}
+
+// maybeSendAck emits Ack{rxCount} throttled, via the gate once present.
+func (w *ServerWorker) maybeSendAck() {
+	if w.gate == nil {
+		return
+	}
+	intervalMs := int64(500)
+	now := time.Now()
+	w.ackMu.mu.Lock()
+	if now.Sub(w.ackMu.lastTime) < time.Duration(intervalMs)*time.Millisecond {
+		w.ackMu.mu.Unlock()
+		return
+	}
+	count := w.rx.Value()
+	if count == w.ackMu.lastSent {
+		w.ackMu.mu.Unlock()
+		return
+	}
+	w.ackMu.lastSent = count
+	w.ackMu.lastTime = now
+	w.ackMu.mu.Unlock()
+	w.gate.writeAck(count)
 }
 
 func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -36,16 +87,24 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if err != nil {
 		return err
 	}
-	w.rx.Next()
 
 	user := serverUserOf(context.Background())
 
 	if !w.resumeHasToken {
-		// First sight: announce. Remember the token; park on carrier loss.
+		// First sight: announce. Remember the token, create the gate so
+		// all later frames on this carrier are counted/retained, and
+		// park on carrier loss.
 		w.resumeToken = rp.Token
 		w.resumeEpoch = rp.Epoch
 		w.resumeHasToken = true
 		w.resumeUser = user
+		if w.gate == nil {
+			w.gate = newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+			w.gate.setOnCarrierError(func() {
+				w.parkForResume(context.Background())
+			})
+		}
+		go w.watchHalfOpen()
 		return nil
 	}
 
@@ -63,11 +122,31 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if rp.RxCount > entry.tx {
 		return errors.New("resume count beyond sent")
 	}
+	// Adopt the parked table, gate (with retain store) and rx baseline.
 	entry.manager.Reparent(w.sessionManager)
+	w.rx.Set(entry.rx)
+	if entry.gate != nil {
+		w.gate = entry.gate
+		w.gate.swapTarget(w.link.Writer)
+		w.gate.setSuspended(false)
+	}
 	w.resumeToken = rp.Token
 	w.resumeEpoch = rp.Epoch
 	w.resumeHasToken = true
 	w.resumeUser = user
+	// Reply with our rx so the client replays exactly what we missed,
+	// then flush our retained suffix past the client's rx.
+	reply := FrameMetadata{SessionStatus: SessionStatusResume}
+	reply.Option.Set(OptionData)
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
+	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
+		return err
+	}
+	if w.gate != nil {
+		if err := w.gate.flushSince(rp.RxCount); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -79,15 +158,38 @@ func (w *ServerWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	if err != nil {
 		return err
 	}
-	buf.ReleaseMulti(mb)
+	defer buf.ReleaseMulti(mb)
+	if len(mb) == 0 || len(mb[0].Bytes()) < ackPayloadLen {
+		return errors.New("short ack payload")
+	}
+	ap, err := decodeAck(mb[0].Bytes())
+	if err != nil {
+		return err
+	}
+	if w.gate != nil {
+		w.gate.ack(ap.RxCount)
+	}
 	return nil
 }
 
-// tryAdoptResume is folded into handleStatusResume (first-frame announce /
-// rebind). Kept as documentation of the ordering contract.
-func (w *ServerWorker) tryAdoptResume(ctx context.Context, reader *buf.BufferedReader) bool {
-	_ = ctx
-	_ = reader
-	_ = w
-	return false
+// watchHalfOpen forces park when bytes sit unacked past AckTimeout.
+func (w *ServerWorker) watchHalfOpen() {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.done.Wait():
+			return
+		case <-t.C:
+		}
+		if w.gate == nil || w.done.Done() {
+			continue
+		}
+		if w.gate.UnackedBytes() > 0 && time.Since(w.gate.lastAckRecv()) > 4*time.Second {
+			// Park via a synthetic path: reuse run()'s park by closing
+			// nothing, just parking directly.
+			w.parkForResume(context.Background())
+			return
+		}
+	}
 }

@@ -11,6 +11,7 @@ import (
 
 type suspendedWorker struct {
 	manager *SessionManager
+	gate    *carrierGate
 	tx      uint64
 	rx      uint64
 	epoch   uint64

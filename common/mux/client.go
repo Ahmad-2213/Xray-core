@@ -5,6 +5,7 @@ import (
 	goerrors "errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -77,7 +78,7 @@ func (p *IncrementalWorkerPicker) cleanup() {
 
 func (p *IncrementalWorkerPicker) findAvailable() int {
 	for idx, w := range p.workers {
-		if !w.IsFull() {
+		if !w.IsFull() && !w.IsSuspended() {
 			return idx
 		}
 	}
@@ -155,36 +156,38 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 	if useV2 {
 		target = muxCoolAddressV2
 	}
+	c.useV2 = useV2
+	c.redialP = f.Proxy
+	c.redialD = f.Dialer
+	c.redialAddr = target
+	if c.gate != nil {
+		c.gate.setOnCarrierError(func() {
+			c.enterSuspend()
+			c.startSupervisor(c.redialP, c.redialD, c.redialAddr)
+		})
+	}
+
+	c.attachCarrier(upLinkWriter, downlinkReader)
 
 	if useV2 {
 		// Announce the resume token as the first frame so a later Resume
 		// on a fresh carrier can rebind this worker's sessions server-side.
+		// Uncounted: bypasses the gate, direct to the pipe.
 		meta := FrameMetadata{SessionStatus: SessionStatusResume}
 		meta.Option.Set(OptionData)
 		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch, RxCount: 0})
 		if err := writeMetaWithFrame(upLinkWriter, meta, buf.MultiBuffer{payload}); err != nil {
-			// WriteMultiBuffer owns the buffer on all paths; just fall back.
 			useV2 = false
 			target = muxCoolAddress
+			c.useV2 = false
 		}
 	}
 
-	go func(p proxy.Outbound, d internet.Dialer, c *ClientWorker) {
-		outbounds := []*session.Outbound{{
-			Target: net.TCPDestination(target, muxCoolPort),
-		}}
-		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
-		ctx, cancel := context.WithCancel(ctx)
+	go c.serveCarrier(f.Proxy, f.Dialer, uplinkReader, downlinkWriter, target, useV2)
 
-		if errP := p.Process(ctx, &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, d); errP != nil {
-			errC := errors.Cause(errP)
-			if !(goerrors.Is(errC, io.EOF) || goerrors.Is(errC, io.ErrClosedPipe) || goerrors.Is(errC, context.Canceled)) {
-				errors.LogInfoInner(ctx, errP, "failed to handler mux client connection")
-			}
-		}
-		c.onCarrierClosed(useV2)
-		cancel()
-	}(f.Proxy, f.Dialer, c)
+	if useV2 {
+		go c.watchHalfOpen(f.Proxy, f.Dialer, target)
+	}
 
 	return c, nil
 }
@@ -203,9 +206,23 @@ type ClientWorker struct {
 	resume         ResumePolicy
 	token          [16]byte
 	epoch          uint64
-	tx             Counter
 	rx             Counter
 	ackMu          ackState
+	// Phase 2 suspend/resume state. gate is nil unless resume is enabled.
+	gate        *carrierGate
+	useV2       bool
+	createdAt   time.Time
+	supervising atomic.Bool
+	redialP     proxy.Outbound
+	redialD     internet.Dialer
+	redialAddr  net.Address
+
+	pipeMu     sync.Mutex
+	downReader *buf.BufferedReader
+	downPipe   buf.Reader
+	upPipe     buf.Writer
+	suspMu     sync.Mutex
+	suspendEnd time.Time
 }
 
 type ackState struct {
@@ -236,15 +253,20 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 		strategy:       s,
 		resume:         policy,
 		epoch:          uint64(time.Now().UnixNano()),
+		createdAt:      time.Now(),
 	}
 	if policy.Enabled {
 		if t, err := NewToken(); err == nil {
 			c.token = t
 		}
+		c.gate = newCarrierGate(stream.Writer, c.done.Wait(), policy)
 	}
 
 	go c.fetchOutput()
 	go c.monitor()
+	if policy.Enabled {
+		go c.watchHalfOpen()
+	}
 
 	return c, nil
 }
@@ -316,7 +338,6 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 		inbound = session.InboundFromContext(ctx)
 	}
 	writer := NewWriter(s.ID, ob.Target, output, transferType, xudp.GetGlobalID(ctx), inbound)
-	writer.counter = s.tx
 	defer s.Close(false)
 	defer writer.Close()
 
@@ -357,7 +378,7 @@ func (m *ClientWorker) IsFull() bool {
 }
 
 func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool {
-	if m.IsFull() {
+	if m.IsFull() || m.IsSuspended() {
 		return false
 	}
 
@@ -366,10 +387,7 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	if s == nil {
 		return false
 	}
-	if m.resume.Enabled {
-		s.tx = &m.tx
-	}
-	go fetchInput(ctx, s, m.link.Writer)
+	go fetchInput(ctx, s, m.out())
 	if _, ok := link.Reader.(*pipe.Reader); !ok {
 		select {
 		case <-ctx.Done():
@@ -409,7 +427,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	rr := s.NewReader(reader, &meta.Target)
 	err := buf.Copy(rr, s.output)
-	if m.resume.Enabled {
+	if m.resume.Enabled && meta.Target.Network != net.Network_UDP {
 		m.rx.Next()
 		m.maybeSendAck()
 	}
@@ -436,9 +454,8 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 	return nil
 }
 
-// handleStatusResume processes a server Resume response on a reattached
-// carrier. Phase 1 parses and validates the echoed count; full replay from
-// the retained queue lands with the sender-side retain store.
+// handleStatusResume processes the server Resume reply on a reattached
+// carrier: validate, replay retained frames past the server's rx, resume.
 func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !m.resume.Enabled {
 		return errors.New("unexpected resume status")
@@ -461,12 +478,16 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if rp.Token != m.token {
 		return errors.New("resume token mismatch")
 	}
-	m.rx.Next()
+	if m.gate != nil {
+		if err := m.gate.flushSince(rp.RxCount); err != nil {
+			return err
+		}
+	}
+	m.clearSuspended()
 	return nil
 }
 
 // handleStatusAck frees retained frames up to the peer's rx count.
-// Phase 1 has no retain store yet, so this only advances accounting.
 func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !m.resume.Enabled {
 		return errors.New("unexpected ack status")
@@ -478,13 +499,23 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	if err != nil {
 		return err
 	}
-	buf.ReleaseMulti(mb)
+	defer buf.ReleaseMulti(mb)
+	if len(mb) == 0 || len(mb[0].Bytes()) < ackPayloadLen {
+		return errors.New("short ack payload")
+	}
+	ap, err := decodeAck(mb[0].Bytes())
+	if err != nil {
+		return err
+	}
+	if m.gate != nil {
+		m.gate.ack(ap.RxCount)
+	}
 	return nil
 }
 
 // maybeSendAck emits Ack{rxCount} at most every AckEveryMs when rx advanced.
 func (m *ClientWorker) maybeSendAck() {
-	if !m.resume.Enabled {
+	if !m.resume.Enabled || m.gate == nil {
 		return
 	}
 	interval := m.resume.AckEveryMs
@@ -506,11 +537,7 @@ func (m *ClientWorker) maybeSendAck() {
 	m.ackMu.lastTime = now
 	m.ackMu.mu.Unlock()
 
-	meta := FrameMetadata{SessionStatus: SessionStatusAck}
-	meta.Option.Set(OptionData)
-	// Ownership transfers to WriteMultiBuffer (releases on all paths).
-	payload := encodeAck(AckPayload{RxCount: count})
-	_ = writeMetaWithFrame(m.link.Writer, meta, buf.MultiBuffer{payload})
+	m.gate.writeAck(count)
 }
 
 func (m *ClientWorker) fetchOutput() {
@@ -518,8 +545,25 @@ func (m *ClientWorker) fetchOutput() {
 		common.Must(m.done.Close())
 	}()
 
-	reader := &buf.BufferedReader{Reader: m.link.Reader}
+	for {
+		reader := m.currentDownReader()
+		if m.readLoop(reader) {
+			return
+		}
+		// Carrier read failed. v1 path (or closed worker): fail fast.
+		if m.gate == nil || m.done.Done() {
+			return
+		}
+		// Suspended: park until rebind swaps in a fresh reader, the
+		// worker closes, or the episode times out.
+		if !m.waitRebind() {
+			return
+		}
+	}
+}
 
+// readLoop processes frames until the carrier errors. True = worker done.
+func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 	var meta FrameMetadata
 	for {
 		err := meta.Unmarshal(reader, false)
@@ -527,7 +571,7 @@ func (m *ClientWorker) fetchOutput() {
 			if errors.Cause(err) != io.EOF {
 				errors.LogInfoInner(context.Background(), err, "failed to read metadata")
 			}
-			break
+			return false
 		}
 
 		switch meta.SessionStatus {
@@ -546,12 +590,33 @@ func (m *ClientWorker) fetchOutput() {
 		default:
 			status := meta.SessionStatus
 			errors.LogError(context.Background(), "unknown status: ", status)
-			return
+			return true
 		}
 
 		if err != nil {
 			errors.LogInfoInner(context.Background(), err, "failed to process data")
-			return
+			return true
+		}
+	}
+}
+
+// waitRebind parks fetchOutput until a rebind swaps the reader, the worker
+// closes, or the suspend episode times out. False = give up.
+func (m *ClientWorker) waitRebind() bool {
+	for {
+		if m.done.Done() {
+			return false
+		}
+		if !m.IsSuspended() {
+			return true
+		}
+		if time.Now().After(m.suspendDeadline()) {
+			return false
+		}
+		select {
+		case <-m.done.Wait():
+			return false
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
