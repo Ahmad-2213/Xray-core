@@ -173,6 +173,7 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
 	m.epoch++
+	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", m.epoch)
 	resume := ResumePayload{Token: m.token, Epoch: m.epoch, RxCount: m.rx.Value()}
 	meta := FrameMetadata{SessionStatus: SessionStatusResume}
 	meta.Option.Set(OptionData)
@@ -237,6 +238,7 @@ func (m *ClientWorker) enterSuspend() {
 	if m.gate != nil {
 		m.gate.setSuspended(true)
 	}
+	errors.LogInfo(context.Background(), "mux resume: suspend worker token ", m.tokenString(), " sessions ", m.sessionManager.Size())
 	m.interruptPipes()
 }
 

@@ -97,6 +97,20 @@ func LookupResumePolicy(tag string) ResumePolicy {
 	return resumeDefault
 }
 
+// tokenString renders a short non-secret prefix for logs (never the full
+// token: it authorizes resume).
+func tokenString(t [16]byte) string {
+	const hex = "0123456789abcdef"
+	var b [8]byte
+	for i := 0; i < 4; i++ {
+		b[i*2] = hex[t[i]>>4]
+		b[i*2+1] = hex[t[i]&0x0f]
+	}
+	return string(b[:])
+}
+
+func (m *ClientWorker) tokenString() string { return tokenString(m.token) }
+
 // NewToken generates an unguessable 128-bit resume token. It must be bound
 // by the caller to the authenticated (VLESS) user session: the server only
 // honors Resume when the new carrier carries the same user credentials.

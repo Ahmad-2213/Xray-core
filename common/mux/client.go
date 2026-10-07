@@ -475,12 +475,18 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if rp.Token != m.token {
 		return errors.New("resume token mismatch")
 	}
+	flushed := 0
 	if m.gate != nil {
+		sent := m.gate.TxCount()
 		if err := m.gate.flushSince(rp.RxCount); err != nil {
 			return err
 		}
+		if sent > rp.RxCount {
+			flushed = int(sent - rp.RxCount)
+		}
 	}
 	m.clearSuspended()
+	errors.LogInfo(context.Background(), "mux resume: reattached token ", m.tokenString(), " replayed ", flushed, " frames")
 	return nil
 }
 

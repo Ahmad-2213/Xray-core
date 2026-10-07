@@ -451,6 +451,7 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if w.gate != nil {
 		w.gate.setSuspended(true)
 	}
+	nSessions := w.sessionManager.Size()
 	hsPut(w.resumeToken, &suspendedWorker{
 		manager: w.sessionManager,
 		gate:    w.gate,
@@ -462,6 +463,7 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	w.sessionManager = NewSessionManager()
 	common.Interrupt(w.link.Writer)
 	common.Interrupt(w.link.Reader)
+	errors.LogInfo(ctx, "mux resume: parked ", nSessions, " sessions for rebind")
 	return true
 }
 

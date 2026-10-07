@@ -142,11 +142,17 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
 		return err
 	}
+	replayed := 0
 	if w.gate != nil {
+		sent := w.gate.TxCount()
 		if err := w.gate.flushSince(rp.RxCount); err != nil {
 			return err
 		}
+		if sent > rp.RxCount {
+			replayed = int(sent - rp.RxCount)
+		}
 	}
+	errors.LogInfo(context.Background(), "mux resume: adopted token, replayed ", replayed, " frames")
 	return nil
 }
 
