@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common"
-	"github.com/xtls/xray-core/common/net"
 )
 
 var (
@@ -38,7 +37,7 @@ func banV2(host string, ttl time.Duration) {
 // immediately (current behavior). v2/resume path: suspend briefly so the
 // redialed carrier can reattach with Resume{token, epoch+1, rxCount}; the
 // app-facing pipes are NOT interrupted during suspension (backpressure).
-func (m *ClientWorker) onCarrierClosed(useV2 bool, target net.Destination) {
+func (m *ClientWorker) onCarrierClosed(useV2 bool) {
 	if m == nil {
 		return
 	}

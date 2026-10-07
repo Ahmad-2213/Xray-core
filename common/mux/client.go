@@ -182,7 +182,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 				errors.LogInfoInner(ctx, errP, "failed to handler mux client connection")
 			}
 		}
-		c.onCarrierClosed(useV2, target)
+		c.onCarrierClosed(useV2)
 		cancel()
 	}(f.Proxy, f.Dialer, c)
 
