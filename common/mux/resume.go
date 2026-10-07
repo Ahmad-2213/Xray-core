@@ -111,6 +111,8 @@ func tokenString(t [16]byte) string {
 
 func (m *ClientWorker) tokenString() string { return tokenString(m.token) }
 
+func (w *ServerWorker) tokenString() string { return tokenString(w.resumeToken) }
+
 // NewToken generates an unguessable 128-bit resume token. It must be bound
 // by the caller to the authenticated (VLESS) user session: the server only
 // honors Resume when the new carrier carries the same user credentials.

@@ -466,7 +466,7 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	w.sessionManager = NewSessionManager()
 	common.Interrupt(w.link.Writer)
 	common.Interrupt(w.link.Reader)
-	errors.LogInfo(ctx, "mux resume: parked ", nSessions, " sessions for rebind")
+	errors.LogInfo(ctx, "mux resume: parked ", nSessions, " sessions token ", w.tokenString(), " epoch ", w.resumeEpoch, " for rebind")
 	return true
 }
 

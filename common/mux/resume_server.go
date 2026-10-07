@@ -146,7 +146,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 				replayed = int(sent - rp.RxCount)
 			}
 		}
-		errors.LogInfo(context.Background(), "mux resume: adopted token, replayed ", replayed, " frames")
+		errors.LogInfo(context.Background(), "mux resume: adopted token ", tokenString(rp.Token), " epoch ", rp.Epoch, " replayed ", replayed, " frames")
 		return nil
 	}
 
