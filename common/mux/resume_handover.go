@@ -60,3 +60,27 @@ func hsTake(token [16]byte) (*suspendedWorker, bool) {
 	}
 	return e, true
 }
+
+// hsPeek looks up without consuming, so a failed validation keeps the
+// entry for a later retry with a greater epoch.
+func hsPeek(token [16]byte) (*suspendedWorker, bool) {
+	hsMu.Lock()
+	defer hsMu.Unlock()
+	e, ok := hsEntries[token]
+	if !ok || time.Now().After(e.expires) {
+		return nil, false
+	}
+	return e, true
+}
+
+// hsPutBack restores an entry after failed validation so a later retry
+// with a greater epoch can still adopt it.
+func hsPutBack(token [16]byte, e *suspendedWorker) {
+	hsMu.Lock()
+	defer hsMu.Unlock()
+	if len(hsEntries) >= hsMaxEntries {
+		return
+	}
+	e.expires = time.Now().Add(hsTTL)
+	hsEntries[token] = e
+}

@@ -444,6 +444,9 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if !w.resumeHasToken {
 		return false
 	}
+	if w.sessionManager.Size() == 0 {
+		return false
+	}
 	user := w.resumeUser
 	if user == "" {
 		user = serverUserOf(ctx)

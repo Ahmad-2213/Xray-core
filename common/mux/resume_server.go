@@ -90,10 +90,33 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 
 	user := serverUserOf(context.Background())
 
-	if !w.resumeHasToken {
-		// First sight: announce. Remember the token, create the gate so
-		// all later frames on this carrier are counted/retained, and
-		// park on carrier loss.
+	// Rebind takes precedence over announce: a fresh carrier bearing a
+	// parked token reattaches sessions. Otherwise it is an announce.
+	if _, ok := hsPeek(rp.Token); ok {
+		entry, ok := hsTake(rp.Token)
+		if !ok {
+			return errors.New("expired resume token")
+		}
+		if entry.user != "" && user != "" && entry.user != user {
+			hsPutBack(rp.Token, entry)
+			return errors.New("resume user mismatch")
+		}
+		if rp.Epoch <= entry.epoch {
+			hsPutBack(rp.Token, entry)
+			return errors.New("stale resume epoch")
+		}
+		if rp.RxCount > entry.tx {
+			hsPutBack(rp.Token, entry)
+			return errors.New("resume count beyond sent")
+		}
+		// Adopt the parked table, gate (with retain store) and rx baseline.
+		entry.manager.Reparent(w.sessionManager)
+		w.rx.Set(entry.rx)
+		if entry.gate != nil {
+			w.gate = entry.gate
+			w.gate.swapTarget(w.link.Writer)
+			w.gate.setSuspended(false)
+		}
 		w.resumeToken = rp.Token
 		w.resumeEpoch = rp.Epoch
 		w.resumeHasToken = true
@@ -103,56 +126,43 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 			w.gate.setOnCarrierError(func() {
 				w.parkForResume(context.Background())
 			})
+			go w.watchHalfOpen()
 		}
-		go w.watchHalfOpen()
+		// Reply with our rx so the client replays exactly what we
+		// missed, then flush our retained suffix past the client's rx.
+		reply := FrameMetadata{SessionStatus: SessionStatusResume}
+		reply.Option.Set(OptionData)
+		rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
+		if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
+			return err
+		}
+		replayed := 0
+		if w.gate != nil {
+			sent := w.gate.TxCount()
+			if err := w.gate.flushSince(rp.RxCount); err != nil {
+				return err
+			}
+			if sent > rp.RxCount {
+				replayed = int(sent - rp.RxCount)
+			}
+		}
+		errors.LogInfo(context.Background(), "mux resume: adopted token, replayed ", replayed, " frames")
 		return nil
 	}
 
-	// Rebind request on a fresh carrier: the token IS the lookup key.
-	entry, ok := hsTake(rp.Token)
-	if !ok {
-		return errors.New("unknown or expired resume token")
-	}
-	if entry.user != "" && user != "" && entry.user != user {
-		return errors.New("resume user mismatch")
-	}
-	if rp.Epoch <= entry.epoch {
-		return errors.New("stale resume epoch")
-	}
-	if rp.RxCount > entry.tx {
-		return errors.New("resume count beyond sent")
-	}
-	// Adopt the parked table, gate (with retain store) and rx baseline.
-	entry.manager.Reparent(w.sessionManager)
-	w.rx.Set(entry.rx)
-	if entry.gate != nil {
-		w.gate = entry.gate
-		w.gate.swapTarget(w.link.Writer)
-		w.gate.setSuspended(false)
-	}
+	// Unknown token: fresh announce. Remember it, create the gate so all
+	// later frames on this carrier are counted/retained, park on loss.
 	w.resumeToken = rp.Token
 	w.resumeEpoch = rp.Epoch
 	w.resumeHasToken = true
 	w.resumeUser = user
-	// Reply with our rx so the client replays exactly what we missed,
-	// then flush our retained suffix past the client's rx.
-	reply := FrameMetadata{SessionStatus: SessionStatusResume}
-	reply.Option.Set(OptionData)
-	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
-	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
-		return err
+	if w.gate == nil {
+		w.gate = newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+		w.gate.setOnCarrierError(func() {
+			w.parkForResume(context.Background())
+		})
+		go w.watchHalfOpen()
 	}
-	replayed := 0
-	if w.gate != nil {
-		sent := w.gate.TxCount()
-		if err := w.gate.flushSince(rp.RxCount); err != nil {
-			return err
-		}
-		if sent > rp.RxCount {
-			replayed = int(sent - rp.RxCount)
-		}
-	}
-	errors.LogInfo(context.Background(), "mux resume: adopted token, replayed ", replayed, " frames")
 	return nil
 }
 
