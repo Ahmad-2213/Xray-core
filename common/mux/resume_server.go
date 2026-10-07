@@ -13,15 +13,6 @@ import (
 	"github.com/xtls/xray-core/common/net"
 )
 
-func serverUserOf(ctx context.Context) string {
-	if in := ctx.Value("inboundUser"); in != nil {
-		if s, ok := in.(string); ok {
-			return s
-		}
-	}
-	return ""
-}
-
 // countRx applies the shared counting rule to received frames. New is
 // counted by the caller only after successful dispatch (a failed dispatch
 // kills the worker today; counting it would ack a never-created session and
@@ -49,14 +40,24 @@ func (w *ServerWorker) countRx(meta *FrameMetadata) {
 }
 
 // maybeSendAck emits Ack{rxCount} throttled, via the gate once present.
+// A trailing ack is scheduled when rate-limited with unacked rx, so a
+// burst's last frame is never left unacked: without it the peer's
+// half-open detector would trip on a healthy-but-quiet carrier.
 func (w *ServerWorker) maybeSendAck() {
-	if w.gate == nil {
+	if w.gate.Load() == nil {
 		return
 	}
 	intervalMs := int64(500)
 	now := time.Now()
 	w.ackMu.mu.Lock()
 	if now.Sub(w.ackMu.lastTime) < time.Duration(intervalMs)*time.Millisecond {
+		if c := w.rx.Value(); c != w.ackMu.lastSent && !w.ackMu.pending {
+			w.ackMu.pending = true
+			wait := time.Duration(intervalMs)*time.Millisecond - now.Sub(w.ackMu.lastTime)
+			w.ackMu.mu.Unlock()
+			time.AfterFunc(wait, w.sendTrailingAck)
+			return
+		}
 		w.ackMu.mu.Unlock()
 		return
 	}
@@ -68,7 +69,26 @@ func (w *ServerWorker) maybeSendAck() {
 	w.ackMu.lastSent = count
 	w.ackMu.lastTime = now
 	w.ackMu.mu.Unlock()
-	w.gate.writeAck(count)
+	if g := w.gate.Load(); g != nil {
+		g.writeAck(count)
+	}
+}
+
+// sendTrailingAck emits the delayed ack scheduled by maybeSendAck.
+func (w *ServerWorker) sendTrailingAck() {
+	w.ackMu.mu.Lock()
+	w.ackMu.pending = false
+	count := w.rx.Value()
+	if count == w.ackMu.lastSent {
+		w.ackMu.mu.Unlock()
+		return
+	}
+	w.ackMu.lastSent = count
+	w.ackMu.lastTime = time.Now()
+	w.ackMu.mu.Unlock()
+	if g := w.gate.Load(); g != nil {
+		g.writeAck(count)
+	}
 }
 
 func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -88,40 +108,51 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		return err
 	}
 
-	user := serverUserOf(context.Background())
-
 	// Rebind takes precedence over announce: a fresh carrier bearing a
-	// parked token reattaches sessions. Otherwise it is an announce.
-	if _, ok := hsPeek(rp.Token); ok {
-		entry, ok := hsTake(rp.Token)
-		if !ok {
-			return errors.New("expired resume token")
-		}
-		if err := validateRebind(entry.tx, entry.epoch, entry.user, rp, user); err != nil {
-			hsPutBack(rp.Token, entry)
-			return err
-		}
+	// parked token reattaches sessions. Validated and consumed under a
+	// single lock so concurrent rebinds can't both pass.
+	entry, found, err := hsAdopt(rp.Token, func(e *suspendedWorker) error {
+		return validateRebind(e.tx, e.epoch, e.user, rp, w.localUser)
+	})
+	if err != nil {
+		return err
+	}
+	if found {
 		// Adopt the parked table, gate (with retain store) and rx baseline.
-		entry.manager.Reparent(w.sessionManager)
+		entry.manager.Reparent(w.sessionManager.Load())
 		w.rx.Set(entry.rx)
 		if entry.gate != nil {
-			w.gate = entry.gate
-			w.gate.swapTarget(w.link.Writer)
-			w.gate.setSuspended(false)
+			w.gate.Store(entry.gate)
+			entry.gate.swapTarget(w.link.Writer)
+			if entry.done != nil {
+				entry.gate.swapDone(entry.done.wait())
+			}
 		}
 		w.resumeToken = rp.Token
 		w.resumeEpoch = rp.Epoch
 		w.resumeHasToken = true
-		w.resumeUser = user
-		if w.gate == nil {
-			w.gate = newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
-			w.gate.setOnCarrierError(func() {
+		w.resumeUser = entry.user
+		w.resumeDone = entry.done
+		if w.gate.Load() == nil {
+			g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+			if w.resumeDone != nil {
+				g.swapDone(w.resumeDone.wait())
+			}
+			w.gate.Store(g)
+		}
+		// Re-arm onto this worker: the adopted gate still points at the
+		// parking worker's park callback (a no-op on its empty manager),
+		// which would leave write errors spinning instead of parking.
+		if g := w.gate.Load(); g != nil {
+			g.setOnCarrierError(func() {
 				w.parkForResume(context.Background())
 			})
 			go w.watchHalfOpen()
 		}
 		// Reply with our rx so the client replays exactly what we
-		// missed, then flush our retained suffix past the client's rx.
+		// missed, then flush our retained suffix past the client's rx,
+		// and only then unsuspend: live writes must never precede the
+		// replay, or the peer double-counts.
 		reply := FrameMetadata{SessionStatus: SessionStatusResume}
 		reply.Option.Set(OptionData)
 		rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
@@ -129,31 +160,58 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 			return err
 		}
 		replayed := 0
-		if w.gate != nil {
-			sent := w.gate.TxCount()
-			if err := w.gate.flushSince(rp.RxCount); err != nil {
-				return err
+		// Flush runs off the reader loop (bidirectional unacked data
+		// above the pipe buffers would deadlock two inline flushes).
+		// The carrier stays readable meanwhile.
+		go func() {
+			if g := w.gate.Load(); g != nil {
+				sent := g.TxCount()
+				if err := g.flushSince(rp.RxCount); err != nil {
+					errors.LogInfoInner(context.Background(), err, "mux resume: rebind flush failed")
+					return
+				}
+				// Free what the peer confirms and advance the ack
+				// clock: retention would otherwise pin memory and the
+				// half-open detector would re-trip right after rebind.
+				g.ack(rp.RxCount)
+				if sent > rp.RxCount {
+					replayed = int(sent - rp.RxCount)
+				}
 			}
-			if sent > rp.RxCount {
-				replayed = int(sent - rp.RxCount)
+			if g := w.gate.Load(); g != nil {
+				g.setSuspended(false)
 			}
-		}
-		errors.LogInfo(context.Background(), "mux resume: adopted token ", tokenString(rp.Token), " epoch ", rp.Epoch, " replayed ", replayed, " frames")
+			errors.LogInfo(context.Background(), "mux resume: adopted token ", tokenString(rp.Token), " epoch ", rp.Epoch, " replayed ", replayed, " frames")
+		}()
 		return nil
 	}
 
-	// Unknown token: fresh announce. Remember it, create the gate so all
-	// later frames on this carrier are counted/retained, park on loss.
+	// Unknown token: either a fresh announce, or a redial racing a park
+	// (half-open: the old carrier still looks alive server-side). Answer
+	// with epoch 0 ("nothing parked") instead of silence so the client
+	// retries on cadence instead of stalling one redial for 8s. The client
+	// ignores epoch-0 replies without resuming.
 	w.resumeToken = rp.Token
 	w.resumeEpoch = rp.Epoch
 	w.resumeHasToken = true
-	w.resumeUser = user
-	if w.gate == nil {
-		w.gate = newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
-		w.gate.setOnCarrierError(func() {
+	w.resumeUser = w.localUser
+	if w.gate.Load() == nil {
+		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+		if w.resumeDone == nil {
+			w.resumeDone = newTokenDone()
+		}
+		g.swapDone(w.resumeDone.wait())
+		g.setOnCarrierError(func() {
 			w.parkForResume(context.Background())
 		})
+		w.gate.Store(g)
 		go w.watchHalfOpen()
+	}
+	reply := FrameMetadata{SessionStatus: SessionStatusResume}
+	reply.Option.Set(OptionData)
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: w.rx.Value()})
+	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -174,8 +232,8 @@ func (w *ServerWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	if err != nil {
 		return err
 	}
-	if w.gate != nil {
-		w.gate.ack(ap.RxCount)
+	if g := w.gate.Load(); g != nil {
+		g.ack(ap.RxCount)
 	}
 	return nil
 }
@@ -190,10 +248,11 @@ func (w *ServerWorker) watchHalfOpen() {
 			return
 		case <-t.C:
 		}
-		if w.gate == nil || w.done.Done() {
+		if w.gate.Load() == nil || w.done.Done() {
 			continue
 		}
-		if halfOpenTripped(w.gate.UnackedBytes(), time.Since(w.gate.lastAckRecv()), 4*time.Second) {
+		g := w.gate.Load()
+		if halfOpenTripped(g.UnackedBytes(), time.Since(g.lastAckRecv()), 4*time.Second) {
 			// Park via a synthetic path: reuse run()'s park by closing
 			// nothing, just parking directly.
 			w.parkForResume(context.Background())

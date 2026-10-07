@@ -483,6 +483,111 @@ func TestGateAckCoalescedWhileSuspended(t *testing.T) {
 	}
 }
 
+func TestGateConcurrentWritersExactOnce(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{failLeft: 20}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	const writers = 8
+	const perWriter = 25
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*perWriter)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				mb := countedFrameBytesForTest(t, uint16(w), mux.SessionStatusNew, fmt.Sprintf("w%d-f%d", w, i))
+				if err := g.WriteMultiBuffer(mb); err != nil {
+					errs <- err
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal("concurrent write failed:", err)
+	}
+	if got := g.TxCount(); got != writers*perWriter {
+		t.Fatalf("TxCount = %d, want %d", got, writers*perWriter)
+	}
+	// Ordered sender: every stored frame must hit the wire exactly once,
+	// even with concurrent writers and injected carrier failures.
+	seen := make(map[string]int)
+	for _, f := range carrier.recorded() {
+		seen[string(f)]++
+	}
+	if len(seen) != writers*perWriter {
+		t.Fatalf("recorded %d distinct frames, want %d", len(seen), writers*perWriter)
+	}
+	for payload, n := range seen {
+		if n != 1 {
+			t.Fatalf("frame %q delivered %d times", payload, n)
+		}
+	}
+	mux.GateAckForTest(g, writers*perWriter)
+	if g.UnackedBytes() != 0 {
+		t.Fatal("full ack must free everything")
+	}
+}
+
+func TestGateGarbageFrameIgnored(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	garbage := buf.New()
+	if _, err := garbage.Write([]byte{0x01}); err != nil {
+		t.Fatal(err)
+	}
+	// Parse failure must not release-then-forward the caller's buffer:
+	// no crash, no retention, and the gate keeps working afterwards.
+	if err := g.WriteMultiBuffer(buf.MultiBuffer{garbage}); err != nil {
+		t.Fatal("garbage frame must be ignored, not error:", err)
+	}
+	if g.TxCount() != 0 || g.UnackedBytes() != 0 {
+		t.Fatal("garbage must not be counted or retained")
+	}
+	mb := countedFrameBytesForTest(t, 1, mux.SessionStatusNew, "after-garbage")
+	if err := g.WriteMultiBuffer(mb); err != nil {
+		t.Fatal("valid frame after garbage failed:", err)
+	}
+	// Uncounted garbage is forwarded (1) plus the valid frame (1).
+	frames := carrier.recorded()
+	if g.TxCount() != 1 || len(frames) != 2 || !bytes.Contains(frames[1], []byte("after-garbage")) {
+		t.Fatal("gate stuck after garbage frame")
+	}
+}
+
+func TestGateAckAfterFlushFreesAll(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	for i := 1; i <= 3; i++ {
+		mb := countedFrameBytesForTest(t, uint16(i), mux.SessionStatusKeep, fmt.Sprintf("q%d", i))
+		if err := g.WriteMultiBuffer(mb); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rebind := &flakyCarrierForTest{}
+	mux.GateSwapTargetForTest(g, rebind)
+	if err := mux.GateFlushSinceForTest(g, 0); err != nil {
+		t.Fatal("flush failed:", err)
+	}
+	if len(rebind.recorded()) != 3 {
+		t.Fatalf("flush must replay all 3, got %d", len(rebind.recorded()))
+	}
+	// The rebind discipline: free what the peer confirms right after
+	// flushing, or retention pins memory and the half-open detector
+	// re-trips on the fresh carrier.
+	mux.GateAckForTest(g, 3)
+	if g.UnackedBytes() != 0 {
+		t.Fatal("ack-after-flush must free all retained bytes")
+	}
+}
+
 // ---- Phase 3: v1/v2 interop matrix ----
 
 func TestV2StatusesDoNotAliasV1(t *testing.T) {
@@ -534,6 +639,22 @@ func TestV2BanTTL(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if mux.IsV2BannedForTest(host) {
 		t.Fatal("ban must expire")
+	}
+}
+
+func TestV2BanKeyScopesPerTag(t *testing.T) {
+	addr := net.DomainAddress("v2.mux.cool")
+	k1 := mux.V2BanKeyForTest("ws-out", addr)
+	k2 := mux.V2BanKeyForTest("tg-out", addr)
+	if k1 == k2 {
+		t.Fatal("ban key must differ per outbound tag")
+	}
+	mux.BanV2ForTest(k1, time.Minute)
+	if !mux.IsV2BannedForTest(k1) {
+		t.Fatal("ban must apply")
+	}
+	if mux.IsV2BannedForTest(k2) {
+		t.Fatal("one outbound's ban must not affect another")
 	}
 }
 

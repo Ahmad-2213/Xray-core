@@ -150,12 +150,13 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		return nil, err
 	}
 
-	useV2 := f.Resume.Enabled && !isV2Banned(muxCoolAddressV2.String())
+	useV2 := f.Resume.Enabled && !isV2Banned(v2BanKey(f.OutboundTag, muxCoolAddressV2))
 	target := muxCoolAddress
 	if useV2 {
 		target = muxCoolAddressV2
 	}
 	c.useV2 = useV2
+	c.banKey = v2BanKey(f.OutboundTag, muxCoolAddressV2)
 	c.redialP = f.Proxy
 	c.redialD = f.Dialer
 	c.redialAddr = target
@@ -174,7 +175,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		// Uncounted: bypasses the gate, direct to the pipe.
 		meta := FrameMetadata{SessionStatus: SessionStatusResume}
 		meta.Option.Set(OptionData)
-		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch, RxCount: 0})
+		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch.Load(), RxCount: 0})
 		if err := writeMetaWithFrame(upLinkWriter, meta, buf.MultiBuffer{payload}); err != nil {
 			useV2 = false
 			target = muxCoolAddress
@@ -204,7 +205,7 @@ type ClientWorker struct {
 	strategy       ClientStrategy
 	resume         ResumePolicy
 	token          [16]byte
-	epoch          uint64
+	epoch          atomic.Uint64
 	rx             Counter
 	ackMu          ackState
 	// Phase 2 suspend/resume state. gate is nil unless resume is enabled.
@@ -220,6 +221,11 @@ type ClientWorker struct {
 	downReader *buf.BufferedReader
 	downPipe   buf.Reader
 	upPipe     buf.Writer
+	// pipeGen bumps on every carrier swap so waitRebind wakes for the new
+	// downlink (which carries the Resume reply that clears the suspend).
+	pipeGen atomic.Uint64
+	// banKey scopes the v2 fallback ban to this outbound tag + server.
+	banKey     string
 	suspMu     sync.Mutex
 	suspendEnd time.Time
 }
@@ -228,6 +234,7 @@ type ackState struct {
 	mu       sync.Mutex
 	lastSent uint64
 	lastTime time.Time
+	pending  bool
 }
 
 var (
@@ -251,9 +258,9 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 		timer:          time.NewTicker(time.Second * 16),
 		strategy:       s,
 		resume:         policy,
-		epoch:          uint64(time.Now().UnixNano()),
 		createdAt:      time.Now(),
 	}
+	c.epoch.Store(uint64(time.Now().UnixNano()))
 	if policy.Enabled {
 		if t, err := NewToken(); err == nil {
 			c.token = t
@@ -413,21 +420,33 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 
+	// Count before lookup, mirroring the server: the frame was delivered
+	// in full, and the sender already counted it at store time. The
+	// not-found path below must also count, or the counters diverge by
+	// one per unknown-session frame.
+	if m.resume.Enabled && meta.Target.Network != net.Network_UDP {
+		m.rx.Next()
+		m.maybeSendAck()
+	}
+
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Notify remote peer to close this session.
-		closingWriter := NewResponseWriter(meta.SessionID, m.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close()
+		// Notify remote peer to close this session. Routed via out() so
+		// the End is counted and retained (and hits the live carrier
+		// after a swap). Async: the gate may be suspended and must
+		// never stall the reader loop.
+		sid := meta.SessionID
+		out := m.out()
+		go func() {
+			closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
+			closingWriter.Close()
+		}()
 
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
 	err := buf.Copy(rr, s.output)
-	if m.resume.Enabled && meta.Target.Network != net.Network_UDP {
-		m.rx.Next()
-		m.maybeSendAck()
-	}
 	if err != nil && buf.IsWriteError(err) {
 		errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
@@ -475,18 +494,36 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if rp.Token != m.token {
 		return errors.New("resume token mismatch")
 	}
-	flushed := 0
-	if m.gate != nil {
-		sent := m.gate.TxCount()
-		if err := m.gate.flushSince(rp.RxCount); err != nil {
-			return err
-		}
-		if sent > rp.RxCount {
-			flushed = int(sent - rp.RxCount)
-		}
+	if rp.Epoch == 0 {
+		// Negative reply: the server has nothing parked (fresh carrier
+		// raced a park, or a previous park expired). Stay suspended and
+		// keep redialing on cadence; do NOT resume, flush, or clear.
+		return nil
 	}
-	m.clearSuspended()
-	errors.LogInfo(context.Background(), "mux resume: reattached token ", m.tokenString(), " replayed ", flushed, " frames")
+	flushed := 0
+	go func() {
+		if m.gate != nil {
+			if rp.RxCount > m.gate.TxCount() {
+				errors.LogInfoInner(context.Background(), errors.New("resume count beyond sent"), "mux resume: rebind flush failed")
+				return
+			}
+			sent := m.gate.TxCount()
+			if err := m.gate.flushSince(rp.RxCount); err != nil {
+				errors.LogInfoInner(context.Background(), err, "mux resume: rebind flush failed")
+				return
+			}
+			// Free what the peer confirms, mirroring the server side.
+			m.gate.ack(rp.RxCount)
+			if sent > rp.RxCount {
+				flushed = int(sent - rp.RxCount)
+			}
+		}
+		m.clearSuspended()
+		errors.LogInfo(context.Background(), "mux resume: reattached token ", m.tokenString(), " replayed ", flushed, " frames")
+	}()
+	// Flush runs off the reader loop (bidirectional unacked data above
+	// the pipe buffers would deadlock two inline flushes). The carrier
+	// stays readable meanwhile.
 	return nil
 }
 
@@ -517,6 +554,8 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 }
 
 // maybeSendAck emits Ack{rxCount} at most every AckEveryMs when rx advanced.
+// A trailing ack is scheduled when rate-limited with unacked rx, so a
+// burst's last frame is never left unacked (see server maybeSendAck).
 func (m *ClientWorker) maybeSendAck() {
 	if !m.resume.Enabled || m.gate == nil {
 		return
@@ -528,6 +567,13 @@ func (m *ClientWorker) maybeSendAck() {
 	now := time.Now()
 	m.ackMu.mu.Lock()
 	if now.Sub(m.ackMu.lastTime) < time.Duration(interval)*time.Millisecond {
+		if c := m.rx.Value(); c != m.ackMu.lastSent && !m.ackMu.pending {
+			m.ackMu.pending = true
+			wait := time.Duration(interval)*time.Millisecond - now.Sub(m.ackMu.lastTime)
+			m.ackMu.mu.Unlock()
+			time.AfterFunc(wait, m.sendTrailingAck)
+			return
+		}
 		m.ackMu.mu.Unlock()
 		return
 	}
@@ -541,6 +587,23 @@ func (m *ClientWorker) maybeSendAck() {
 	m.ackMu.mu.Unlock()
 
 	m.gate.writeAck(count)
+}
+
+// sendTrailingAck emits the delayed ack scheduled by maybeSendAck.
+func (m *ClientWorker) sendTrailingAck() {
+	m.ackMu.mu.Lock()
+	m.ackMu.pending = false
+	count := m.rx.Value()
+	if count == m.ackMu.lastSent {
+		m.ackMu.mu.Unlock()
+		return
+	}
+	m.ackMu.lastSent = count
+	m.ackMu.lastTime = time.Now()
+	m.ackMu.mu.Unlock()
+	if m.gate != nil {
+		m.gate.writeAck(count)
+	}
 }
 
 func (m *ClientWorker) fetchOutput() {
@@ -604,13 +667,18 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 }
 
 // waitRebind parks fetchOutput until a rebind swaps the reader, the worker
-// closes, or the suspend episode times out. False = give up.
+// closes, or the suspend episode times out. False = give up. The generation
+// check is the point: attachCarrierSwap bumps pipeGen on every rebind, so
+// fetchOutput picks up the new downlink and reads the server's Resume
+// reply (which clears the suspend). Waiting on !IsSuspended alone would
+// deadlock, since only the reply reader can clear it.
 func (m *ClientWorker) waitRebind() bool {
+	gen := m.pipeGen.Load()
 	for {
 		if m.done.Done() {
 			return false
 		}
-		if !m.IsSuspended() {
+		if !m.IsSuspended() || m.pipeGen.Load() != gen {
 			return true
 		}
 		if time.Now().After(m.suspendDeadline()) {

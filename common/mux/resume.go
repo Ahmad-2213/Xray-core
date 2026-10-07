@@ -42,7 +42,6 @@ type ResumePolicy struct {
 	SuspendTimeout  time.Duration
 	MaxStreamBuffer int64
 	MaxWorkerBuffer int64
-	AckEveryBytes   int64
 	AckEveryMs      int64
 	RedialDelays    []time.Duration
 	NoV2CacheTTL    time.Duration
@@ -58,7 +57,6 @@ func DefaultResumePolicy() ResumePolicy {
 		SuspendTimeout:  10 * time.Second,
 		MaxStreamBuffer: 256 * 1024,
 		MaxWorkerBuffer: 4 * 1024 * 1024,
-		AckEveryBytes:   32 * 1024,
 		AckEveryMs:      500,
 		RedialDelays:    []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second},
 		NoV2CacheTTL:    10 * time.Minute,

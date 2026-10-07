@@ -35,6 +35,13 @@ func isV2Banned(host string) bool {
 	return false
 }
 
+// v2BanKey scopes the v2 fallback ban to one outbound tag + server. Keying
+// by the magic hostname alone would disable resume for every outbound
+// after a single server's handshake failure.
+func v2BanKey(tag string, target net.Address) string {
+	return tag + "\x00" + target.String()
+}
+
 func banV2(host string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
@@ -54,6 +61,8 @@ func shouldFallbackV1(tx, rx uint64, age time.Duration) bool {
 func BanV2ForTest(host string, ttl time.Duration) { banV2(host, ttl) }
 
 func IsV2BannedForTest(host string) bool { return isV2Banned(host) }
+
+func V2BanKeyForTest(tag string, target net.Address) string { return v2BanKey(tag, target) }
 
 func ShouldFallbackV1ForTest(tx, rx uint64, age time.Duration) bool {
 	return shouldFallbackV1(tx, rx, age)
@@ -135,7 +144,11 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 	// Instant-death handshake failure (e.g. old server): ban v2 so fresh
 	// workers fall back, instead of suspending pointlessly.
 	if shouldFallbackV1(m.gate.TxCount(), m.rx.Value(), time.Since(m.createdAt)) {
-		banV2(muxCoolAddressV2.String(), m.resume.NoV2CacheTTL)
+		key := m.banKey
+		if key == "" {
+			key = muxCoolAddressV2.String()
+		}
+		banV2(key, m.resume.NoV2CacheTTL)
 		common.Must(m.done.Close())
 		return
 	}
@@ -148,13 +161,20 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 }
 
 // startSupervisor runs redial attempts until resume or suspend timeout.
-// CAS-guarded: at most one supervisor per worker.
+// CAS-guarded: at most one supervisor per worker. On exit it re-checks:
+// without that, a concurrent startSupervisor could fail its CAS against
+// the stale flag and leave the worker suspended with no supervisor.
 func (m *ClientWorker) startSupervisor(p proxy.Outbound, d internet.Dialer, target net.Address) {
 	if !m.supervising.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
-		defer m.supervising.Store(false)
+		defer func() {
+			m.supervising.Store(false)
+			if !m.done.Done() && m.IsSuspended() && !time.Now().After(m.suspendDeadline()) {
+				m.startSupervisor(p, d, target)
+			}
+		}()
 		delays := m.resume.RedialDelays
 		if len(delays) == 0 {
 			delays = []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second}
@@ -187,9 +207,10 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
-	m.epoch++
-	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", m.epoch)
-	resume := ResumePayload{Token: m.token, Epoch: m.epoch, RxCount: m.rx.Value()}
+	m.epoch.Add(1)
+	myEpoch := m.epoch.Load()
+	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", myEpoch)
+	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: m.rx.Value()}
 	meta := FrameMetadata{SessionStatus: SessionStatusResume}
 	meta.Option.Set(OptionData)
 	payload := encodeResume(resume)
@@ -213,6 +234,12 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 			common.Must(m.done.Close())
 			return
 		}
+		if m.epoch.Load() != myEpoch {
+			// A newer attempt took over (or finished): this tail is
+			// stale and must not suspend a healthy worker or touch
+			// pipes it no longer owns.
+			return
+		}
 		m.enterSuspend()
 		m.startSupervisor(p, d, target)
 	}()
@@ -224,7 +251,8 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 }
 
 // attachCarrierSwap swaps pipes on rebind: interrupt the dead ends (stored
-// bytes make discards replayable), install the new ones.
+// bytes make discards replayable), install the new ones, and bump the pipe
+// generation so waitRebind wakes for the new downlink.
 func (m *ClientWorker) attachCarrierSwap(upW buf.Writer, downR buf.Reader) {
 	m.pipeMu.Lock()
 	oldUp, oldDown := m.upPipe, m.downPipe
@@ -232,6 +260,7 @@ func (m *ClientWorker) attachCarrierSwap(upW buf.Writer, downR buf.Reader) {
 	m.downPipe = downR
 	m.downReader = &buf.BufferedReader{Reader: downR}
 	m.pipeMu.Unlock()
+	m.pipeGen.Add(1)
 	common.Interrupt(oldUp)
 	common.Interrupt(oldDown)
 	if m.gate != nil {

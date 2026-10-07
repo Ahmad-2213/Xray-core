@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -85,9 +86,12 @@ func (s *Server) Close() error {
 }
 
 type ServerWorker struct {
-	dispatcher     routing.Dispatcher
-	link           *transport.Link
-	sessionManager *SessionManager
+	dispatcher routing.Dispatcher
+	link       *transport.Link
+	// sessionManager and gate are swapped by park/adopt while monitor and
+	// handlers read them: atomic pointers so the swap is race-free.
+	sessionManager atomic.Pointer[SessionManager]
+	gate           atomic.Pointer[carrierGate]
 	done           *done.Instance
 	timer          *time.Ticker
 	tx             Counter
@@ -96,17 +100,28 @@ type ServerWorker struct {
 	resumeHasToken bool
 	resumeUser     string
 	resumeEpoch    uint64
-	gate           *carrierGate
-	ackMu          ackState
+	// resumeDone is the token-scoped lifetime for the gate. The parking
+	// worker may be reaped by its monitor while adopted sessions are
+	// still live, so the gate must never reference a worker's done.
+	// Shared with the handover entry; closed once on worker close or
+	// park expiry.
+	resumeDone *tokenDone
+	// localUser binds rebinds to the VLESS user of this worker,
+	// captured at construction (run/adopt run on one goroutine after).
+	localUser string
+	ackMu     ackState
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
 	worker := &ServerWorker{
-		dispatcher:     d,
-		link:           link,
-		sessionManager: NewSessionManager(),
-		done:           done.New(),
-		timer:          time.NewTicker(60 * time.Second),
+		dispatcher: d,
+		link:       link,
+		done:       done.New(),
+		timer:      time.NewTicker(60 * time.Second),
+	}
+	worker.sessionManager.Store(NewSessionManager())
+	if ib := session.InboundFromContext(ctx); ib != nil && ib.User != nil {
+		worker.localUser = ib.User.Email
 	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.CanSpliceCopy = 3
@@ -130,8 +145,8 @@ func handle(ctx context.Context, s *Session, output buf.Writer) {
 // out returns the stable response-write target: the gate once a v2
 // Resume was seen, the raw carrier pipe otherwise.
 func (w *ServerWorker) out() buf.Writer {
-	if w.gate != nil {
-		return w.gate
+	if g := w.gate.Load(); g != nil {
+		return g
 	}
 	return w.link.Writer
 }
@@ -140,16 +155,17 @@ func (w *ServerWorker) monitor() {
 	defer w.timer.Stop()
 
 	for {
-		checkSize := w.sessionManager.Size()
-		checkCount := w.sessionManager.Count()
+		sm := w.sessionManager.Load()
+		checkSize := sm.Size()
+		checkCount := sm.Count()
 		select {
 		case <-w.done.Wait():
-			w.sessionManager.Close()
+			sm.Close()
 			common.Interrupt(w.link.Writer)
 			common.Interrupt(w.link.Reader)
 			return
 		case <-w.timer.C:
-			if w.sessionManager.CloseIfNoSessionAndIdle(checkSize, checkCount) {
+			if sm.CloseIfNoSessionAndIdle(checkSize, checkCount) {
 				common.Must(w.done.Close())
 			}
 		}
@@ -157,7 +173,7 @@ func (w *ServerWorker) monitor() {
 }
 
 func (w *ServerWorker) ActiveConnections() uint32 {
-	return uint32(w.sessionManager.Size())
+	return uint32(w.sessionManager.Load().Size())
 }
 
 func (w *ServerWorker) Closed() bool {
@@ -264,13 +280,13 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		x.Mux = &Session{
 			input:        x.Mux.input,
 			output:       x.Mux.output,
-			parent:       w.sessionManager,
+			parent:       w.sessionManager.Load(),
 			ID:           meta.SessionID,
 			transferType: protocol.TransferTypePacket,
 			XUDP:         x,
 		}
 		x.Status = Active
-		if !w.sessionManager.Add(x.Mux) {
+		if !w.sessionManager.Load().Add(x.Mux) {
 			x.Mux.Close(false)
 			return errors.New("failed to add new session")
 		}
@@ -278,7 +294,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return nil
 	}
 
-	link, err := w.dispatcher.Dispatch(ctx, meta.Target)
+	link, cancel, err := w.dispatchLink(ctx, meta.Target)
 	if err != nil {
 		if meta.Option.Has(OptionData) {
 			buf.Copy(NewStreamReader(reader), buf.Discard)
@@ -288,14 +304,15 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	s := &Session{
 		input:        link.Reader,
 		output:       link.Writer,
-		parent:       w.sessionManager,
+		parent:       w.sessionManager.Load(),
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
+		cancel:       cancel,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}
-	if !w.sessionManager.Add(s) {
+	if !w.sessionManager.Load().Add(s) {
 		s.Close(false)
 		return errors.New("failed to add new session")
 	}
@@ -321,11 +338,19 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 	w.countRx(meta)
 
-	s, found := w.sessionManager.Get(meta.SessionID)
+	s, found := w.sessionManager.Load().Get(meta.SessionID)
 	if !found {
-		// Notify remote peer to close this session.
-		closingWriter := NewResponseWriter(meta.SessionID, w.link.Writer, protocol.TransferTypeStream)
-		closingWriter.Close()
+		// Notify remote peer to close this session. Routed via out() so
+		// the End is counted and retained like any other frame (and hits
+		// the live carrier after a swap, not the dead original pipe).
+		// Async: the gate may be suspended (half-open park) and must
+		// never stall the reader loop.
+		sid := meta.SessionID
+		out := w.out()
+		go func() {
+			closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
+			closingWriter.Close()
+		}()
 
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
@@ -344,7 +369,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	w.countRx(meta)
-	if s, found := w.sessionManager.Get(meta.SessionID); found {
+	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
 		s.Close(false)
 	}
 	if meta.Option.Has(OptionData) {
@@ -390,15 +415,14 @@ func (w *ServerWorker) run(ctx context.Context) {
 		if !parked {
 			common.Must(w.done.Close())
 		}
+		// A parked worker's sessions outlive it (adopt or janitor owns
+		// them now); anything else dies with the worker.
+		if td := w.resumeDone; td != nil && !parked {
+			td.close()
+		}
 	}()
 
 	reader := &buf.BufferedReader{Reader: w.link.Reader}
-
-	// v2 carriers announce Resume{token, epoch, rx=0} first so a later
-	// Resume can rebind after carrier loss. Record it, then run normally.
-	if w.tryRecordAnnounce(ctx, reader) {
-		// Announce consumed; continue to session frames.
-	}
 
 	for {
 		select {
@@ -420,50 +444,64 @@ func (w *ServerWorker) run(ctx context.Context) {
 	}
 }
 
-// tryRecordAnnounce consumes a leading Resume announce frame if present.
-// It peeks one metadata: Resume+Data with a 32-byte payload is an announce;
-// anything else is replayed by... (Phase 1: only consumes when it IS an
-// announce; otherwise the frame is handled by the normal loop via pushback.)
-// Simplified: attempt one Unmarshal with a short path — if it is not Resume,
-// stash it back by returning false and letting handleFrame read it. Since
-// BufferedReader has no pushback, Phase 1 records the token inside
-// handleStatusResume on first sight instead; this hook stays for the
-// explicit adopt step and currently no-ops.
-func (w *ServerWorker) tryRecordAnnounce(ctx context.Context, reader *buf.BufferedReader) bool {
-	_ = ctx
-	_ = reader
-	return false
+// dispatchLink dispatches downstream with a carrier-detached context once
+// a v2 token is known: values (inbound, routing flags, access log) are
+// preserved via WithoutCancel, but carrier death no longer cancels parked
+// sessions' outbounds. The cancel is stored on the Session and invoked on
+// Close, so closed sessions never leak. v1 path keeps the carrier ctx.
+func (w *ServerWorker) dispatchLink(ctx context.Context, dest net.Destination) (*transport.Link, context.CancelFunc, error) {
+	dctx := ctx
+	var cancel context.CancelFunc
+	if w.resumeHasToken {
+		dctx, cancel = context.WithCancel(context.WithoutCancel(ctx))
+	}
+	link, err := w.dispatcher.Dispatch(dctx, dest)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return nil, nil, err
+	}
+	return link, cancel, nil
 }
 
 // parkForResume suspends instead of closing when a v2 token is known:
 // the session table is handed to the handover map for 10s so a fresh
 // carrier Resume can adopt it. The manager is swapped so the monitor
 // closes nothing; pipes are interrupted (retained bytes replay later).
+// The gate is moved onto the token-scoped done first: the parking worker
+// may be reaped by its monitor while adopted sessions are still live.
 // Returns true when parked.
 func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if !w.resumeHasToken {
 		return false
 	}
-	if w.sessionManager.Size() == 0 {
+	sm := w.sessionManager.Load()
+	if sm.Size() == 0 {
 		return false
 	}
 	user := w.resumeUser
 	if user == "" {
-		user = serverUserOf(ctx)
+		user = w.localUser
 	}
-	if w.gate != nil {
-		w.gate.setSuspended(true)
+	if w.resumeDone == nil {
+		w.resumeDone = newTokenDone()
 	}
-	nSessions := w.sessionManager.Size()
+	if g := w.gate.Load(); g != nil {
+		g.setSuspended(true)
+		g.swapDone(w.resumeDone.wait())
+	}
+	nSessions := sm.Size()
 	hsPut(w.resumeToken, &suspendedWorker{
-		manager: w.sessionManager,
-		gate:    w.gate,
+		manager: sm,
+		gate:    w.gate.Load(),
 		tx:      w.gateTx(),
 		rx:      w.rx.Value(),
 		epoch:   w.resumeEpoch,
 		user:    user,
+		done:    w.resumeDone,
 	})
-	w.sessionManager = NewSessionManager()
+	w.sessionManager.Store(NewSessionManager())
 	common.Interrupt(w.link.Writer)
 	common.Interrupt(w.link.Reader)
 	errors.LogInfo(ctx, "mux resume: parked ", nSessions, " sessions token ", w.tokenString(), " epoch ", w.resumeEpoch, " for rebind")
@@ -472,8 +510,8 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 
 // gateTx returns transmitted frames (0 when no gate yet).
 func (w *ServerWorker) gateTx() uint64 {
-	if w.gate == nil {
-		return 0
+	if g := w.gate.Load(); g != nil {
+		return g.TxCount()
 	}
-	return w.gate.TxCount()
+	return 0
 }

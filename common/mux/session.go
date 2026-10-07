@@ -155,23 +155,24 @@ func (m *SessionManager) Close() error {
 	return nil
 }
 
-// Reparent moves all sessions to dst (resume adopt). Caller holds no locks;
-// both managers are locked in address order to avoid deadlock with Close.
+// Reparent moves all sessions to dst (resume adopt). Caller holds no locks.
+// Only Reparent ever holds two manager locks at once, so no lock-order
+// inversion is possible. Session parent pointers are swapped under the
+// session lock: handle() goroutines draining the old carrier may Close()
+// concurrently with adopt.
 func (m *SessionManager) Reparent(dst *SessionManager) {
 	if m == dst {
 		return
 	}
-	first, second := m, dst
-	// Stable order not critical (single-threaded adopt path), keep simple.
-	first.Lock()
-	defer first.Unlock()
-	second.Lock()
-	defer second.Unlock()
+	m.Lock()
+	defer m.Unlock()
+	dst.Lock()
+	defer dst.Unlock()
 	if m.closed || dst.closed {
 		return
 	}
 	for id, s := range m.sessions {
-		s.parent = dst
+		s.setParent(dst)
 		dst.sessions[id] = s
 	}
 	m.sessions = make(map[uint16]*Session, 16)
@@ -179,21 +180,44 @@ func (m *SessionManager) Reparent(dst *SessionManager) {
 
 // Session represents a client connection in a Mux connection.
 type Session struct {
-	input        buf.Reader
-	output       buf.Writer
+	input  buf.Reader
+	output buf.Writer
+	// pmu guards parent: adopt (Reparent) swaps it while draining
+	// handle() goroutines may Close() concurrently.
+	pmu          sync.Mutex
 	parent       *SessionManager
 	ID           uint16
 	transferType protocol.TransferType
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
+	// cancel detaches the downstream (dispatcher/freedom) lifetime from
+	// the carrier: invoked on Close so a dead carrier doesn't kill
+	// parked sessions, and dead sessions don't leak outbounds.
+	cancel context.CancelFunc
+}
+
+func (s *Session) getParent() *SessionManager {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	return s.parent
+}
+
+func (s *Session) setParent(m *SessionManager) {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	s.parent = m
 }
 
 // Close closes all resources associated with this session.
 func (s *Session) Close(locked bool) error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	parent := s.getParent()
 	if !locked {
-		s.parent.Lock()
-		defer s.parent.Unlock()
+		parent.Lock()
+		defer parent.Unlock()
 	}
 	locked = true
 	if s.closed {
@@ -221,7 +245,7 @@ func (s *Session) Close(locked bool) error {
 		}
 		XUDPManager.Unlock()
 	}
-	s.parent.Remove(locked, s.ID)
+	parent.Remove(locked, s.ID)
 	return nil
 }
 

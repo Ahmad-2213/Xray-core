@@ -105,10 +105,19 @@ type carrierGate struct {
 	target    buf.Writer
 	policy    ResumePolicy
 
+	// sendMu serializes store+forward so wire order always matches seq
+	// order. Without it two session writers could put frames on the wire
+	// in a different order than their seqs, and the peer (which counts by
+	// arrival) would permanently diverge after a cut. Ack accounting and
+	// flush never take sendMu, so they can't deadlock a blocked sender.
+	sendMu sync.Mutex
+
 	tx             Counter
 	frames         []storedFrame
 	baseSeq        uint64
 	storedByte     int64
+	streamBytes    map[uint16]int64
+	flushSeq       uint64
 	onCarrierError func()
 
 	ackCh      chan struct{}
@@ -128,24 +137,39 @@ func newCarrierGate(target buf.Writer, done <-chan struct{}, policy ResumePolicy
 		target:      target,
 		done:        done,
 		policy:      policy,
-		ackCh:       make(chan struct{}, 1),
-		resumeCh:    make(chan struct{}, 1),
+		streamBytes: make(map[uint16]int64),
+		ackCh:       make(chan struct{}),
+		resumeCh:    make(chan struct{}),
 		lastAckTime: time.Now(),
 	}
 }
 
+// notifyAck wakes cap-blocked senders. Broadcast (close-and-replace) so
+// every waiter observes it; a capacity-1 send could be consumed by one
+// waiter while others sleep past their window.
 func (g *carrierGate) notifyAck() {
-	select {
-	case g.ackCh <- struct{}{}:
-	default:
-	}
+	g.mu.Lock()
+	close(g.ackCh)
+	g.ackCh = make(chan struct{})
+	g.mu.Unlock()
 }
 
+// notifyResume wakes writers parked in waitResume. Broadcast for the same
+// reason as notifyAck.
 func (g *carrierGate) notifyResume() {
-	select {
-	case g.resumeCh <- struct{}{}:
-	default:
-	}
+	g.mu.Lock()
+	close(g.resumeCh)
+	g.resumeCh = make(chan struct{})
+	g.mu.Unlock()
+}
+
+// swapDone repoints the lifetime channel (rebind adopts the gate onto a
+// token-scoped done). Callers must ensure no waiter selects on a stale
+// channel: all wait loops below re-capture under mu every iteration.
+func (g *carrierGate) swapDone(done <-chan struct{}) {
+	g.mu.Lock()
+	g.done = done
+	g.mu.Unlock()
 }
 
 // TxCount returns frames assigned so far. Unacked = TxCount - ackedUpTo.
@@ -180,6 +204,10 @@ func (g *carrierGate) ack(n uint64) {
 	g.mu.Lock()
 	for len(g.frames) > 0 && g.frames[0].seq <= n {
 		g.storedByte -= int64(len(g.frames[0].raw))
+		g.streamBytes[g.frames[0].sid] -= int64(len(g.frames[0].raw))
+		if g.streamBytes[g.frames[0].sid] <= 0 {
+			delete(g.streamBytes, g.frames[0].sid)
+		}
 		g.frames[0].raw = nil
 		g.frames = g.frames[1:]
 		g.baseSeq++
@@ -208,6 +236,11 @@ func (g *carrierGate) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if len(mb) == 0 {
 		return nil
 	}
+	// Ordered sender: seq assignment and wire order must match, otherwise
+	// the peer (which counts by arrival) diverges after a cut and the
+	// replay math silently drops frames.
+	g.sendMu.Lock()
+	defer g.sendMu.Unlock()
 	seq, counted, err := g.store(mb)
 	if err != nil {
 		return err
@@ -225,6 +258,12 @@ func (g *carrierGate) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			g.mu.Unlock()
 			if err := g.waitResume(); err != nil {
 				return err
+			}
+			// Woke via resume: the rebind flush owns retransmission of
+			// everything it covered. Only forward what it missed
+			// (stored after its snapshot); otherwise we'd double-send.
+			if g.flushedThrough(seq) {
+				return nil
 			}
 			continue
 		}
@@ -255,12 +294,12 @@ func (g *carrierGate) setOnCarrierError(f func()) {
 
 // store parses mb, cap-blocks, assigns seq and retains a private copy,
 // taking ownership of mb. Uncounted frames are left untouched for the
-// caller to forward directly.
+// caller to forward directly (ownership stays with the caller on the
+// uncounted path, including parse failures).
 func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 	first := mb[0].Bytes()
 	status, opt, metaLen, netByte, hasNet, ok := parseMetaPrefix(first)
 	if !ok {
-		buf.ReleaseMulti(mb)
 		return 0, false, nil
 	}
 	sid := uint16(0)
@@ -275,16 +314,18 @@ func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 		need += int64(len(b.Bytes()))
 	}
 	g.mu.Lock()
-	for g.storedByte+need > g.policy.MaxWorkerBuffer {
+	for g.storedByte+need > g.policy.MaxWorkerBuffer || g.streamBytes[sid]+need > g.policy.MaxStreamBuffer {
 		if g.isDoneLocked() {
 			g.mu.Unlock()
 			buf.ReleaseMulti(mb)
 			return 0, false, io.ErrClosedPipe
 		}
+		ackCh := g.ackCh
+		done := g.done
 		g.mu.Unlock()
 		select {
-		case <-g.ackCh:
-		case <-g.done:
+		case <-ackCh:
+		case <-done:
 			buf.ReleaseMulti(mb)
 			return 0, false, io.ErrClosedPipe
 		}
@@ -301,8 +342,16 @@ func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 	g.tx.mu.Unlock()
 	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw})
 	g.storedByte += int64(len(raw))
+	g.streamBytes[sid] += int64(len(raw))
 	g.mu.Unlock()
 	return seq, true, nil
+}
+
+// flushedThrough reports whether seq was covered by a rebind flush.
+func (g *carrierGate) flushedThrough(seq uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return seq <= g.flushSeq
 }
 
 // rawCopyOf returns a private copy of the retained frame, if still held.
@@ -348,10 +397,12 @@ func (g *carrierGate) waitResume() error {
 			g.mu.Unlock()
 			return nil
 		}
+		resumeCh := g.resumeCh
+		done := g.done
 		g.mu.Unlock()
 		select {
-		case <-g.resumeCh:
-		case <-g.done:
+		case <-resumeCh:
+		case <-done:
 			return io.ErrClosedPipe
 		case <-time.After(time.Second):
 		}
@@ -402,6 +453,8 @@ func (g *carrierGate) writeAck(rx uint64) {
 }
 
 // flushSince writes pending Ack then retained frames with seq > peerRx.
+// Covers exactly the unacked suffix; records the high-water mark so live
+// writers waking from suspend don't re-forward what was just replayed.
 func (g *carrierGate) flushSince(peerRx uint64) error {
 	g.mu.Lock()
 	var ackToSend uint64
@@ -412,11 +465,15 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	}
 	target := g.target
 	var frames [][]byte
+	maxSent := peerRx
 	for _, f := range g.frames {
 		if f.seq > peerRx {
 			cp := make([]byte, len(f.raw))
 			copy(cp, f.raw)
 			frames = append(frames, cp)
+			if f.seq > maxSent {
+				maxSent = f.seq
+			}
 		}
 	}
 	g.mu.Unlock()
@@ -433,5 +490,10 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 			return err
 		}
 	}
+	g.mu.Lock()
+	if maxSent > g.flushSeq {
+		g.flushSeq = maxSent
+	}
+	g.mu.Unlock()
 	return nil
 }

@@ -121,10 +121,9 @@ type MuxResumeConfig struct {
 	SuspendTimeoutSec int  `json:"suspendTimeoutSec"`
 	MaxStreamBufferKB int  `json:"maxStreamBufferKB"`
 	MaxWorkerBufferMB int  `json:"maxWorkerBufferMB"`
-	AckEveryKB        int  `json:"ackEveryKB"`
 	AckEveryMs        int  `json:"ackEveryMs"`
 	AckTimeoutSec     int  `json:"ackTimeoutSec"`
-	NoV2CacheTTLSec   int  `json:"noV2CacheTTLMin"`
+	NoV2CacheTTLSec   int  `json:"noV2CacheTTLSec"`
 }
 
 // ToPolicy converts JSON config to a mux.ResumePolicy with reviewed defaults.
@@ -142,9 +141,6 @@ func (m *MuxResumeConfig) ToPolicy() mux.ResumePolicy {
 	}
 	if m.MaxWorkerBufferMB > 0 {
 		p.MaxWorkerBuffer = int64(m.MaxWorkerBufferMB) * 1024 * 1024
-	}
-	if m.AckEveryKB > 0 {
-		p.AckEveryBytes = int64(m.AckEveryKB) * 1024
 	}
 	if m.AckEveryMs > 0 {
 		p.AckEveryMs = int64(m.AckEveryMs)
