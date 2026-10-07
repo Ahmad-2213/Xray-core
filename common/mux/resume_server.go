@@ -48,30 +48,31 @@ func (w *ServerWorker) maybeSendAck() {
 		return
 	}
 	intervalMs := int64(500)
+	interval := time.Duration(intervalMs) * time.Millisecond
 	now := time.Now()
 	w.ackMu.mu.Lock()
-	if now.Sub(w.ackMu.lastTime) < time.Duration(intervalMs)*time.Millisecond {
-		if c := w.rx.Value(); c != w.ackMu.lastSent && !w.ackMu.pending {
-			w.ackMu.pending = true
-			wait := time.Duration(intervalMs)*time.Millisecond - now.Sub(w.ackMu.lastTime)
-			w.ackMu.mu.Unlock()
-			time.AfterFunc(wait, w.sendTrailingAck)
-			return
-		}
-		w.ackMu.mu.Unlock()
-		return
-	}
 	count := w.rx.Value()
-	if count == w.ackMu.lastSent {
+	advanced := count != w.ackMu.lastSent
+	// Frame-count trigger: bulk traffic must not wait out the whole
+	// timer per window; combined with the timer below this bounds both
+	// ack latency and ack rate.
+	if advanced && (count-w.ackMu.lastSent >= 64 || now.Sub(w.ackMu.lastTime) >= interval) {
+		w.ackMu.lastSent = count
+		w.ackMu.lastTime = now
 		w.ackMu.mu.Unlock()
+		if g := w.gate.Load(); g != nil {
+			g.writeAck(count)
+		}
 		return
 	}
-	w.ackMu.lastSent = count
-	w.ackMu.lastTime = now
-	w.ackMu.mu.Unlock()
-	if g := w.gate.Load(); g != nil {
-		g.writeAck(count)
+	if advanced && !w.ackMu.pending {
+		w.ackMu.pending = true
+		wait := interval - now.Sub(w.ackMu.lastTime)
+		w.ackMu.mu.Unlock()
+		time.AfterFunc(wait, w.sendTrailingAck)
+		return
 	}
+	w.ackMu.mu.Unlock()
 }
 
 // sendTrailingAck emits the delayed ack scheduled by maybeSendAck.
@@ -121,6 +122,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		// Adopt the parked table, gate (with retain store) and rx baseline.
 		entry.manager.Reparent(w.sessionManager.Load())
 		w.rx.Set(entry.rx)
+		w.rsMu.Lock()
 		if entry.gate != nil {
 			w.gate.Store(entry.gate)
 			entry.gate.swapTarget(w.link.Writer)
@@ -133,6 +135,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		w.resumeHasToken = true
 		w.resumeUser = entry.user
 		w.resumeDone = entry.done
+		w.rsMu.Unlock()
 		if w.gate.Load() == nil {
 			g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
 			if w.resumeDone != nil {
@@ -191,10 +194,12 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	// with epoch 0 ("nothing parked") instead of silence so the client
 	// retries on cadence instead of stalling one redial for 8s. The client
 	// ignores epoch-0 replies without resuming.
+	w.rsMu.Lock()
 	w.resumeToken = rp.Token
 	w.resumeEpoch = rp.Epoch
 	w.resumeHasToken = true
 	w.resumeUser = w.localUser
+	w.rsMu.Unlock()
 	if w.gate.Load() == nil {
 		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
 		if w.resumeDone == nil {
@@ -252,7 +257,8 @@ func (w *ServerWorker) watchHalfOpen() {
 			continue
 		}
 		g := w.gate.Load()
-		if halfOpenTripped(g.UnackedBytes(), time.Since(g.lastAckRecv()), 4*time.Second) {
+		idle := time.Since(g.lastAckRecv())
+		if halfOpenTripped(g.UnackedBytes(), idle, g.unackedAge(), 4*time.Second) {
 			// Park via a synthetic path: reuse run()'s park by closing
 			// nothing, just parking directly.
 			w.parkForResume(context.Background())

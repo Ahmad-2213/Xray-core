@@ -17,6 +17,7 @@ type suspendedWorker struct {
 	epoch   uint64
 	user    string
 	expires time.Time
+	born    time.Time
 	done    *tokenDone
 }
 
@@ -73,6 +74,9 @@ var (
 const (
 	hsMaxEntries = 1024
 	hsTTL        = 10 * time.Second
+	// hsMaxLifetime caps total park time across validation-failure
+	// refreshes: repeated failures must not pin an entry indefinitely.
+	hsMaxLifetime = 60 * time.Second
 )
 
 func hsPut(token [16]byte, e *suspendedWorker) {
@@ -113,8 +117,12 @@ func hsPut(token [16]byte, e *suspendedWorker) {
 		// can never rebind again, close it instead of leaking.
 		closeEntry(old)
 	}
+	if e.born.IsZero() {
+		e.born = time.Now()
+	}
 	e.expires = time.Now().Add(hsTTL)
 	hsEntries[token] = e
+	lazyJanitor()
 }
 
 func hsTake(token [16]byte) (*suspendedWorker, bool) {
@@ -163,7 +171,12 @@ func hsAdopt(token [16]byte, validate func(*suspendedWorker) error) (*suspendedW
 		return nil, false, nil
 	}
 	if err := validate(e); err != nil {
+		// Refresh, but never past the lifetime cap: repeated failures
+		// must not pin an entry indefinitely.
 		e.expires = time.Now().Add(hsTTL)
+		if max := e.born.Add(hsMaxLifetime); !e.born.IsZero() && e.expires.After(max) {
+			e.expires = max
+		}
 		return nil, true, err
 	}
 	delete(hsEntries, token)
@@ -184,14 +197,22 @@ func sweepExpired() {
 	}
 }
 
-func init() {
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for range t.C {
-			sweepExpired()
-		}
-	}()
+var janitorOnce sync.Once
+
+// lazyJanitor starts the expiry sweeper on first park (no eager init, so
+// importing common/mux with resume disabled costs no goroutine). Expiry is
+// otherwise lazy (checked on take/peek), which alone could pin dead entries
+// when no new traffic arrives.
+func lazyJanitor() {
+	janitorOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for range t.C {
+				sweepExpired()
+			}
+		}()
+	})
 }
 
 // hsPutBack restores an entry after failed validation so a later retry

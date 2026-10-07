@@ -420,15 +420,11 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 
-	// Count before lookup, mirroring the server: the frame was delivered
-	// in full, and the sender already counted it at store time. The
-	// not-found path below must also count, or the counters diverge by
-	// one per unknown-session frame.
-	if m.resume.Enabled && meta.Target.Network != net.Network_UDP {
-		m.rx.Next()
-		m.maybeSendAck()
-	}
-
+	// Count only what was actually delivered: the sender counts at store
+	// time, so a frame cut mid-payload must stay out of rx or the sender
+	// will never replay it (silent loss). A downstream write error means
+	// the carrier delivered fully — still count. Mirrors the server.
+	count := m.resume.Enabled && meta.Target.Network != net.Network_UDP
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
 		// Notify remote peer to close this session. Routed via out() so
@@ -442,11 +438,24 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			closingWriter.Close()
 		}()
 
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
+		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+			return err
+		}
+		if count {
+			m.rx.Next()
+			m.maybeSendAck()
+		}
+		return nil
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
 	err := buf.Copy(rr, s.output)
+	if err == nil || buf.IsWriteError(err) {
+		if count {
+			m.rx.Next()
+			m.maybeSendAck()
+		}
+	}
 	if err != nil && buf.IsWriteError(err) {
 		errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
@@ -460,12 +469,15 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
 		s.Close(false)
 	}
-	if m.resume.Enabled {
+	count := m.resume.Enabled
+	if meta.Option.Has(OptionData) {
+		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+			return err
+		}
+	}
+	if count {
 		m.rx.Next()
 		m.maybeSendAck()
-	}
-	if meta.Option.Has(OptionData) {
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
 }
@@ -560,33 +572,32 @@ func (m *ClientWorker) maybeSendAck() {
 	if !m.resume.Enabled || m.gate == nil {
 		return
 	}
-	interval := m.resume.AckEveryMs
-	if interval <= 0 {
-		interval = 500
+	intervalMs := m.resume.AckEveryMs
+	if intervalMs <= 0 {
+		intervalMs = 500
 	}
+	interval := time.Duration(intervalMs) * time.Millisecond
 	now := time.Now()
 	m.ackMu.mu.Lock()
-	if now.Sub(m.ackMu.lastTime) < time.Duration(interval)*time.Millisecond {
-		if c := m.rx.Value(); c != m.ackMu.lastSent && !m.ackMu.pending {
-			m.ackMu.pending = true
-			wait := time.Duration(interval)*time.Millisecond - now.Sub(m.ackMu.lastTime)
-			m.ackMu.mu.Unlock()
-			time.AfterFunc(wait, m.sendTrailingAck)
-			return
-		}
-		m.ackMu.mu.Unlock()
-		return
-	}
 	count := m.rx.Value()
-	if count == m.ackMu.lastSent {
+	advanced := count != m.ackMu.lastSent
+	// Frame-count trigger: bulk traffic must not wait out the whole
+	// timer per window (see server maybeSendAck).
+	if advanced && (count-m.ackMu.lastSent >= 64 || now.Sub(m.ackMu.lastTime) >= interval) {
+		m.ackMu.lastSent = count
+		m.ackMu.lastTime = now
 		m.ackMu.mu.Unlock()
+		m.gate.writeAck(count)
 		return
 	}
-	m.ackMu.lastSent = count
-	m.ackMu.lastTime = now
+	if advanced && !m.ackMu.pending {
+		m.ackMu.pending = true
+		wait := interval - now.Sub(m.ackMu.lastTime)
+		m.ackMu.mu.Unlock()
+		time.AfterFunc(wait, m.sendTrailingAck)
+		return
+	}
 	m.ackMu.mu.Unlock()
-
-	m.gate.writeAck(count)
 }
 
 // sendTrailingAck emits the delayed ack scheduled by maybeSendAck.
@@ -606,19 +617,34 @@ func (m *ClientWorker) sendTrailingAck() {
 	}
 }
 
+// currentDownReaderGen returns the live downlink reader together with its
+// pipe generation, atomically: a swap between separate calls could hand
+// fetchOutput a reader that no longer matches the generation it compares.
+func (m *ClientWorker) currentDownReaderGen() (*buf.BufferedReader, uint64) {
+	m.pipeMu.Lock()
+	defer m.pipeMu.Unlock()
+	return m.downReader, m.pipeGen.Load()
+}
+
 func (m *ClientWorker) fetchOutput() {
 	defer func() {
 		common.Must(m.done.Close())
 	}()
 
 	for {
-		reader := m.currentDownReader()
+		reader, gen := m.currentDownReaderGen()
 		if m.readLoop(reader) {
 			return
 		}
 		// Carrier read failed. v1 path (or closed worker): fail fast.
 		if m.gate == nil || m.done.Done() {
 			return
+		}
+		// A swap landed while reading: the new downlink (and its Resume
+		// reply) is already installed — read it immediately instead of
+		// waiting out a poll with a stale generation baseline.
+		if m.pipeGen.Load() != gen {
+			continue
 		}
 		// Suspended: park until rebind swaps in a fresh reader, the
 		// worker closes, or the episode times out.

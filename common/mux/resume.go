@@ -131,9 +131,11 @@ func validateRebind(entryTx, entryEpoch uint64, entryUser string, rp ResumePaylo
 
 // halfOpenTripped fires the unilateral half-open detector: bytes retained
 // (unacked) while no Ack arrived for longer than the timeout means the read
-// side is stalled even though writes succeed.
-func halfOpenTripped(unacked int64, idle, timeout time.Duration) bool {
-	return unacked > 0 && idle > timeout
+// side is stalled even though writes succeed. All three must hold: fresh
+// acks veto the trip (slow bulk with flowing acks is healthy), and young
+// unacked data vetoes it (a send after silence hasn't had time to be acked).
+func halfOpenTripped(unacked int64, idle, age, timeout time.Duration) bool {
+	return unacked > 0 && idle > timeout && age > timeout
 }
 
 // NewToken generates an unguessable 128-bit resume token. It must be bound

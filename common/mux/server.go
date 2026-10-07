@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -106,6 +107,16 @@ type ServerWorker struct {
 	// Shared with the handover entry; closed once on worker close or
 	// park expiry.
 	resumeDone *tokenDone
+	// rsMu guards the resume fields below: parkForResume runs on the run
+	// loop, the gate error callback, and the half-open watcher, while
+	// handleStatusResume runs on the run loop. Without it concurrent
+	// parks double-store (killing the park via close-on-overwrite) and
+	// race the adopt assignments.
+	rsMu sync.Mutex
+	// parkOnce ensures exactly one park per worker: concurrent triggers
+	// (read error + write error + watchdog on a busy death) must not
+	// double-store the same table.
+	parkOnce atomic.Bool
 	// localUser binds rebinds to the VLESS user of this worker,
 	// captured at construction (run/adopt run on one goroutine after).
 	localUser string
@@ -120,15 +131,30 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 		timer:      time.NewTicker(60 * time.Second),
 	}
 	worker.sessionManager.Store(NewSessionManager())
-	if ib := session.InboundFromContext(ctx); ib != nil && ib.User != nil {
-		worker.localUser = ib.User.Email
-	}
+	worker.localUser = boundIdentity(ctx)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		inbound.CanSpliceCopy = 3
 	}
 	go worker.run(ctx)
 	go worker.monitor()
 	return worker, nil
+}
+
+// boundIdentity binds rebinds to the authenticated user behind this
+// worker: email when set, else the account proto string. Empty only for
+// anonymous inbounds, which are unbindable by necessity (documented).
+func boundIdentity(ctx context.Context) string {
+	ib := session.InboundFromContext(ctx)
+	if ib == nil || ib.User == nil {
+		return ""
+	}
+	if ib.User.Email != "" {
+		return ib.User.Email
+	}
+	if s, ok := ib.User.Account.ToProto().(interface{ String() string }); ok {
+		return s.String()
+	}
+	return ""
 }
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
@@ -316,14 +342,17 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		s.Close(false)
 		return errors.New("failed to add new session")
 	}
-	w.countRx(meta)
 	go handle(ctx, s, w.out())
 	if !meta.Option.Has(OptionData) {
+		w.countRx(meta)
 		return nil
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
 	err = buf.Copy(rr, s.output)
+	if err == nil || buf.IsWriteError(err) {
+		w.countRx(meta)
+	}
 
 	if err != nil && buf.IsWriteError(err) {
 		s.Close(false)
@@ -336,8 +365,9 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
-	w.countRx(meta)
-
+	// Count only what was actually delivered (see client
+	// handleStatusKeep): a frame cut mid-payload must stay out of rx.
+	count := meta.Target.Network != net.Network_UDP
 	s, found := w.sessionManager.Load().Get(meta.SessionID)
 	if !found {
 		// Notify remote peer to close this session. Routed via out() so
@@ -352,11 +382,22 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			closingWriter.Close()
 		}()
 
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
+		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+			return err
+		}
+		if count {
+			w.countRx(meta)
+		}
+		return nil
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
 	err := buf.Copy(rr, s.output)
+	if err == nil || buf.IsWriteError(err) {
+		if count {
+			w.countRx(meta)
+		}
+	}
 
 	if err != nil && buf.IsWriteError(err) {
 		errors.LogInfoInner(context.Background(), err, "failed to write to downstream writer. closing session ", s.ID)
@@ -368,13 +409,15 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 }
 
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	w.countRx(meta)
 	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
 		s.Close(false)
 	}
 	if meta.Option.Has(OptionData) {
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
+		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+			return err
+		}
 	}
+	w.countRx(meta)
 	return nil
 }
 
@@ -417,7 +460,10 @@ func (w *ServerWorker) run(ctx context.Context) {
 		}
 		// A parked worker's sessions outlive it (adopt or janitor owns
 		// them now); anything else dies with the worker.
-		if td := w.resumeDone; td != nil && !parked {
+		w.rsMu.Lock()
+		td := w.resumeDone
+		w.rsMu.Unlock()
+		if td != nil && !parked {
 			td.close()
 		}
 	}()
@@ -473,6 +519,8 @@ func (w *ServerWorker) dispatchLink(ctx context.Context, dest net.Destination) (
 // may be reaped by its monitor while adopted sessions are still live.
 // Returns true when parked.
 func (w *ServerWorker) parkForResume(ctx context.Context) bool {
+	w.rsMu.Lock()
+	defer w.rsMu.Unlock()
 	if !w.resumeHasToken {
 		return false
 	}
@@ -480,13 +528,19 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if sm.Size() == 0 {
 		return false
 	}
+	// Exactly one park per worker. A loser returns true: the park did
+	// happen (by the winner), so the caller must treat sessions as
+	// parked — especially run(), which must NOT close the shared done.
+	if !w.parkOnce.CompareAndSwap(false, true) {
+		return true
+	}
 	user := w.resumeUser
 	if user == "" {
 		user = w.localUser
 	}
-	if w.resumeDone == nil {
-		w.resumeDone = newTokenDone()
-	}
+	// Fresh tokenDone per park: the previous park's done may still be
+	// owned by an entry (adopted or expired), which closes it itself.
+	w.resumeDone = newTokenDone()
 	if g := w.gate.Load(); g != nil {
 		g.setSuspended(true)
 		g.swapDone(w.resumeDone.wait())

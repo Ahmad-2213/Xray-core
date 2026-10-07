@@ -51,6 +51,27 @@ func banV2(host string, ttl time.Duration) {
 	noV2Until[host] = time.Now().Add(ttl)
 }
 
+var (
+	v2FailMu sync.Mutex
+	v2Fails  = make(map[string]int)
+)
+
+// recordV2Fail counts consecutive instant-death handshakes per ban key.
+// A single transient dial failure must not ban v2 (that failure is what
+// resume exists for); only a streak proves an old/non-v2 server.
+func recordV2Fail(key string) int {
+	v2FailMu.Lock()
+	defer v2FailMu.Unlock()
+	v2Fails[key]++
+	return v2Fails[key]
+}
+
+func clearV2Fails(key string) {
+	v2FailMu.Lock()
+	defer v2FailMu.Unlock()
+	delete(v2Fails, key)
+}
+
 // shouldFallbackV1 detects a carrier that died before a single counted
 // frame in either direction: the peer is not v2 (old server), so the worker
 // must close and let fresh workers use v1 instead of suspending pointlessly.
@@ -61,6 +82,10 @@ func shouldFallbackV1(tx, rx uint64, age time.Duration) bool {
 func BanV2ForTest(host string, ttl time.Duration) { banV2(host, ttl) }
 
 func IsV2BannedForTest(host string) bool { return isV2Banned(host) }
+
+func RecordV2FailForTest(key string) int { return recordV2Fail(key) }
+
+func ClearV2FailsForTest(key string) { clearV2Fails(key) }
 
 func V2BanKeyForTest(tag string, target net.Address) string { return v2BanKey(tag, target) }
 
@@ -141,17 +166,21 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 		common.Must(m.done.Close())
 		return
 	}
-	// Instant-death handshake failure (e.g. old server): ban v2 so fresh
-	// workers fall back, instead of suspending pointlessly.
+	// Instant-death handshake failure (e.g. old server): fall back so
+	// fresh workers use v1 instead of suspending pointlessly. Ban v2
+	// only on a streak: one transient dial failure is what resume is for.
+	key := m.banKey
+	if key == "" {
+		key = muxCoolAddressV2.String()
+	}
 	if shouldFallbackV1(m.gate.TxCount(), m.rx.Value(), time.Since(m.createdAt)) {
-		key := m.banKey
-		if key == "" {
-			key = muxCoolAddressV2.String()
+		if recordV2Fail(key) >= 3 {
+			banV2(key, m.resume.NoV2CacheTTL)
 		}
-		banV2(key, m.resume.NoV2CacheTTL)
 		common.Must(m.done.Close())
 		return
 	}
+	clearV2Fails(key)
 	if m.sessionManager.Size() == 0 {
 		common.Must(m.done.Close())
 		return
@@ -324,7 +353,11 @@ func (m *ClientWorker) watchHalfOpen(p proxy.Outbound, d internet.Dialer, target
 		if timeout <= 0 {
 			timeout = 4 * time.Second
 		}
-		if halfOpenTripped(m.gate.UnackedBytes(), time.Since(m.gate.lastAckRecv()), timeout) {
+		// Trip only when acks are stale AND the oldest unacked frame is
+		// old: fresh acks veto (slow bulk is healthy), and young data
+		// vetoes (a send after silence hasn't had time to be acked).
+		idle := time.Since(m.gate.lastAckRecv())
+		if halfOpenTripped(m.gate.UnackedBytes(), idle, m.gate.unackedAge(), timeout) {
 			m.enterSuspend()
 			m.startSupervisor(p, d, target)
 		}

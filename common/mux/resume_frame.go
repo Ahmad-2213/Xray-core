@@ -77,6 +77,6 @@ func ValidateRebindForTest(entryTx, entryEpoch uint64, entryUser string, rp Resu
 	return validateRebind(entryTx, entryEpoch, entryUser, rp, user)
 }
 
-func HalfOpenTrippedForTest(unacked int64, idle, timeout time.Duration) bool {
-	return halfOpenTripped(unacked, idle, timeout)
+func HalfOpenTrippedForTest(unacked int64, idle, age, timeout time.Duration) bool {
+	return halfOpenTripped(unacked, idle, age, timeout)
 }

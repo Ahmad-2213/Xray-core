@@ -266,17 +266,23 @@ func TestValidateRebindMatrix(t *testing.T) {
 }
 
 func TestHalfOpenTrippedMatrix(t *testing.T) {
-	if mux.HalfOpenTrippedForTest(0, 10*time.Second, 4*time.Second) {
+	if mux.HalfOpenTrippedForTest(0, 10*time.Second, 10*time.Second, 4*time.Second) {
 		t.Fatal("no unacked bytes must not trip")
 	}
-	if !mux.HalfOpenTrippedForTest(100, 5*time.Second, 4*time.Second) {
-		t.Fatal("stalled acks must trip")
+	if !mux.HalfOpenTrippedForTest(100, 5*time.Second, 5*time.Second, 4*time.Second) {
+		t.Fatal("stalled acks with old unacked data must trip")
 	}
-	if mux.HalfOpenTrippedForTest(100, 4*time.Second, 4*time.Second) {
+	if mux.HalfOpenTrippedForTest(100, 4*time.Second, 5*time.Second, 4*time.Second) {
 		t.Fatal("trip must be strictly past the timeout")
 	}
-	if mux.HalfOpenTrippedForTest(100, 0, 4*time.Second) {
-		t.Fatal("fresh acks must not trip")
+	if mux.HalfOpenTrippedForTest(100, 5*time.Second, 4*time.Second, 4*time.Second) {
+		t.Fatal("age must be strictly past the timeout")
+	}
+	if mux.HalfOpenTrippedForTest(100, 5*time.Second, 0, 4*time.Second) {
+		t.Fatal("young unacked data must veto (send after silence)")
+	}
+	if mux.HalfOpenTrippedForTest(100, 0, 5*time.Second, 4*time.Second) {
+		t.Fatal("fresh acks must veto (slow bulk is healthy)")
 	}
 }
 
@@ -586,6 +592,76 @@ func TestGateAckAfterFlushFreesAll(t *testing.T) {
 	if g.UnackedBytes() != 0 {
 		t.Fatal("ack-after-flush must free all retained bytes")
 	}
+}
+
+func TestGateReserveDoesNotStallOthers(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	policy := mux.DefaultResumePolicy()
+	policy.MaxWorkerBuffer = 64 * 1024 * 1024
+	policy.MaxStreamBuffer = 256
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, policy)
+	bulkMB := countedFrameBytesForTest(t, 1, mux.SessionStatusNew, strings.Repeat("B", 1024))
+	smallMB := countedFrameBytesForTest(t, 2, mux.SessionStatusNew, "s")
+	// Bulk frame exceeds the per-stream window: reserve blocks (no acks).
+	bulkDone := make(chan error, 1)
+	go func() { bulkDone <- g.WriteMultiBuffer(bulkMB) }()
+	select {
+	case err := <-bulkDone:
+		t.Fatalf("bulk write returned early: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// A small stream on another sid must still complete promptly: the
+	// cap-block waits without holding the ordered sender.
+	smallDone := make(chan error, 1)
+	go func() { smallDone <- g.WriteMultiBuffer(smallMB) }()
+	select {
+	case err := <-smallDone:
+		if err != nil {
+			t.Fatal("small stream stalled behind bulk reserve:", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("small stream head-of-line blocked by bulk cap-block")
+	}
+}
+
+func TestGateUnackedAge(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	if age := mux.GateUnackedAgeForTest(g); age != 0 {
+		t.Fatalf("empty gate age = %v, want 0", age)
+	}
+	mb := countedFrameBytesForTest(t, 1, mux.SessionStatusNew, "aged")
+	if err := g.WriteMultiBuffer(mb); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if age := mux.GateUnackedAgeForTest(g); age < 20*time.Millisecond {
+		t.Fatalf("retained frame age = %v, want >= 20ms", age)
+	}
+	mux.GateAckForTest(g, 1)
+	if age := mux.GateUnackedAgeForTest(g); age != 0 {
+		t.Fatalf("acked gate age = %v, want 0", age)
+	}
+}
+
+func TestV2FailConsecutive(t *testing.T) {
+	key := "failkey-test.invalid"
+	mux.ClearV2FailsForTest(key)
+	if n := mux.RecordV2FailForTest(key); n != 1 {
+		t.Fatalf("first fail = %d, want 1", n)
+	}
+	if n := mux.RecordV2FailForTest(key); n != 2 {
+		t.Fatalf("second fail = %d, want 2", n)
+	}
+	mux.ClearV2FailsForTest(key)
+	if n := mux.RecordV2FailForTest(key); n != 1 {
+		t.Fatalf("fail after clear = %d, want 1", n)
+	}
+	mux.ClearV2FailsForTest(key)
 }
 
 // ---- Phase 3: v1/v2 interop matrix ----

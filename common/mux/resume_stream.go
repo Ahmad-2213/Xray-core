@@ -92,10 +92,13 @@ func GateFlushSinceForTest(g *carrierGate, peerRx uint64) error { return g.flush
 
 func GateWriteAckForTest(g *carrierGate, rx uint64) { g.writeAck(rx) }
 
+func GateUnackedAgeForTest(g *carrierGate) time.Duration { return g.unackedAge() }
+
 type storedFrame struct {
-	seq uint64
-	sid uint16
-	raw []byte
+	seq      uint64
+	sid      uint16
+	raw      []byte
+	storedAt time.Time
 }
 
 type carrierGate struct {
@@ -219,6 +222,17 @@ func (g *carrierGate) ack(n uint64) {
 	g.notifyAck()
 }
 
+// unackedAge returns how long the oldest retained frame has waited for
+// its ack, or 0 when nothing is retained.
+func (g *carrierGate) unackedAge() time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.frames) == 0 {
+		return 0
+	}
+	return time.Since(g.frames[0].storedAt)
+}
+
 // lastAckRecv returns when the last Ack was processed.
 func (g *carrierGate) lastAckRecv() time.Time {
 	g.ackRecvMu.Lock()
@@ -236,18 +250,60 @@ func (g *carrierGate) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if len(mb) == 0 {
 		return nil
 	}
-	// Ordered sender: seq assignment and wire order must match, otherwise
-	// the peer (which counts by arrival) diverges after a cut and the
-	// replay math silently drops frames.
-	g.sendMu.Lock()
-	defer g.sendMu.Unlock()
-	seq, counted, err := g.store(mb)
-	if err != nil {
-		return err
-	}
-	if !counted {
+	return g.writeCounted(mb)
+}
+
+// parse extracts frame identity without locking or taking ownership.
+func (g *carrierGate) parse(mb buf.MultiBuffer) (SessionStatus, bitmask.Byte, int, byte, bool, bool) {
+	return parseMetaPrefix(mb[0].Bytes())
+}
+
+// writeCounted runs the ordered sender: seq assignment and wire order must
+// match, otherwise the peer (which counts by arrival) diverges after a cut
+// and the replay math silently drops frames.
+func (g *carrierGate) writeCounted(mb buf.MultiBuffer) error {
+	status, opt, metaLen, netByte, hasNet, ok := g.parse(mb)
+	if !ok {
 		return g.forwardUncounted(mb)
 	}
+	sid := uint16(0)
+	if first := mb[0].Bytes(); len(first) >= 4 {
+		sid = uint16(first[2])<<8 | uint16(first[3])
+	}
+	if !countedFrame(status, opt, metaLen, netByte, hasNet) {
+		return g.forwardUncounted(mb)
+	}
+	var need int64
+	for _, b := range mb {
+		need += int64(len(b.Bytes()))
+	}
+	// Reserve credit before taking sendMu: a cap-blocked bulk stream must
+	// not stall other sessions' senders.
+	for {
+		if err := g.reserve(need, sid); err != nil {
+			buf.ReleaseMulti(mb)
+			return err
+		}
+		g.sendMu.Lock()
+		seq, retry, err := g.retain(mb, need, sid)
+		if err != nil {
+			g.sendMu.Unlock()
+			return err
+		}
+		if !retry {
+			defer g.sendMu.Unlock()
+			return g.forwardRetained(seq)
+		}
+		// Lost a race after reserve (mb untouched): release sendMu and
+		// re-reserve. Caps only loosen via ack, which never takes
+		// sendMu, so this terminates.
+		g.sendMu.Unlock()
+	}
+}
+
+// forwardRetained forwards one retained frame, riding out suspension and
+// carrier errors. Caller holds sendMu, released on return.
+func (g *carrierGate) forwardRetained(seq uint64) error {
 	for {
 		g.mu.Lock()
 		if g.isDoneLocked() {
@@ -292,33 +348,15 @@ func (g *carrierGate) setOnCarrierError(f func()) {
 	g.onCarrierError = f
 }
 
-// store parses mb, cap-blocks, assigns seq and retains a private copy,
-// taking ownership of mb. Uncounted frames are left untouched for the
-// caller to forward directly (ownership stays with the caller on the
-// uncounted path, including parse failures).
-func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
-	first := mb[0].Bytes()
-	status, opt, metaLen, netByte, hasNet, ok := parseMetaPrefix(first)
-	if !ok {
-		return 0, false, nil
-	}
-	sid := uint16(0)
-	if len(first) >= 4 {
-		sid = uint16(first[2])<<8 | uint16(first[3])
-	}
-	if !countedFrame(status, opt, metaLen, netByte, hasNet) {
-		return 0, false, nil
-	}
-	need := int64(0)
-	for _, b := range mb {
-		need += int64(len(b.Bytes()))
-	}
+// reserve blocks until need bytes fit the worker and per-stream caps.
+// Runs without sendMu so a cap-blocked bulk stream never stalls other
+// sessions' senders; retain re-verifies under sendMu afterwards.
+func (g *carrierGate) reserve(need int64, sid uint16) error {
 	g.mu.Lock()
 	for g.storedByte+need > g.policy.MaxWorkerBuffer || g.streamBytes[sid]+need > g.policy.MaxStreamBuffer {
 		if g.isDoneLocked() {
 			g.mu.Unlock()
-			buf.ReleaseMulti(mb)
-			return 0, false, io.ErrClosedPipe
+			return io.ErrClosedPipe
 		}
 		ackCh := g.ackCh
 		done := g.done
@@ -326,10 +364,28 @@ func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 		select {
 		case <-ackCh:
 		case <-done:
-			buf.ReleaseMulti(mb)
-			return 0, false, io.ErrClosedPipe
+			return io.ErrClosedPipe
 		}
 		g.mu.Lock()
+	}
+	g.mu.Unlock()
+	return nil
+}
+
+// errReserveRetry is internal: retain lost a race after reserve; the
+
+// retain stores a private copy and assigns its seq, consuming mb.
+// Caller holds sendMu. Caps were reserved beforehand and are re-verified
+// here; on a lost race it returns retry=true with mb untouched.
+func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16) (seq uint64, retry bool, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.isDoneLocked() {
+		buf.ReleaseMulti(mb)
+		return 0, false, io.ErrClosedPipe
+	}
+	if g.storedByte+need > g.policy.MaxWorkerBuffer || g.streamBytes[sid]+need > g.policy.MaxStreamBuffer {
+		return 0, true, nil
 	}
 	raw := make([]byte, 0, need)
 	for _, b := range mb {
@@ -338,13 +394,12 @@ func (g *carrierGate) store(mb buf.MultiBuffer) (uint64, bool, error) {
 	buf.ReleaseMulti(mb)
 	g.tx.mu.Lock()
 	g.tx.n++
-	seq := g.tx.n
+	seq = g.tx.n
 	g.tx.mu.Unlock()
-	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw})
+	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw, storedAt: time.Now()})
 	g.storedByte += int64(len(raw))
 	g.streamBytes[sid] += int64(len(raw))
-	g.mu.Unlock()
-	return seq, true, nil
+	return seq, false, nil
 }
 
 // flushedThrough reports whether seq was covered by a rebind flush.

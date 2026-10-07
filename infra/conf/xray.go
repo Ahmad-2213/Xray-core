@@ -137,7 +137,13 @@ func (m *MuxResumeConfig) ToPolicy() mux.ResumePolicy {
 		p.SuspendTimeout = time.Duration(m.SuspendTimeoutSec) * time.Second
 	}
 	if m.MaxStreamBufferKB > 0 {
-		p.MaxStreamBuffer = int64(m.MaxStreamBufferKB) * 1024
+		// Floor at 64KB (one pipe chunk): anything smaller blocks every
+		// frame forever instead of throttling.
+		kb := m.MaxStreamBufferKB
+		if kb < 64 {
+			kb = 64
+		}
+		p.MaxStreamBuffer = int64(kb) * 1024
 	}
 	if m.MaxWorkerBufferMB > 0 {
 		p.MaxWorkerBuffer = int64(m.MaxWorkerBufferMB) * 1024 * 1024
