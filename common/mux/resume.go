@@ -36,15 +36,15 @@ const DiscardTombstone = true
 
 // ResumePolicy configures opt-in session resume. Zero value = disabled.
 type ResumePolicy struct {
-	Enabled          bool
-	SuspendTimeout   time.Duration
-	MaxStreamBuffer  int64
-	MaxWorkerBuffer  int64
-	AckEveryBytes    int64
-	AckEveryMs       int64
-	RedialDelays     []time.Duration
-	NoV2CacheTTL     time.Duration
-	AckTimeout       time.Duration
+	Enabled         bool
+	SuspendTimeout  time.Duration
+	MaxStreamBuffer int64
+	MaxWorkerBuffer int64
+	AckEveryBytes   int64
+	AckEveryMs      int64
+	RedialDelays    []time.Duration
+	NoV2CacheTTL    time.Duration
+	AckTimeout      time.Duration
 }
 
 // DefaultResumePolicy returns the reviewed defaults: short hold, fast redial.

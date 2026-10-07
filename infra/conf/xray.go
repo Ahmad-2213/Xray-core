@@ -117,14 +117,14 @@ type MuxConfig struct {
 // "mux": {"enabled": true, "concurrency": 8},
 // "muxResume": {"enabled": true, "suspendTimeoutSec": 10}
 type MuxResumeConfig struct {
-	Enabled            bool `json:"enabled"`
-	SuspendTimeoutSec  int  `json:"suspendTimeoutSec"`
-	MaxStreamBufferKB  int  `json:"maxStreamBufferKB"`
-	MaxWorkerBufferMB  int  `json:"maxWorkerBufferMB"`
-	AckEveryKB         int  `json:"ackEveryKB"`
-	AckEveryMs         int  `json:"ackEveryMs"`
-	AckTimeoutSec      int  `json:"ackTimeoutSec"`
-	NoV2CacheTTLSec    int  `json:"noV2CacheTTLMin"`
+	Enabled           bool `json:"enabled"`
+	SuspendTimeoutSec int  `json:"suspendTimeoutSec"`
+	MaxStreamBufferKB int  `json:"maxStreamBufferKB"`
+	MaxWorkerBufferMB int  `json:"maxWorkerBufferMB"`
+	AckEveryKB        int  `json:"ackEveryKB"`
+	AckEveryMs        int  `json:"ackEveryMs"`
+	AckTimeoutSec     int  `json:"ackTimeoutSec"`
+	NoV2CacheTTLSec   int  `json:"noV2CacheTTLMin"`
 }
 
 // ToPolicy converts JSON config to a mux.ResumePolicy with reviewed defaults.
