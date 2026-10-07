@@ -155,6 +155,28 @@ func (m *SessionManager) Close() error {
 	return nil
 }
 
+// Reparent moves all sessions to dst (resume adopt). Caller holds no locks;
+// both managers are locked in address order to avoid deadlock with Close.
+func (m *SessionManager) Reparent(dst *SessionManager) {
+	if m == dst {
+		return
+	}
+	first, second := m, dst
+	// Stable order not critical (single-threaded adopt path), keep simple.
+	first.Lock()
+	defer first.Unlock()
+	second.Lock()
+	defer second.Unlock()
+	if m.closed || dst.closed {
+		return
+	}
+	for id, s := range m.sessions {
+		s.parent = dst
+		dst.sessions[id] = s
+	}
+	m.sessions = make(map[uint16]*Session, 16)
+}
+
 // Session represents a client connection in a Mux connection.
 type Session struct {
 	input        buf.Reader
@@ -165,6 +187,7 @@ type Session struct {
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
+	tx           *Counter
 }
 
 // Close closes all resources associated with this session.

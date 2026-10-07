@@ -39,7 +39,7 @@ func (s *Server) Type() interface{} {
 
 // Dispatch implements routing.Dispatcher
 func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	if dest.Address != muxCoolAddress {
+	if dest.Address != muxCoolAddress && dest.Address != muxCoolAddressV2 {
 		return s.dispatcher.Dispatch(ctx, dest)
 	}
 
@@ -60,7 +60,7 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport
 
 // DispatchLink implements routing.Dispatcher
 func (s *Server) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	if dest.Address != muxCoolAddress {
+	if dest.Address != muxCoolAddress && dest.Address != muxCoolAddressV2 {
 		return s.dispatcher.DispatchLink(ctx, dest, link)
 	}
 	worker, err := NewServerWorker(ctx, s.dispatcher, link)
@@ -90,6 +90,12 @@ type ServerWorker struct {
 	sessionManager *SessionManager
 	done           *done.Instance
 	timer          *time.Ticker
+	tx             Counter
+	rx             Counter
+	resumeToken    [16]byte
+	resumeHasToken bool
+	resumeUser     string
+	resumeEpoch    uint64
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
@@ -110,6 +116,7 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
 	writer := NewResponseWriter(s.ID, output, s.transferType)
+	writer.counter = s.tx
 	if err := buf.Copy(s.input, writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
@@ -274,6 +281,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		parent:       w.sessionManager,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
+		tx:           &w.tx,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
@@ -349,6 +357,10 @@ func (w *ServerWorker) handleFrame(ctx context.Context, reader *buf.BufferedRead
 		err = w.handleStatusNew(session.ContextWithIsReverseMux(ctx, false), &meta, reader)
 	case SessionStatusKeep:
 		err = w.handleStatusKeep(&meta, reader)
+	case SessionStatusResume:
+		err = w.handleStatusResume(&meta, reader)
+	case SessionStatusAck:
+		err = w.handleStatusAck(&meta, reader)
 	default:
 		status := meta.SessionStatus
 		return errors.New("unknown status: ", status)
@@ -367,6 +379,12 @@ func (w *ServerWorker) run(ctx context.Context) {
 
 	reader := &buf.BufferedReader{Reader: w.link.Reader}
 
+	// v2 carriers announce Resume{token, epoch, rx=0} first so a later
+	// Resume can rebind after carrier loss. Record it, then run normally.
+	if w.tryRecordAnnounce(ctx, reader) {
+		// Announce consumed; continue to session frames.
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -374,6 +392,9 @@ func (w *ServerWorker) run(ctx context.Context) {
 		default:
 			err := w.handleFrame(ctx, reader)
 			if err != nil {
+				if w.parkForResume(ctx) {
+					return
+				}
 				if errors.Cause(err) != io.EOF {
 					errors.LogInfoInner(ctx, err, "unexpected EOF")
 				}
@@ -381,4 +402,40 @@ func (w *ServerWorker) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// tryRecordAnnounce consumes a leading Resume announce frame if present.
+// It peeks one metadata: Resume+Data with a 32-byte payload is an announce;
+// anything else is replayed by... (Phase 1: only consumes when it IS an
+// announce; otherwise the frame is handled by the normal loop via pushback.)
+// Simplified: attempt one Unmarshal with a short path — if it is not Resume,
+// stash it back by returning false and letting handleFrame read it. Since
+// BufferedReader has no pushback, Phase 1 records the token inside
+// handleStatusResume on first sight instead; this hook stays for the
+// explicit adopt step and currently no-ops.
+func (w *ServerWorker) tryRecordAnnounce(ctx context.Context, reader *buf.BufferedReader) bool {
+	_ = ctx
+	_ = reader
+	return false
+}
+
+// parkForResume suspends instead of closing when a v2 token is known:
+// the session table is handed to the handover map for 10s so a fresh
+// carrier Resume can adopt it. Returns true when parked.
+func (w *ServerWorker) parkForResume(ctx context.Context) bool {
+	if !w.resumeHasToken {
+		return false
+	}
+	user := w.resumeUser
+	if user == "" {
+		user = serverUserOf(ctx)
+	}
+	hsPut(w.resumeToken, &suspendedWorker{
+		manager: w.sessionManager,
+		tx:      w.tx.Value(),
+		rx:      w.rx.Value(),
+		epoch:   w.resumeEpoch,
+		user:    user,
+	})
+	return true
 }

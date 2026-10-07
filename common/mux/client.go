@@ -130,9 +130,11 @@ type ClientWorkerFactory interface {
 }
 
 type DialingWorkerFactory struct {
-	Proxy    proxy.Outbound
-	Dialer   internet.Dialer
-	Strategy ClientStrategy
+	Proxy       proxy.Outbound
+	Dialer      internet.Dialer
+	Strategy    ClientStrategy
+	Resume      ResumePolicy
+	OutboundTag string
 }
 
 func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
@@ -140,17 +142,36 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
-	c, err := NewClientWorker(transport.Link{
+	c, err := NewClientWorkerWithResume(transport.Link{
 		Reader: downlinkReader,
 		Writer: upLinkWriter,
-	}, f.Strategy)
+	}, f.Strategy, f.Resume)
 	if err != nil {
 		return nil, err
 	}
 
-	go func(p proxy.Outbound, d internet.Dialer, c common.Closable) {
+	useV2 := f.Resume.Enabled && !isV2Banned(muxCoolAddressV2.String())
+	target := muxCoolAddress
+	if useV2 {
+		target = muxCoolAddressV2
+	}
+
+	if useV2 {
+		// Announce the resume token as the first frame so a later Resume
+		// on a fresh carrier can rebind this worker's sessions server-side.
+		meta := FrameMetadata{SessionStatus: SessionStatusResume}
+		meta.Option.Set(OptionData)
+		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch, RxCount: 0})
+		if err := writeMetaWithFrame(upLinkWriter, meta, buf.MultiBuffer{payload}); err != nil {
+			payload.Release()
+			useV2 = false
+			target = muxCoolAddress
+		}
+	}
+
+	go func(p proxy.Outbound, d internet.Dialer, c *ClientWorker) {
 		outbounds := []*session.Outbound{{
-			Target: net.TCPDestination(muxCoolAddress, muxCoolPort),
+			Target: net.TCPDestination(target, muxCoolPort),
 		}}
 		ctx := session.ContextWithOutbounds(context.Background(), outbounds)
 		ctx, cancel := context.WithCancel(ctx)
@@ -161,9 +182,9 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 				errors.LogInfoInner(ctx, errP, "failed to handler mux client connection")
 			}
 		}
-		common.Must(c.Close())
+		c.onCarrierClosed(useV2, target)
 		cancel()
-	}(f.Proxy, f.Dialer, c.done)
+	}(f.Proxy, f.Dialer, c)
 
 	return c, nil
 }
@@ -179,21 +200,47 @@ type ClientWorker struct {
 	done           *done.Instance
 	timer          *time.Ticker
 	strategy       ClientStrategy
+	resume         ResumePolicy
+	token          [16]byte
+	epoch          uint64
+	tx             Counter
+	rx             Counter
+	ackMu          ackState
+}
+
+type ackState struct {
+	mu       sync.Mutex
+	lastSent uint64
+	lastTime time.Time
 }
 
 var (
-	muxCoolAddress = net.DomainAddress("v1.mux.cool")
-	muxCoolPort    = net.Port(9527)
+	muxCoolAddress   = net.DomainAddress("v1.mux.cool")
+	muxCoolAddressV2 = net.DomainAddress("v2.mux.cool")
+	muxCoolPort      = net.Port(9527)
 )
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
+	return NewClientWorkerWithResume(stream, s, DisabledPolicy())
+}
+
+// NewClientWorkerWithResume creates a mux client with opt-in resume policy.
+// Flag-off (DisabledPolicy) follows the exact v1 path with zero extra cost.
+func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy ResumePolicy) (*ClientWorker, error) {
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
 		link:           stream,
 		done:           done.New(),
 		timer:          time.NewTicker(time.Second * 16),
 		strategy:       s,
+		resume:         policy,
+		epoch:          uint64(time.Now().UnixNano()),
+	}
+	if policy.Enabled {
+		if t, err := NewToken(); err == nil {
+			c.token = t
+		}
 	}
 
 	go c.fetchOutput()
@@ -269,6 +316,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 		inbound = session.InboundFromContext(ctx)
 	}
 	writer := NewWriter(s.ID, ob.Target, output, transferType, xudp.GetGlobalID(ctx), inbound)
+	writer.counter = s.tx
 	defer s.Close(false)
 	defer writer.Close()
 
@@ -318,6 +366,9 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	if s == nil {
 		return false
 	}
+	if m.resume.Enabled {
+		s.tx = &m.tx
+	}
 	go fetchInput(ctx, s, m.link.Writer)
 	if _, ok := link.Reader.(*pipe.Reader); !ok {
 		select {
@@ -358,6 +409,10 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 	rr := s.NewReader(reader, &meta.Target)
 	err := buf.Copy(rr, s.output)
+	if m.resume.Enabled {
+		m.rx.Next()
+		m.maybeSendAck()
+	}
 	if err != nil && buf.IsWriteError(err) {
 		errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
@@ -371,10 +426,93 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
 		s.Close(false)
 	}
+	if m.resume.Enabled {
+		m.rx.Next()
+		m.maybeSendAck()
+	}
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
 	}
 	return nil
+}
+
+// handleStatusResume processes a server Resume response on a reattached
+// carrier. Phase 1 parses and validates the echoed count; full replay from
+// the retained queue lands with the sender-side retain store.
+func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	if !m.resume.Enabled {
+		return errors.New("unexpected resume status")
+	}
+	if !meta.Option.Has(OptionData) {
+		return nil
+	}
+	mb, err := NewStreamReader(reader).ReadMultiBuffer()
+	if err != nil {
+		return err
+	}
+	defer buf.ReleaseMulti(mb)
+	if len(mb) == 0 || len(mb[0].Bytes()) < resumePayloadLen {
+		return errors.New("short resume payload")
+	}
+	b := &buf.Buffer{}
+	b.Write(mb[0].Bytes())
+	rp, err := decodeResume(b)
+	if err != nil {
+		return err
+	}
+	if rp.Token != m.token {
+		return errors.New("resume token mismatch")
+	}
+	m.rx.Next()
+	return nil
+}
+
+// handleStatusAck frees retained frames up to the peer's rx count.
+// Phase 1 has no retain store yet, so this only advances accounting.
+func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.BufferedReader) error {
+	if !m.resume.Enabled {
+		return errors.New("unexpected ack status")
+	}
+	if !meta.Option.Has(OptionData) {
+		return nil
+	}
+	mb, err := NewStreamReader(reader).ReadMultiBuffer()
+	if err != nil {
+		return err
+	}
+	buf.ReleaseMulti(mb)
+	return nil
+}
+
+// maybeSendAck emits Ack{rxCount} at most every AckEveryMs when rx advanced.
+func (m *ClientWorker) maybeSendAck() {
+	if !m.resume.Enabled {
+		return
+	}
+	interval := m.resume.AckEveryMs
+	if interval <= 0 {
+		interval = 500
+	}
+	now := time.Now()
+	m.ackMu.mu.Lock()
+	if now.Sub(m.ackMu.lastTime) < time.Duration(interval)*time.Millisecond {
+		m.ackMu.mu.Unlock()
+		return
+	}
+	count := m.rx.Value()
+	if count == m.ackMu.lastSent {
+		m.ackMu.mu.Unlock()
+		return
+	}
+	m.ackMu.lastSent = count
+	m.ackMu.lastTime = now
+	m.ackMu.mu.Unlock()
+
+	meta := FrameMetadata{SessionStatus: SessionStatusAck}
+	meta.Option.Set(OptionData)
+	payload := encodeAck(AckPayload{RxCount: count})
+	defer payload.Release()
+	_ = writeMetaWithFrame(m.link.Writer, meta, buf.MultiBuffer{payload})
 }
 
 func (m *ClientWorker) fetchOutput() {
@@ -403,6 +541,10 @@ func (m *ClientWorker) fetchOutput() {
 			err = m.handleStatusNew(&meta, reader)
 		case SessionStatusKeep:
 			err = m.handleStatusKeep(&meta, reader)
+		case SessionStatusResume:
+			err = m.handleStatusResume(&meta, reader)
+		case SessionStatusAck:
+			err = m.handleStatusAck(&meta, reader)
 		default:
 			status := meta.SessionStatus
 			errors.LogError(context.Background(), "unknown status: ", status)

@@ -6,12 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/geodata"
+	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
@@ -108,6 +110,52 @@ type MuxConfig struct {
 	Concurrency     int16  `json:"concurrency"`
 	XudpConcurrency int16  `json:"xudpConcurrency"`
 	XudpProxyUDP443 string `json:"xudpProxyUDP443"`
+}
+
+// MuxResumeConfig is the opt-in JSON sibling of "mux" (no proto change).
+// Example:
+// "mux": {"enabled": true, "concurrency": 8},
+// "muxResume": {"enabled": true, "suspendTimeoutSec": 10}
+type MuxResumeConfig struct {
+	Enabled            bool `json:"enabled"`
+	SuspendTimeoutSec  int  `json:"suspendTimeoutSec"`
+	MaxStreamBufferKB  int  `json:"maxStreamBufferKB"`
+	MaxWorkerBufferMB  int  `json:"maxWorkerBufferMB"`
+	AckEveryKB         int  `json:"ackEveryKB"`
+	AckEveryMs         int  `json:"ackEveryMs"`
+	AckTimeoutSec      int  `json:"ackTimeoutSec"`
+	NoV2CacheTTLSec    int  `json:"noV2CacheTTLMin"`
+}
+
+// ToPolicy converts JSON config to a mux.ResumePolicy with reviewed defaults.
+func (m *MuxResumeConfig) ToPolicy() mux.ResumePolicy {
+	p := mux.DefaultResumePolicy()
+	if m == nil || !m.Enabled {
+		return mux.DisabledPolicy()
+	}
+	p.Enabled = true
+	if m.SuspendTimeoutSec > 0 {
+		p.SuspendTimeout = time.Duration(m.SuspendTimeoutSec) * time.Second
+	}
+	if m.MaxStreamBufferKB > 0 {
+		p.MaxStreamBuffer = int64(m.MaxStreamBufferKB) * 1024
+	}
+	if m.MaxWorkerBufferMB > 0 {
+		p.MaxWorkerBuffer = int64(m.MaxWorkerBufferMB) * 1024 * 1024
+	}
+	if m.AckEveryKB > 0 {
+		p.AckEveryBytes = int64(m.AckEveryKB) * 1024
+	}
+	if m.AckEveryMs > 0 {
+		p.AckEveryMs = int64(m.AckEveryMs)
+	}
+	if m.AckTimeoutSec > 0 {
+		p.AckTimeout = time.Duration(m.AckTimeoutSec) * time.Second
+	}
+	if m.NoV2CacheTTLSec > 0 {
+		p.NoV2CacheTTL = time.Duration(m.NoV2CacheTTLSec) * time.Second
+	}
+	return p
 }
 
 // Build creates MultiplexingConfig, Concurrency < 0 completely disables mux.
@@ -225,6 +273,7 @@ type OutboundDetourConfig struct {
 	StreamSetting  *StreamConfig    `json:"streamSettings"`
 	ProxySettings  *json.RawMessage `json:"proxySettings"`
 	MuxSettings    *MuxConfig       `json:"mux"`
+	MuxResume      *MuxResumeConfig `json:"muxResume"`
 	TargetStrategy string           `json:"targetStrategy"`
 }
 
@@ -326,6 +375,10 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 			return nil, errors.New("failed to build Mux config").Base(err)
 		}
 		senderSettings.MultiplexSettings = ms
+	}
+
+	if c.MuxResume != nil && c.MuxResume.Enabled {
+		mux.RegisterResumePolicy(c.Tag, c.MuxResume.ToPolicy())
 	}
 
 	settings := []byte("{}")
