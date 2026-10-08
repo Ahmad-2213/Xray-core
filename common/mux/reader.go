@@ -63,6 +63,11 @@ func ReadFullFrameForTest(rr buf.Reader) (buf.MultiBuffer, error) {
 	return readFullFrame(rr)
 }
 
+// errFrameTooLarge aborts accumulation past buf.Size. Unlike transport
+// loss it must fail fast, never park: callers must not wrap it as
+// frameReadError, or the reader would spin on a desynced carrier.
+var errFrameTooLarge = errors.New("frame exceeds size bound")
+
 // readFullFrame accumulates one framed payload before delivery.
 // ChunkStreamReaders may return it piece-wise (ReadAtMost) while keeping
 // the remainder in per-reader state, and PacketReaders signal end with
@@ -72,14 +77,8 @@ func ReadFullFrameForTest(rr buf.Reader) (buf.MultiBuffer, error) {
 // delivered until the frame is whole (EOF, including the empty-chunk
 // case) or known dead (any other error discards the prefix).
 // Accumulation is capped at buf.Size (our writer never emits bigger
-// chunks; PacketReader enforces the same bound): anything larger is a
-// corrupt or hostile peer, fail it instead of growing memory.
-// errFrameTooLarge aborts accumulation past buf.Size (our writer never
-// emits bigger chunks; PacketReader enforces the same bound). Unlike
-// transport loss it must fail fast, never park: callers must not wrap
-// it as frameReadError, or the reader would spin on a desynced carrier.
-var errFrameTooLarge = errors.New("frame exceeds size bound")
-
+// chunks; PacketReader enforces the same bound): anything larger fails
+// with errFrameTooLarge below instead of growing memory.
 func readFullFrame(rr buf.Reader) (buf.MultiBuffer, error) {
 	var mb buf.MultiBuffer
 	for {

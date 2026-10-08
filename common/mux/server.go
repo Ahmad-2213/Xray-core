@@ -334,24 +334,27 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	// the first payload (kept uncounted and parked): deliver to the
 	// existing session instead of colliding. IDs are never reused within
 	// a worker, so a New for a born ID is a genuine duplicate. Checked
-	// before dispatch so replays never redial downstream.
-	if existing, ok := w.sessionManager.Load().Get(meta.SessionID); ok {
-		if !existing.unborn {
-			return errors.New("duplicate New for live session")
+	// before dispatch so replays never redial downstream. Resume-only:
+	// flag-off duplicates follow the upstream overwrite path below.
+	if w.resumeHasToken {
+		if existing, ok := w.sessionManager.Load().Get(meta.SessionID); ok {
+			if !existing.unborn {
+				return errors.New("duplicate New for live session")
+			}
+			rr := existing.NewReader(reader, &meta.Target)
+			mb, rerr := readFullFrame(rr)
+			if rerr != nil {
+				return rerr
+			}
+			werr := existing.output.WriteMultiBuffer(mb)
+			existing.unborn = false
+			w.countRx(meta)
+			if werr != nil {
+				existing.Close(false)
+				return buf.Copy(rr, buf.Discard)
+			}
+			return nil
 		}
-		rr := existing.NewReader(reader, &meta.Target)
-		mb, rerr := readFullFrame(rr)
-		if rerr != nil {
-			return rerr
-		}
-		werr := existing.output.WriteMultiBuffer(mb)
-		existing.unborn = false
-		w.countRx(meta)
-		if werr != nil {
-			existing.Close(false)
-			return buf.Copy(rr, buf.Discard)
-		}
-		return nil
 	}
 	link, cancel, err := w.dispatchLink(ctx, meta.Target)
 	if err != nil {
@@ -367,9 +370,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
 		cancel:       cancel,
-		// Only a payload-carrying New can be cut mid-delivery: a
-		// payload-less New is complete at its meta, so it is born.
-		unborn: meta.Option.Has(OptionData),
+		// Only a payload-carrying New on a resume carrier can be cut
+		// mid-delivery: a payload-less New is complete at its meta, and
+		// flag-off sessions never take the idempotent replay branch, so
+		// both stay born from birth.
+		unborn: w.resumeHasToken && meta.Option.Has(OptionData),
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
