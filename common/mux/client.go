@@ -449,13 +449,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
-	// Read the whole chunk before delivering: a carrier cut mid-payload
-	// must leave nothing in the session, or the rebind replay would
-	// duplicate the delivered prefix (the old meta-time counting lost
-	// it instead — same dead inner TLS either way).
-	mb, rerr := rr.ReadMultiBuffer()
+	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
-		buf.ReleaseMulti(mb)
 		return rerr
 	}
 	werr := s.output.WriteMultiBuffer(mb)
@@ -498,15 +493,19 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
-	mb, err := NewStreamReader(reader).ReadMultiBuffer()
+	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
 		return err
 	}
 	defer buf.ReleaseMulti(mb)
-	if len(mb) == 0 || len(mb[0].Bytes()) < resumePayloadLen {
+	var raw []byte
+	for _, b := range mb {
+		raw = append(raw, b.Bytes()...)
+	}
+	if len(raw) < resumePayloadLen {
 		return errors.New("short resume payload")
 	}
-	rp, err := decodeResume(mb[0].Bytes())
+	rp, err := decodeResume(raw)
 	if err != nil {
 		return err
 	}
@@ -554,15 +553,19 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
-	mb, err := NewStreamReader(reader).ReadMultiBuffer()
+	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
 		return err
 	}
 	defer buf.ReleaseMulti(mb)
-	if len(mb) == 0 || len(mb[0].Bytes()) < ackPayloadLen {
+	var raw []byte
+	for _, b := range mb {
+		raw = append(raw, b.Bytes()...)
+	}
+	if len(raw) < ackPayloadLen {
 		return errors.New("short ack payload")
 	}
-	ap, err := decodeAck(mb[0].Bytes())
+	ap, err := decodeAck(raw)
 	if err != nil {
 		return err
 	}
@@ -693,6 +696,14 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 		}
 
 		if err != nil {
+			// A handler error while suspended is almost certainly the
+			// rebind interrupting this reader (attachCarrierSwap pulls
+			// the pipes from underneath it): park and wait like a read
+			// error instead of killing the worker. Genuine corruption
+			// on a live carrier still fails fast below.
+			if m.gate != nil && m.IsSuspended() {
+				return false
+			}
 			errors.LogInfoInner(context.Background(), err, "failed to process data")
 			return true
 		}

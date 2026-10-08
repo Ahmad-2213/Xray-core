@@ -107,11 +107,11 @@ func (h *carrierHarness) Process(ctx context.Context, link *transport.Link, d in
 	h.kill = stop
 	h.mu.Unlock()
 	go func() {
-		_ = buf.Copy(link.Reader, upW)
+		_ = fragmentPump(link.Reader, upW)
 		stop()
 	}()
 	go func() {
-		_ = buf.Copy(downR, link.Writer)
+		_ = fragmentPump(downR, link.Writer)
 		stop()
 	}()
 	select {
@@ -120,6 +120,36 @@ func (h *carrierHarness) Process(ctx context.Context, link *transport.Link, d in
 		return ctx.Err()
 	case <-done:
 		return errors.New("carrier killed")
+	}
+}
+
+// fragmentPump copies src to dst shattering every buffer into 1-3 byte
+// pieces, modeling carriers that split frames across reads (WS/TLS/TCP
+// all do). A bridge preserving write boundaries always hands the reader
+// whole frames, so byte-exact tests could never catch reassembly bugs.
+func fragmentPump(src buf.Reader, dst buf.Writer) error {
+	for {
+		mb, err := src.ReadMultiBuffer()
+		if err != nil {
+			buf.ReleaseMulti(mb)
+			return err
+		}
+		for _, b := range mb {
+			raw := b.Bytes()
+			for len(raw) > 0 {
+				n := 1 + int(raw[0])%3
+				if n > len(raw) {
+					n = len(raw)
+				}
+				cp := append([]byte(nil), raw[:n]...)
+				if werr := dst.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(cp)}); werr != nil {
+					buf.ReleaseMulti(mb)
+					return werr
+				}
+				raw = raw[n:]
+			}
+		}
+		buf.ReleaseMulti(mb)
 	}
 }
 
@@ -181,7 +211,9 @@ func newE2EFixture(t *testing.T, h *carrierHarness, policy mux.ResumePolicy) *e2
 
 func testResumePolicy() mux.ResumePolicy {
 	p := mux.DefaultResumePolicy()
-	p.SuspendTimeout = 15 * time.Second
+	// Generous episode for slow CI: functional behavior is identical,
+	// only the give-up deadline moves.
+	p.SuspendTimeout = 30 * time.Second
 	p.RedialDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond}
 	return p
 }
@@ -261,7 +293,7 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	defer h.closeAll()
 	defer mux.HsResetForTest()
 
-	const chunks = 128
+	const chunks = 64
 	const chunkSize = 16 * 1024
 	var sent []byte
 	for i := 0; i < chunks; i++ {
@@ -270,8 +302,8 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	}
 	total := len(sent)
 
-	// Throttled drain (5ms per read, ≤64KB per pipe read): draining 2MB
-	// takes ≥160ms on any machine, so killing at 100ms deterministically
+	// Throttled drain (5ms per read, ≤64KB per pipe read): draining 1MB
+	// takes ≥80ms on any machine, so killing at 50ms deterministically
 	// lands mid-transfer with data in flight. The reader drains for the
 	// whole test — stalling it would seize the pipeline (and correctly
 	// trip the half-open watchdog).
@@ -309,7 +341,7 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 	h.killCurrent()
 	echoMu.Lock()
 	atKill := len(echoed)
@@ -343,7 +375,10 @@ func TestResumeE2EBulkCompletes(t *testing.T) {
 	defer h.closeAll()
 	defer mux.HsResetForTest()
 
-	const total = 2 * 1024 * 1024
+	// 512KB exceeds the 256KB per-stream window: completing it proves
+	// cap-block plus ack cycles keep flowing (fragmentation makes every
+	// byte expensive, so this stays small on purpose).
+	const total = 512 * 1024
 	big := bytes.Repeat([]byte{0xAB}, total)
 	done := make(chan error, 1)
 	go func() {

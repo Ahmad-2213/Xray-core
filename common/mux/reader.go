@@ -57,3 +57,31 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 func NewStreamReader(reader *buf.BufferedReader) buf.Reader {
 	return crypto.NewChunkStreamReaderWithChunkCount(crypto.PlainChunkSizeParser{}, reader, 1)
 }
+
+// ReadFullFrameForTest exposes readFullFrame to unit tests.
+func ReadFullFrameForTest(rr buf.Reader) (buf.MultiBuffer, error) {
+	return readFullFrame(rr)
+}
+
+// readFullFrame accumulates one framed payload before delivery.
+// ChunkStreamReaders may return it piece-wise (ReadAtMost) while keeping
+// the remainder in per-reader state, and PacketReaders signal end with
+// EOF after the single packet. Delivering a prefix before the carrier
+// dies would duplicate it on replay (and counting it would lose the
+// suffix instead) — either kills the inner stream. So nothing is
+// delivered until the frame is whole (EOF, including the empty-chunk
+// case) or known dead (any other error discards the prefix).
+func readFullFrame(rr buf.Reader) (buf.MultiBuffer, error) {
+	var mb buf.MultiBuffer
+	for {
+		part, err := rr.ReadMultiBuffer()
+		mb = append(mb, part...)
+		if err != nil {
+			if errors.Cause(err) == io.EOF {
+				return mb, nil
+			}
+			buf.ReleaseMulti(mb)
+			return nil, err
+		}
+	}
+}

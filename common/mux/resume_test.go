@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -662,6 +663,65 @@ func TestV2FailConsecutive(t *testing.T) {
 		t.Fatalf("fail after clear = %d, want 1", n)
 	}
 	mux.ClearV2FailsForTest(key)
+}
+
+// dribbleReaderForTest scripts partial reads: chunks go out piece-wise,
+// then either clean EOF (full frame delivered in dribbles) or a cut.
+type dribbleReaderForTest struct {
+	chunks [][]byte
+	cut    bool
+	calls  int
+}
+
+func (r *dribbleReaderForTest) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	if r.calls >= len(r.chunks) {
+		if r.cut {
+			return nil, errors.New("carrier cut")
+		}
+		return nil, io.EOF
+	}
+	b := buf.FromBytes(r.chunks[r.calls])
+	r.calls++
+	return buf.MultiBuffer{b}, nil
+}
+
+func collectBytes(mb buf.MultiBuffer) []byte {
+	var out []byte
+	for _, b := range mb {
+		out = append(out, b.Bytes()...)
+	}
+	buf.ReleaseMulti(mb)
+	return out
+}
+
+func TestReadFullFrameDribbles(t *testing.T) {
+	mb, err := mux.ReadFullFrameForTest(&dribbleReaderForTest{chunks: [][]byte{[]byte("he"), []byte("llo"), []byte("!")}})
+	if err != nil {
+		t.Fatal("dribbled frame must assemble:", err)
+	}
+	if got := collectBytes(mb); string(got) != "hello!" {
+		t.Fatalf("assembled %q, want %q", got, "hello!")
+	}
+}
+
+func TestReadFullFrameCutDiscardsPrefix(t *testing.T) {
+	// Carrier dies mid-payload after delivering a prefix: nothing may
+	// come out (the sender replays the whole frame; a delivered prefix
+	// would duplicate it).
+	_, err := mux.ReadFullFrameForTest(&dribbleReaderForTest{chunks: [][]byte{[]byte("he")}, cut: true})
+	if err == nil {
+		t.Fatal("cut frame must error, not deliver a prefix")
+	}
+}
+
+func TestReadFullFrameEmpty(t *testing.T) {
+	mb, err := mux.ReadFullFrameForTest(&dribbleReaderForTest{})
+	if err != nil {
+		t.Fatal("empty chunk EOF must not error:", err)
+	}
+	if got := collectBytes(mb); len(got) != 0 {
+		t.Fatalf("empty frame gave %d bytes", len(got))
+	}
 }
 
 // ---- Phase 3: v1/v2 interop matrix ----

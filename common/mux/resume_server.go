@@ -97,15 +97,19 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
-	mb, err := NewStreamReader(reader).ReadMultiBuffer()
+	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
 		return err
 	}
 	defer buf.ReleaseMulti(mb)
-	if len(mb) == 0 || len(mb[0].Bytes()) < resumePayloadLen {
+	var raw []byte
+	for _, b := range mb {
+		raw = append(raw, b.Bytes()...)
+	}
+	if len(raw) < resumePayloadLen {
 		return errors.New("short resume payload")
 	}
-	rp, err := decodeResume(mb[0].Bytes())
+	rp, err := decodeResume(raw)
 	if err != nil {
 		return err
 	}
@@ -226,15 +230,19 @@ func (w *ServerWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
-	mb, err := NewStreamReader(reader).ReadMultiBuffer()
+	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
 		return err
 	}
 	defer buf.ReleaseMulti(mb)
-	if len(mb) == 0 || len(mb[0].Bytes()) < ackPayloadLen {
+	var raw []byte
+	for _, b := range mb {
+		raw = append(raw, b.Bytes()...)
+	}
+	if len(raw) < ackPayloadLen {
 		return errors.New("short ack payload")
 	}
-	ap, err := decodeAck(mb[0].Bytes())
+	ap, err := decodeAck(raw)
 	if err != nil {
 		return err
 	}

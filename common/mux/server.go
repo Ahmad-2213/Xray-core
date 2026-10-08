@@ -348,12 +348,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return nil
 	}
 
-	// Read the whole chunk before delivering (see client
-	// handleStatusKeep): no partial delivery, no duplication on replay.
+	// Read the whole chunk before delivering (see readFullFrame): no
+	// partial delivery, no duplication on replay.
 	rr := s.NewReader(reader, &meta.Target)
-	mb, rerr := rr.ReadMultiBuffer()
+	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
-		buf.ReleaseMulti(mb)
 		return rerr
 	}
 	werr := s.output.WriteMultiBuffer(mb)
@@ -364,12 +363,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		s.Close(false)
 		return buf.Copy(rr, buf.Discard)
 	}
-
-	if err != nil && buf.IsWriteError(err) {
-		s.Close(false)
-		return buf.Copy(rr, buf.Discard)
-	}
-	return err
+	return nil
 }
 
 func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -403,11 +397,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
-	// Read the whole chunk before delivering (see client
-	// handleStatusKeep): no partial delivery, no duplication on replay.
-	mb, rerr := rr.ReadMultiBuffer()
+	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
-		buf.ReleaseMulti(mb)
 		return rerr
 	}
 	werr := s.output.WriteMultiBuffer(mb)
