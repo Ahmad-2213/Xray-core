@@ -55,8 +55,9 @@ func (w *ServerWorker) maybeSendAck() {
 	advanced := count != w.ackMu.lastSent
 	// Frame-count trigger: bulk traffic must not wait out the whole
 	// timer per window; combined with the timer below this bounds both
-	// ack latency and ack rate.
-	if advanced && (count-w.ackMu.lastSent >= 64 || now.Sub(w.ackMu.lastTime) >= interval) {
+	// ack latency and ack rate. 8 frames ≈ a quarter of the default
+	// per-stream window, so a lone bulk stream still acks promptly.
+	if advanced && (count-w.ackMu.lastSent >= 8 || now.Sub(w.ackMu.lastTime) >= interval) {
 		w.ackMu.lastSent = count
 		w.ackMu.lastTime = now
 		w.ackMu.mu.Unlock()
@@ -135,7 +136,6 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		w.resumeHasToken = true
 		w.resumeUser = entry.user
 		w.resumeDone = entry.done
-		w.rsMu.Unlock()
 		if w.gate.Load() == nil {
 			g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
 			if w.resumeDone != nil {
@@ -143,6 +143,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 			}
 			w.gate.Store(g)
 		}
+		w.rsMu.Unlock()
 		// Re-arm onto this worker: the adopted gate still points at the
 		// parking worker's park callback (a no-op on its empty manager),
 		// which would leave write errors spinning instead of parking.
@@ -199,7 +200,6 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	w.resumeEpoch = rp.Epoch
 	w.resumeHasToken = true
 	w.resumeUser = w.localUser
-	w.rsMu.Unlock()
 	if w.gate.Load() == nil {
 		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
 		if w.resumeDone == nil {
@@ -212,6 +212,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		w.gate.Store(g)
 		go w.watchHalfOpen()
 	}
+	w.rsMu.Unlock()
 	reply := FrameMetadata{SessionStatus: SessionStatusResume}
 	reply.Option.Set(OptionData)
 	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: w.rx.Value()})

@@ -16,6 +16,11 @@ package mux
 //     target with TTL-cached fallback to v1.
 //
 // UDP payloads are never retained (slots only, replayed as tombstones).
+//
+// Lock order (must stay consistent): rsMu → hsMu → SessionManager locks →
+// carrierGate mu / pipeMu. Nothing acquires them in reverse: gate and pipe
+// code never take rsMu/hsMu/manager locks; Session.Close takes only its
+// parent manager lock plus its own pmu; SessionManager methods are leaves.
 
 import (
 	"crypto/rand"

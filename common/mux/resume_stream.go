@@ -372,8 +372,6 @@ func (g *carrierGate) reserve(need int64, sid uint16) error {
 	return nil
 }
 
-// errReserveRetry is internal: retain lost a race after reserve; the
-
 // retain stores a private copy and assigns its seq, consuming mb.
 // Caller holds sendMu. Caps were reserved beforehand and are re-verified
 // here; on a lost race it returns retry=true with mb untouched.

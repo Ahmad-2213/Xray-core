@@ -449,20 +449,27 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
-	err := buf.Copy(rr, s.output)
-	if err == nil || buf.IsWriteError(err) {
-		if count {
-			m.rx.Next()
-			m.maybeSendAck()
-		}
+	// Read the whole chunk before delivering: a carrier cut mid-payload
+	// must leave nothing in the session, or the rebind replay would
+	// duplicate the delivered prefix (the old meta-time counting lost
+	// it instead — same dead inner TLS either way).
+	mb, rerr := rr.ReadMultiBuffer()
+	if rerr != nil {
+		buf.ReleaseMulti(mb)
+		return rerr
 	}
-	if err != nil && buf.IsWriteError(err) {
-		errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)
+	werr := s.output.WriteMultiBuffer(mb)
+	if count {
+		m.rx.Next()
+		m.maybeSendAck()
+	}
+	if werr != nil {
+		errors.LogInfoInner(context.Background(), werr, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
 		return buf.Copy(rr, buf.Discard)
 	}
 
-	return err
+	return nil
 }
 
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -583,7 +590,7 @@ func (m *ClientWorker) maybeSendAck() {
 	advanced := count != m.ackMu.lastSent
 	// Frame-count trigger: bulk traffic must not wait out the whole
 	// timer per window (see server maybeSendAck).
-	if advanced && (count-m.ackMu.lastSent >= 64 || now.Sub(m.ackMu.lastTime) >= interval) {
+	if advanced && (count-m.ackMu.lastSent >= 8 || now.Sub(m.ackMu.lastTime) >= interval) {
 		m.ackMu.lastSent = count
 		m.ackMu.lastTime = now
 		m.ackMu.mu.Unlock()
@@ -648,7 +655,7 @@ func (m *ClientWorker) fetchOutput() {
 		}
 		// Suspended: park until rebind swaps in a fresh reader, the
 		// worker closes, or the episode times out.
-		if !m.waitRebind() {
+		if !m.waitRebind(gen) {
 			return
 		}
 	}
@@ -693,13 +700,15 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 }
 
 // waitRebind parks fetchOutput until a rebind swaps the reader, the worker
-// closes, or the suspend episode times out. False = give up. The generation
-// check is the point: attachCarrierSwap bumps pipeGen on every rebind, so
-// fetchOutput picks up the new downlink and reads the server's Resume
-// reply (which clears the suspend). Waiting on !IsSuspended alone would
-// deadlock, since only the reply reader can clear it.
-func (m *ClientWorker) waitRebind() bool {
-	gen := m.pipeGen.Load()
+// closes, or the suspend episode times out. False = give up. gen is the
+// pipe generation the caller just read: a swap between the caller's check
+// and this capture would otherwise miss one reply and cost that attempt.
+// The generation check is the point: attachCarrierSwap bumps pipeGen on
+// every rebind, so fetchOutput picks up the new downlink and reads the
+// server's Resume reply (which clears the suspend). Waiting on
+// !IsSuspended alone would deadlock, since only the reply reader can
+// clear it.
+func (m *ClientWorker) waitRebind(gen uint64) bool {
 	for {
 		if m.done.Done() {
 			return false

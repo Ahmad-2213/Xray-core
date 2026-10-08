@@ -1,0 +1,363 @@
+package mux_test
+
+// Live client↔server resume harness: a real ClientWorker (via
+// DialingWorkerFactory, the production path) talks to real ServerWorkers
+// over a killable bridged carrier. Kills exercise the full death →
+// suspend → redial → adopt → replay cycle; assertions are end-to-end
+// (same app socket survives, byte-exact echo), so they fail if any link
+// in the chain regresses.
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/mux"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/pipe"
+)
+
+// echoDispatcher returns links that echo everything back. The echo dies
+// with ctx, modeling freedom: pre-detachCtx code cancels the ctx on
+// carrier death, so an echo that stops after a park proves the A4
+// regression (and one that survives proves the fix).
+type echoDispatcher struct{}
+
+func (echoDispatcher) Type() interface{} { return routing.DispatcherType() }
+func (echoDispatcher) Start() error      { return nil }
+func (echoDispatcher) Close() error      { return nil }
+
+func (echoDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
+	upR, upW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	downR, downW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	go func() {
+		_ = buf.Copy(upR, downW)
+	}()
+	go func() {
+		<-ctx.Done()
+		upR.Interrupt()
+		_ = upW.Close()
+		downR.Interrupt()
+		_ = downW.Close()
+	}()
+	return &transport.Link{Reader: downR, Writer: upW}, nil
+}
+
+func (echoDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
+	return errors.New("echoDispatcher: DispatchLink unused")
+}
+
+type stubDialer struct{}
+
+func (stubDialer) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+	return nil, errors.New("stubDialer: no real dial in test")
+}
+
+func (stubDialer) DestIpAddress() net.IP { return nil }
+
+func (stubDialer) SetOutboundGateway(ctx context.Context, ob *session.Outbound) {}
+
+// carrierHarness bridges the client carrier to a fresh ServerWorker per
+// Process call (the production inbound path in miniature). The bridge is
+// killable: killing breaks reads and writes on both ends at once, which
+// is exactly the busy-death N1 scenario.
+type carrierHarness struct {
+	mu       sync.Mutex
+	disp     routing.Dispatcher
+	failLeft int
+	kill     func()
+	servers  []*mux.ServerWorker
+}
+
+func (h *carrierHarness) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
+	h.mu.Lock()
+	if h.failLeft > 0 {
+		h.failLeft--
+		h.mu.Unlock()
+		return errors.New("injected dial failure")
+	}
+	upR, upW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	downR, downW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	srv, err := mux.NewServerWorker(ctx, h.disp, &transport.Link{Reader: upR, Writer: downW})
+	if err != nil {
+		h.mu.Unlock()
+		return err
+	}
+	h.servers = append(h.servers, srv)
+	done := make(chan struct{})
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(done)
+			upR.Interrupt()
+			_ = upW.Close()
+			downR.Interrupt()
+			_ = downW.Close()
+		})
+	}
+	h.kill = stop
+	h.mu.Unlock()
+	go func() {
+		_ = buf.Copy(link.Reader, upW)
+		stop()
+	}()
+	go func() {
+		_ = buf.Copy(downR, link.Writer)
+		stop()
+	}()
+	select {
+	case <-ctx.Done():
+		stop()
+		return ctx.Err()
+	case <-done:
+		return errors.New("carrier killed")
+	}
+}
+
+func (h *carrierHarness) killCurrent() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.kill != nil {
+		h.kill()
+	}
+}
+
+// armFailures makes the next n Process calls fail. Armed mid-test so
+// failures hit redials (with a park waiting) rather than the initial
+// dial (after which nothing exists to adopt).
+func (h *carrierHarness) armFailures(n int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.failLeft = n
+}
+
+func (h *carrierHarness) closeAll() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, s := range h.servers {
+		_ = s.Close()
+	}
+}
+
+type e2eFixture struct {
+	worker *mux.ClientWorker
+	appUpW buf.Writer
+	appDnR *pipe.Reader
+	cancel context.CancelFunc
+}
+
+func newE2EFixture(t *testing.T, h *carrierHarness, policy mux.ResumePolicy) *e2eFixture {
+	t.Helper()
+	factory := &mux.DialingWorkerFactory{
+		Proxy:       h,
+		Dialer:      stubDialer{},
+		Strategy:    mux.ClientStrategy{MaxConcurrency: 8},
+		Resume:      policy,
+		OutboundTag: "e2e-test",
+	}
+	worker, err := factory.Create()
+	if err != nil {
+		t.Fatal("factory.Create failed:", err)
+	}
+	upR, upW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	downR, downW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{
+		{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)},
+	})
+	if !worker.Dispatch(ctx, &transport.Link{Reader: upR, Writer: downW}) {
+		t.Fatal("worker.Dispatch rejected the session")
+	}
+	return &e2eFixture{worker: worker, appUpW: upW, appDnR: downR}
+}
+
+func testResumePolicy() mux.ResumePolicy {
+	p := mux.DefaultResumePolicy()
+	p.SuspendTimeout = 15 * time.Second
+	p.RedialDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond}
+	return p
+}
+
+func writeChunk(t *testing.T, w buf.Writer, payload []byte) {
+	t.Helper()
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
+		t.Fatal("app write failed:", err)
+	}
+}
+
+func readExactly(t *testing.T, r *pipe.Reader, n int, timeout time.Duration) []byte {
+	t.Helper()
+	var acc []byte
+	deadline := time.Now().Add(timeout)
+	for len(acc) < n {
+		mb, err := r.ReadMultiBufferTimeout(time.Until(deadline))
+		if err != nil {
+			t.Fatalf("app read failed after %d/%d bytes: %v", len(acc), n, err)
+		}
+		for _, b := range mb {
+			acc = append(acc, b.Bytes()...)
+		}
+		buf.ReleaseMulti(mb)
+	}
+	return acc
+}
+
+func TestResumeE2ERebindSurvives(t *testing.T) {
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	ping1 := []byte("ping-before-kill")
+	writeChunk(t, fx.appUpW, ping1)
+	if got := readExactly(t, fx.appDnR, len(ping1), 10*time.Second); !bytes.Equal(got, ping1) {
+		t.Fatalf("pre-kill echo mismatch: %q", got)
+	}
+
+	// Busy death: reads and writes fail together (the N1 scenario).
+	h.killCurrent()
+
+	ping2 := []byte("ping-after-rebind-same-socket")
+	writeChunk(t, fx.appUpW, ping2)
+	if got := readExactly(t, fx.appDnR, len(ping2), 20*time.Second); !bytes.Equal(got, ping2) {
+		t.Fatalf("post-rebind echo mismatch: %q", got)
+	}
+}
+
+func TestResumeE2EFailedRedialsThenSuccess(t *testing.T) {
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	writeChunk(t, fx.appUpW, []byte("warmup"))
+	_ = readExactly(t, fx.appDnR, len("warmup"), 10*time.Second)
+
+	// Fail the next two redials only: a park is waiting, so the third
+	// redial must still adopt and resume.
+	h.armFailures(2)
+	h.killCurrent()
+	ping := []byte("ping-after-two-failed-redials")
+	writeChunk(t, fx.appUpW, ping)
+	if got := readExactly(t, fx.appDnR, len(ping), 25*time.Second); !bytes.Equal(got, ping) {
+		t.Fatalf("echo after failed redials mismatch: %q", got)
+	}
+}
+
+func TestResumeE2EMidPayloadByteExact(t *testing.T) {
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	const chunks = 128
+	const chunkSize = 16 * 1024
+	var sent []byte
+	for i := 0; i < chunks; i++ {
+		c := bytes.Repeat([]byte{byte(i)}, chunkSize)
+		sent = append(sent, c...)
+	}
+	total := len(sent)
+
+	// Throttled drain (5ms per read, ≤64KB per pipe read): draining 2MB
+	// takes ≥160ms on any machine, so killing at 100ms deterministically
+	// lands mid-transfer with data in flight. The reader drains for the
+	// whole test — stalling it would seize the pipeline (and correctly
+	// trip the half-open watchdog).
+	var echoed []byte
+	var echoMu sync.Mutex
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			echoMu.Lock()
+			n := len(echoed)
+			echoMu.Unlock()
+			if n >= total {
+				return
+			}
+			mb, err := fx.appDnR.ReadMultiBufferTimeout(15 * time.Second)
+			if err != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+			for _, b := range mb {
+				echoMu.Lock()
+				echoed = append(echoed, b.Bytes()...)
+				echoMu.Unlock()
+			}
+			buf.ReleaseMulti(mb)
+		}
+	}()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for i := 0; i < chunks; i++ {
+			if err := fx.appUpW.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(sent[i*chunkSize : (i+1)*chunkSize])}); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	h.killCurrent()
+	echoMu.Lock()
+	atKill := len(echoed)
+	echoMu.Unlock()
+	joinDone := make(chan struct{})
+	go func() {
+		<-writerDone
+		<-readerDone
+		close(joinDone)
+	}()
+	select {
+	case <-joinDone:
+	case <-time.After(60 * time.Second):
+		t.Fatal("mid-payload flow stalled (writer or drain stuck)")
+	}
+	echoMu.Lock()
+	final := echoed
+	echoMu.Unlock()
+	if atKill >= total {
+		t.Fatalf("kill landed after full echo (%d/%d): cut was not mid-flight", atKill, total)
+	}
+	if !bytes.Equal(final, sent) {
+		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(final), total)
+	}
+}
+
+func TestResumeE2EBulkCompletes(t *testing.T) {
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	const total = 2 * 1024 * 1024
+	big := bytes.Repeat([]byte{0xAB}, total)
+	done := make(chan error, 1)
+	go func() {
+		done <- fx.appUpW.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(big)})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal("bulk write failed:", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("bulk write stalled (window/ack liveness)")
+	}
+	if got := readExactly(t, fx.appDnR, total, 60*time.Second); !bytes.Equal(got, big) {
+		t.Fatal("bulk echo mismatch")
+	}
+}

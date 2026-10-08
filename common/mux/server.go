@@ -348,10 +348,21 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return nil
 	}
 
+	// Read the whole chunk before delivering (see client
+	// handleStatusKeep): no partial delivery, no duplication on replay.
 	rr := s.NewReader(reader, &meta.Target)
-	err = buf.Copy(rr, s.output)
-	if err == nil || buf.IsWriteError(err) {
-		w.countRx(meta)
+	mb, rerr := rr.ReadMultiBuffer()
+	if rerr != nil {
+		buf.ReleaseMulti(mb)
+		return rerr
+	}
+	werr := s.output.WriteMultiBuffer(mb)
+	// Carrier delivered fully; a downstream write error is local, so the
+	// frame still counts (the sender counted it at store time).
+	w.countRx(meta)
+	if werr != nil {
+		s.Close(false)
+		return buf.Copy(rr, buf.Discard)
 	}
 
 	if err != nil && buf.IsWriteError(err) {
@@ -392,20 +403,25 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
-	err := buf.Copy(rr, s.output)
-	if err == nil || buf.IsWriteError(err) {
-		if count {
-			w.countRx(meta)
-		}
+	// Read the whole chunk before delivering (see client
+	// handleStatusKeep): no partial delivery, no duplication on replay.
+	mb, rerr := rr.ReadMultiBuffer()
+	if rerr != nil {
+		buf.ReleaseMulti(mb)
+		return rerr
+	}
+	werr := s.output.WriteMultiBuffer(mb)
+	if count {
+		w.countRx(meta)
 	}
 
-	if err != nil && buf.IsWriteError(err) {
-		errors.LogInfoInner(context.Background(), err, "failed to write to downstream writer. closing session ", s.ID)
+	if werr != nil {
+		errors.LogInfoInner(context.Background(), werr, "failed to write to downstream writer. closing session ", s.ID)
 		s.Close(false)
 		return buf.Copy(rr, buf.Discard)
 	}
 
-	return err
+	return nil
 }
 
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
@@ -459,11 +475,14 @@ func (w *ServerWorker) run(ctx context.Context) {
 			common.Must(w.done.Close())
 		}
 		// A parked worker's sessions outlive it (adopt or janitor owns
-		// them now); anything else dies with the worker.
+		// them now); anything else dies with the worker. The parkOnce
+		// re-check covers a park that landed after this run's own call
+		// returned false: the shared done must survive that too.
 		w.rsMu.Lock()
 		td := w.resumeDone
+		parkedOnce := w.parkOnce.Load()
 		w.rsMu.Unlock()
-		if td != nil && !parked {
+		if td != nil && !parked && !parkedOnce {
 			td.close()
 		}
 	}()
@@ -473,6 +492,11 @@ func (w *ServerWorker) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Carrier context canceled: try to park first — detached
+			// sessions can still survive on a rebind.
+			if w.parkForResume(ctx) {
+				parked = true
+			}
 			return
 		default:
 			err := w.handleFrame(ctx, reader)
@@ -519,6 +543,14 @@ func (w *ServerWorker) dispatchLink(ctx context.Context, dest net.Destination) (
 // may be reaped by its monitor while adopted sessions are still live.
 // Returns true when parked.
 func (w *ServerWorker) parkForResume(ctx context.Context) bool {
+	// Another goroutine already parked this worker (read error + write
+	// error + watchdog on a busy death): the park happened, so report
+	// parked — especially run(), which must NOT close the shared done.
+	// Checked before the Size gate: the winner swaps in an empty manager,
+	// so a loser would otherwise exit false on Size()==0.
+	if w.parkOnce.Load() {
+		return true
+	}
 	w.rsMu.Lock()
 	defer w.rsMu.Unlock()
 	if !w.resumeHasToken {
@@ -528,9 +560,8 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if sm.Size() == 0 {
 		return false
 	}
-	// Exactly one park per worker. A loser returns true: the park did
-	// happen (by the winner), so the caller must treat sessions as
-	// parked — especially run(), which must NOT close the shared done.
+	// Exactly one park per worker; re-check under the lock against a
+	// park that landed between the Load above and here.
 	if !w.parkOnce.CompareAndSwap(false, true) {
 		return true
 	}
