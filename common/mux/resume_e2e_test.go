@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	stdnet "net"
 	"sync"
 	"testing"
 	"time"
@@ -63,6 +64,41 @@ func (stubDialer) Dial(ctx context.Context, dest net.Destination) (stat.Connecti
 	return nil, errors.New("stubDialer: no real dial in test")
 }
 
+// stubDialerOK models a successful transport dial (TCP+TLS to the server):
+// the handshake that follows may still die instantly (old server).
+type stubDialerOK struct{ stubDialer }
+
+func (stubDialerOK) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+	c1, c2 := stdnet.Pipe()
+	_ = c2.Close()
+	return c1, nil
+}
+
+// flapDialer fails the next n dials, then succeeds: a transport flap.
+// Unlike post-connect deaths, dial failures must suspend (not close),
+// so sessions survive short outages.
+type flapDialer struct {
+	mu       sync.Mutex
+	failLeft int
+	stubDialerOK
+}
+
+func (d *flapDialer) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failLeft > 0 {
+		d.failLeft--
+		return nil, errors.New("flap: dial failed")
+	}
+	return d.stubDialerOK.Dial(ctx, dest)
+}
+
+func (d *flapDialer) arm(n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failLeft = n
+}
+
 func (stubDialer) DestIpAddress() net.IP { return nil }
 
 func (stubDialer) SetOutboundGateway(ctx context.Context, ob *session.Outbound) {}
@@ -86,6 +122,16 @@ func (h *carrierHarness) Process(ctx context.Context, link *transport.Link, d in
 		h.mu.Unlock()
 		return errors.New("injected dial failure")
 	}
+	h.mu.Unlock()
+	// Model the transport dial like a real outbound: it determines
+	// whether a later instant death counts toward the v2 ban (dial
+	// failures during a flap must not).
+	conn, err := d.Dial(ctx, net.TCPDestination(net.DomainAddress("v1.mux.cool"), 9527))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	h.mu.Lock()
 	upR, upW := pipe.New(pipe.WithSizeLimit(64 * 1024))
 	downR, downW := pipe.New(pipe.WithSizeLimit(64 * 1024))
 	srv, err := mux.NewServerWorker(ctx, h.disp, &transport.Link{Reader: upR, Writer: downW})
@@ -186,11 +232,11 @@ type e2eFixture struct {
 	cancel context.CancelFunc
 }
 
-func newE2EFixture(t *testing.T, h *carrierHarness, policy mux.ResumePolicy) *e2eFixture {
+func newE2EFixture(t *testing.T, h *carrierHarness, dialer internet.Dialer, policy mux.ResumePolicy) *e2eFixture {
 	t.Helper()
 	factory := &mux.DialingWorkerFactory{
 		Proxy:       h,
-		Dialer:      stubDialer{},
+		Dialer:      dialer,
 		Strategy:    mux.ClientStrategy{MaxConcurrency: 8},
 		Resume:      policy,
 		OutboundTag: "e2e-test",
@@ -245,7 +291,7 @@ func readExactly(t *testing.T, r *pipe.Reader, n int, timeout time.Duration) []b
 
 func TestResumeE2ERebindSurvives(t *testing.T) {
 	h := &carrierHarness{disp: echoDispatcher{}}
-	fx := newE2EFixture(t, h, testResumePolicy())
+	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
 	defer fx.worker.Close()
 	defer h.closeAll()
 	defer mux.HsResetForTest()
@@ -268,7 +314,7 @@ func TestResumeE2ERebindSurvives(t *testing.T) {
 
 func TestResumeE2EFailedRedialsThenSuccess(t *testing.T) {
 	h := &carrierHarness{disp: echoDispatcher{}}
-	fx := newE2EFixture(t, h, testResumePolicy())
+	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
 	defer fx.worker.Close()
 	defer h.closeAll()
 	defer mux.HsResetForTest()
@@ -289,7 +335,7 @@ func TestResumeE2EFailedRedialsThenSuccess(t *testing.T) {
 
 func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	h := &carrierHarness{disp: echoDispatcher{}}
-	fx := newE2EFixture(t, h, testResumePolicy())
+	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
 	defer fx.worker.Close()
 	defer h.closeAll()
 	defer mux.HsResetForTest()
@@ -371,7 +417,7 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 
 func TestResumeE2EBulkCompletes(t *testing.T) {
 	h := &carrierHarness{disp: echoDispatcher{}}
-	fx := newE2EFixture(t, h, testResumePolicy())
+	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
 	defer fx.worker.Close()
 	defer h.closeAll()
 	defer mux.HsResetForTest()
@@ -454,7 +500,7 @@ func TestResumeE2ENewPayloadCutSurvives(t *testing.T) {
 	mux.NewPayloadDelayForTest(300 * time.Millisecond)
 	defer mux.NewPayloadDelayForTest(0)
 	h := &carrierHarness{disp: echoDispatcher{}}
-	fx := newE2EFixture(t, h, testResumePolicy())
+	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
 	defer fx.worker.Close()
 	defer h.closeAll()
 	defer mux.HsResetForTest()
@@ -485,6 +531,11 @@ func TestResumeE2ENewPayloadCutSurvives(t *testing.T) {
 type oldServer struct{}
 
 func (oldServer) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
+	conn, err := d.Dial(ctx, net.TCPDestination(net.DomainAddress("v1.mux.cool"), 9527))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 	mb, err := link.Reader.ReadMultiBuffer()
 	if err != nil {
 		return err
@@ -499,11 +550,37 @@ func (oldServer) Process(ctx context.Context, link *transport.Link, d internet.D
 	return errors.New("old server: expected Resume first")
 }
 
+func TestResumeE2EDialFlapSurvives(t *testing.T) {
+	fd := &flapDialer{}
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, fd, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	writeChunk(t, fx.appUpW, []byte("before-flap"))
+	if got := readExactly(t, fx.appDnR, len("before-flap"), 10*time.Second); !bytes.Equal(got, []byte("before-flap")) {
+		t.Fatalf("pre-flap echo mismatch: %q", got)
+	}
+	// Flap the next 4 dials mid-episode, then recover: dial failures
+	// must suspend (not close), and the session must survive.
+	fd.arm(4)
+	h.killCurrent()
+	ping := []byte("ping-after-flap")
+	writeChunk(t, fx.appUpW, ping)
+	if got := readExactly(t, fx.appDnR, len(ping), 25*time.Second); !bytes.Equal(got, ping) {
+		t.Fatalf("post-flap echo mismatch: %q", got)
+	}
+	if fx.worker.Closed() {
+		t.Fatal("worker died through a survivable flap")
+	}
+}
+
 func TestResumeE2EOldServerFallsBackFast(t *testing.T) {
 	policy := testResumePolicy()
 	factory := &mux.DialingWorkerFactory{
 		Proxy:       oldServer{},
-		Dialer:      stubDialer{},
+		Dialer:      stubDialerOK{},
 		Strategy:    mux.ClientStrategy{MaxConcurrency: 8},
 		Resume:      policy,
 		OutboundTag: "oldserver-test",
@@ -533,5 +610,76 @@ func TestResumeE2EOldServerFallsBackFast(t *testing.T) {
 	}
 	if worker.IsSuspended() {
 		t.Fatal("instant-death handshake suspended instead of falling back")
+	}
+}
+
+// slowOldServer models a pre-fork server over a real path: the transport
+// dial succeeds, then the rejection takes ~300ms to travel back. App data
+// is already queued by then (tx==1), so a tx==0 predicate would suspend
+// till timeout; the reply-evidence predicate must still fall back fast.
+type slowOldServer struct {
+	delay time.Duration
+}
+
+func (s slowOldServer) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
+	conn, err := d.Dial(ctx, net.TCPDestination(net.DomainAddress("old.example"), 443))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(s.delay):
+	}
+	mb, err := link.Reader.ReadMultiBuffer()
+	if err != nil {
+		return err
+	}
+	defer buf.ReleaseMulti(mb)
+	if len(mb) == 0 || len(mb[0].Bytes()) < 6 {
+		return errors.New("old server: short meta")
+	}
+	if mb[0].Bytes()[4] == byte(mux.SessionStatusResume) {
+		return errors.New("old server: unknown status")
+	}
+	return errors.New("old server: expected Resume first")
+}
+
+func TestResumeE2ESlowOldServerFallsBack(t *testing.T) {
+	policy := testResumePolicy()
+	factory := &mux.DialingWorkerFactory{
+		Proxy:       slowOldServer{delay: 300 * time.Millisecond},
+		Dialer:      stubDialerOK{},
+		Strategy:    mux.ClientStrategy{MaxConcurrency: 8},
+		Resume:      policy,
+		OutboundTag: "slowoldserver-test",
+	}
+	worker, err := factory.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	defer mux.ClearV2FailsForTest(mux.V2BanKeyForTest("slowoldserver-test", net.DomainAddress("v1.mux.cool")))
+
+	appUpR, appUpW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	_, appDnW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	// Queue app data before dispatch: the New frame is stored (tx==1)
+	// long before the 300ms rejection lands.
+	writeChunk(t, appUpW, []byte("early-app-data"))
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{
+		{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)},
+	})
+	worker.Dispatch(ctx, &transport.Link{Reader: appUpR, Writer: appDnW})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !worker.Closed() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !worker.Closed() {
+		t.Fatal("slow old-server rejection neither fell back nor closed")
+	}
+	if worker.IsSuspended() {
+		t.Fatal("slow rejection suspended instead of falling back")
 	}
 }

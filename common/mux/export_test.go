@@ -107,6 +107,6 @@ func ClearV2FailsForTest(key string) { clearV2Fails(key) }
 
 func V2BanKeyForTest(tag string, target net.Address) string { return v2BanKey(tag, target) }
 
-func ShouldFallbackV1ForTest(tx, rx uint64, age time.Duration) bool {
-	return shouldFallbackV1(tx, rx, age)
+func ShouldFallbackV1ForTest(connected, sawReply bool, age time.Duration) bool {
+	return shouldFallbackV1(connected, sawReply, age)
 }

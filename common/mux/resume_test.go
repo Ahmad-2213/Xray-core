@@ -807,16 +807,16 @@ func TestV2BanKeyScopesPerTag(t *testing.T) {
 }
 
 func TestFallbackV1Matrix(t *testing.T) {
-	if !mux.ShouldFallbackV1ForTest(0, 0, time.Second) {
-		t.Fatal("instant-death handshake must fall back to v1")
+	if !mux.ShouldFallbackV1ForTest(true, false, time.Second) {
+		t.Fatal("connected death with no reply must fall back to v1")
 	}
-	if mux.ShouldFallbackV1ForTest(0, 0, 6*time.Second) {
+	if mux.ShouldFallbackV1ForTest(true, true, time.Second) {
+		t.Fatal("a reply proves v2, must not fall back")
+	}
+	if mux.ShouldFallbackV1ForTest(false, false, time.Second) {
+		t.Fatal("dial failure is a flap, not an old server")
+	}
+	if mux.ShouldFallbackV1ForTest(true, false, 6*time.Second) {
 		t.Fatal("old carrier must not fall back")
-	}
-	if mux.ShouldFallbackV1ForTest(1, 0, time.Second) {
-		t.Fatal("frames sent means v2 works")
-	}
-	if mux.ShouldFallbackV1ForTest(0, 5, time.Second) {
-		t.Fatal("frames received means v2 works")
 	}
 }

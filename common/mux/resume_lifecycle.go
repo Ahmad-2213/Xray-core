@@ -97,11 +97,13 @@ func (d *banTrackingDialer) Connected() bool {
 	return d.connected.Load()
 }
 
-// shouldFallbackV1 detects a carrier that died before a single counted
-// frame in either direction: the peer is not v2 (old server), so the worker
-// must close and let fresh workers use v1 instead of suspending pointlessly.
-func shouldFallbackV1(tx, rx uint64, age time.Duration) bool {
-	return tx == 0 && rx == 0 && age < 5*time.Second
+// shouldFallbackV1 detects a peer that never spoke v2: the dial
+// succeeded but no Resume reply arrived before death inside the handshake
+// window. Frame counters can't prove this — the first payload is stored
+// within ~100ms while the rejection travels a real path — but a v2 server
+// answers every announce immediately, so a missing reply is the evidence.
+func shouldFallbackV1(connected, sawReply bool, age time.Duration) bool {
+	return connected && !sawReply && age < 5*time.Second
 }
 
 // out returns the stable session-write target: the gate when resume is
@@ -185,7 +187,7 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 	if key == "" {
 		key = muxCoolAddress.String()
 	}
-	if shouldFallbackV1(m.gate.TxCount(), m.rx.Value(), time.Since(m.createdAt)) {
+	if shouldFallbackV1(m.dialProbe.Connected(), m.sawResumeReply.Load(), time.Since(m.createdAt)) {
 		if m.dialProbe.Connected() && recordV2Fail(key) >= 3 {
 			banV2(key, m.resume.NoV2CacheTTL)
 			// Reset the streak with the ban: v1 workers carry no

@@ -234,6 +234,12 @@ type ClientWorker struct {
 	pipeGen atomic.Uint64
 	// banKey scopes the v2 fallback ban to this outbound tag + server.
 	banKey string
+	// sawResumeReply records any valid Resume reply (either epoch): a v2
+	// server answers every announce immediately, so its absence at death
+	// is the old-server evidence the fallback predicate needs. Frame
+	// counters can't serve: the first payload is stored within ~100ms
+	// while a real-path rejection is still traveling.
+	sawResumeReply atomic.Bool
 	// dialProbe records whether the initial carrier dial succeeded; only
 	// post-connect deaths count toward the v2 ban (see serveCarrier).
 	dialProbe  *banTrackingDialer
@@ -542,6 +548,7 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if rp.Token != m.token {
 		return errors.New("resume token mismatch")
 	}
+	m.sawResumeReply.Store(true)
 	// Any valid Resume reply proves v2 on this tag: clear the fallback
 	// streak (a negative epoch-0 reply counts too — only v2 speaks it).
 	clearV2Fails(m.banKey)
