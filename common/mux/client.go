@@ -165,6 +165,10 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 	c.redialP = f.Proxy
 	c.redialD = f.Dialer
 	c.redialAddr = target
+	// The initial carrier dials through a probe: only a post-connect
+	// instant death counts toward the v2 ban (see serveCarrier).
+	probe := &banTrackingDialer{Dialer: f.Dialer}
+	c.dialProbe = probe
 	if c.gate != nil {
 		c.gate.setOnCarrierError(func() {
 			c.enterSuspend()
@@ -187,7 +191,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		}
 	}
 
-	go c.serveCarrier(f.Proxy, f.Dialer, uplinkReader, downlinkWriter, target, useV2)
+	go c.serveCarrier(f.Proxy, probe, uplinkReader, downlinkWriter, target, useV2)
 
 	if useV2 {
 		go c.watchHalfOpen(f.Proxy, f.Dialer, target)
@@ -229,7 +233,10 @@ type ClientWorker struct {
 	// downlink (which carries the Resume reply that clears the suspend).
 	pipeGen atomic.Uint64
 	// banKey scopes the v2 fallback ban to this outbound tag + server.
-	banKey     string
+	banKey string
+	// dialProbe records whether the initial carrier dial succeeded; only
+	// post-connect deaths count toward the v2 ban (see serveCarrier).
+	dialProbe  *banTrackingDialer
 	suspMu     sync.Mutex
 	suspendEnd time.Time
 }
@@ -535,6 +542,9 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	if rp.Token != m.token {
 		return errors.New("resume token mismatch")
 	}
+	// Any valid Resume reply proves v2 on this tag: clear the fallback
+	// streak (a negative epoch-0 reply counts too — only v2 speaks it).
+	clearV2Fails(m.banKey)
 	if rp.Epoch == 0 {
 		// Negative reply: the server has nothing parked (fresh carrier
 		// raced a park, or a previous park expired). Stay suspended and

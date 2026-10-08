@@ -8,6 +8,7 @@ import (
 	goerrors "errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -18,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -70,6 +72,29 @@ func clearV2Fails(key string) {
 	v2FailMu.Lock()
 	defer v2FailMu.Unlock()
 	delete(v2Fails, key)
+}
+
+// banTrackingDialer records whether any dial succeeded. Only post-connect
+// instant deaths count toward the v2 ban: a dial failure during a flap
+// looks identical (tx==0 && rx==0) but is exactly what resume is for.
+type banTrackingDialer struct {
+	internet.Dialer
+	connected atomic.Bool
+}
+
+func (d *banTrackingDialer) Dial(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+	conn, err := d.Dialer.Dial(ctx, dest)
+	if err == nil {
+		d.connected.Store(true)
+	}
+	return conn, err
+}
+
+func (d *banTrackingDialer) Connected() bool {
+	if d == nil {
+		return true
+	}
+	return d.connected.Load()
 }
 
 // shouldFallbackV1 detects a carrier that died before a single counted
@@ -154,14 +179,19 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 	}
 	// Instant-death handshake failure (e.g. old server): fall back so
 	// fresh workers use v1 instead of suspending pointlessly. Ban v2
-	// only on a streak: one transient dial failure is what resume is for.
+	// only on a streak of post-connect deaths: a dial failure during a
+	// flap must never ban the version resume needs.
 	key := m.banKey
 	if key == "" {
 		key = muxCoolAddress.String()
 	}
 	if shouldFallbackV1(m.gate.TxCount(), m.rx.Value(), time.Since(m.createdAt)) {
-		if recordV2Fail(key) >= 3 {
+		if m.dialProbe.Connected() && recordV2Fail(key) >= 3 {
 			banV2(key, m.resume.NoV2CacheTTL)
+			// Reset the streak with the ban: v1 workers carry no
+			// counted traffic, so nothing would ever clear it and the
+			// first post-TTL failure would re-ban instantly.
+			clearV2Fails(key)
 		}
 		common.Must(m.done.Close())
 		return

@@ -97,6 +97,18 @@ func RegisterResumePolicy(tag string, p ResumePolicy) {
 	resumeByTag[tag] = p
 }
 
+// UnregisterResumePolicy drops the policy for an outbound tag (e.g. on
+// outbound removal through the API), so a later outbound reusing the tag
+// can't inherit a stale policy.
+func UnregisterResumePolicy(tag string) {
+	if tag == "" {
+		return
+	}
+	resumeRegistryMu.Lock()
+	defer resumeRegistryMu.Unlock()
+	delete(resumeByTag, tag)
+}
+
 // LookupResumePolicy returns the policy for an outbound tag, or disabled
 // when the tag was never registered.
 func LookupResumePolicy(tag string) ResumePolicy {

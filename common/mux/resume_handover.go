@@ -115,18 +115,32 @@ func hsPut(token [16]byte, e *suspendedWorker) {
 			}
 		}
 		if len(hsEntries) >= hsMaxEntries {
-			// Still full: evict the oldest (closest to expiry) rather
-			// than leaking the parked sessions. Newest entries are
-			// the most likely to rebind.
-			var oldest [16]byte
-			var oldestExp time.Time
-			first := true
-			for k, v := range hsEntries {
-				if first || v.expires.Before(oldestExp) {
-					oldest, oldestExp, first = k, v.expires, false
+			// Still full: shed from the largest holder rather than the
+			// globally oldest, so a few heavy users can't evict
+			// everyone else's parks.
+			counts := make(map[string]int, 8)
+			for _, v := range hsEntries {
+				counts[v.user]++
+			}
+			var top string
+			topN, first := 0, true
+			for u, n := range counts {
+				if first || n > topN {
+					top, topN, first = u, n, false
 				}
 			}
-			if !first {
+			var oldest [16]byte
+			var oldestExp time.Time
+			ofirst := true
+			for k, v := range hsEntries {
+				if v.user != top {
+					continue
+				}
+				if ofirst || v.expires.Before(oldestExp) {
+					oldest, oldestExp, ofirst = k, v.expires, false
+				}
+			}
+			if !ofirst {
 				closeEntry(hsEntries[oldest])
 				delete(hsEntries, oldest)
 			}

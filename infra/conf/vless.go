@@ -242,6 +242,34 @@ type VLessOutboundVnext struct {
 	Users   []json.RawMessage `json:"users"`
 }
 
+// HasVisionFlow reports whether any user of this outbound uses an
+// xtls-rprx-vision flow, in either config style. muxResume is useless
+// there: the server restricts Vision mux to UDP-only and breaks the TCP
+// sessions resume protects.
+func (c *VLessOutboundConfig) HasVisionFlow() bool {
+	if c == nil {
+		return false
+	}
+	isVision := func(flow string) bool {
+		return flow == vless.XRV || flow == vless.XRV+"-udp443"
+	}
+	if isVision(c.Flow) {
+		return true
+	}
+	for _, rec := range c.Vnext {
+		for _, rawUser := range rec.Users {
+			var account vless.Account
+			if err := json.Unmarshal(rawUser, &account); err != nil {
+				continue
+			}
+			if isVision(account.Flow) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type VLessOutboundConfig struct {
 	Address    *Address              `json:"address"`
 	Port       uint16                `json:"port"`

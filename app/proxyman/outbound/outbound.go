@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/outbound"
 )
@@ -141,6 +142,7 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil
 	}
+	mux.UnregisterResumePolicy(tag)
 
 	return nil
 }

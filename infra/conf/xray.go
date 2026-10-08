@@ -380,6 +380,9 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	}
 
 	if c.MuxResume != nil && c.MuxResume.Enabled {
+		if c.Tag == "" {
+			return nil, errors.New(`"muxResume.enabled" requires the outbound to have a "tag" (policies are per-tag; untagged would silently do nothing)`)
+		}
 		mux.RegisterResumePolicy(c.Tag, c.MuxResume.ToPolicy())
 	}
 
@@ -390,6 +393,11 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	rawConfig, err := outboundConfigLoader.LoadWithID(settings, c.Protocol)
 	if err != nil {
 		return nil, errors.New("failed to load outbound detour config for protocol ", c.Protocol).Base(err)
+	}
+	if c.MuxResume != nil && c.MuxResume.Enabled {
+		if vc, ok := rawConfig.(*VLessOutboundConfig); ok && vc.HasVisionFlow() {
+			return nil, errors.New(`"muxResume" is useless with "flow":"xtls-rprx-vision": the server restricts Vision mux to UDP-only and breaks the TCP sessions resume protects`)
+		}
 	}
 	ts, err := rawConfig.(Buildable).Build()
 	if err != nil {
