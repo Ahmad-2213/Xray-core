@@ -140,6 +140,16 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 	return worker, nil
 }
 
+// newPayloadDelay injects latency before the server reads a New frame's
+// first payload. Test-only: lets a kill land deterministically inside the
+// New window to prove a cut there survives via replay.
+var newPayloadDelay atomic.Uint64 // nanoseconds
+
+// NewPayloadDelayForTest sets the injected New-payload delay.
+func NewPayloadDelayForTest(d time.Duration) {
+	newPayloadDelay.Store(uint64(d.Nanoseconds()))
+}
+
 // boundIdentity binds rebinds to the authenticated user behind this
 // worker: email when set, else the account proto string. Empty only for
 // anonymous inbounds, which are unbindable by necessity (documented).
@@ -320,6 +330,29 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return nil
 	}
 
+	// A replayed New for an unborn ID is the second half of a cut inside
+	// the first payload (kept uncounted and parked): deliver to the
+	// existing session instead of colliding. IDs are never reused within
+	// a worker, so a New for a born ID is a genuine duplicate. Checked
+	// before dispatch so replays never redial downstream.
+	if existing, ok := w.sessionManager.Load().Get(meta.SessionID); ok {
+		if !existing.unborn {
+			return errors.New("duplicate New for live session")
+		}
+		rr := existing.NewReader(reader, &meta.Target)
+		mb, rerr := readFullFrame(rr)
+		if rerr != nil {
+			return rerr
+		}
+		werr := existing.output.WriteMultiBuffer(mb)
+		existing.unborn = false
+		w.countRx(meta)
+		if werr != nil {
+			existing.Close(false)
+			return buf.Copy(rr, buf.Discard)
+		}
+		return nil
+	}
 	link, cancel, err := w.dispatchLink(ctx, meta.Target)
 	if err != nil {
 		if meta.Option.Has(OptionData) {
@@ -334,6 +367,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
 		cancel:       cancel,
+		unborn:       true,
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
@@ -350,14 +384,22 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 
 	// Read the whole chunk before delivering (see readFullFrame): no
 	// partial delivery, no duplication on replay.
+	if d := newPayloadDelay.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
 	rr := s.NewReader(reader, &meta.Target)
 	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
+		// Never delivered and never counted: the session stays tabled
+		// but unborn, so the rebind replay lands on the idempotent
+		// branch above instead of colliding. If no rebind comes, the
+		// park janitor reaps it.
 		return rerr
 	}
 	werr := s.output.WriteMultiBuffer(mb)
 	// Carrier delivered fully; a downstream write error is local, so the
 	// frame still counts (the sender counted it at store time).
+	s.unborn = false
 	w.countRx(meta)
 	if werr != nil {
 		s.Close(false)

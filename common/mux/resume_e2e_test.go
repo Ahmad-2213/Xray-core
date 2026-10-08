@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
@@ -394,5 +395,86 @@ func TestResumeE2EBulkCompletes(t *testing.T) {
 	}
 	if got := readExactly(t, fx.appDnR, total, 60*time.Second); !bytes.Equal(got, big) {
 		t.Fatal("bulk echo mismatch")
+	}
+}
+
+func TestResumeTruncatedFrameParks(t *testing.T) {
+	downR, downW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	upR, upW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	worker, err := mux.NewClientWorkerWithResume(
+		transport.Link{Reader: downR, Writer: upW},
+		mux.ClientStrategy{MaxConcurrency: 8},
+		mux.DefaultResumePolicy(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	defer mux.HsResetForTest()
+
+	appUpR, _ := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	_, appDnW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{
+		{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)},
+	})
+	if !worker.Dispatch(ctx, &transport.Link{Reader: appUpR, Writer: appDnW}) {
+		t.Fatal("dispatch rejected")
+	}
+
+	// Truncated Keep for the live session: meta + size prefix claiming
+	// 100 bytes, only 10 delivered, then the carrier dies. Pre-fix this
+	// killed the worker (handler error); it must park (stay alive).
+	meta := mux.FrameMetadata{SessionID: 1, SessionStatus: mux.SessionStatusKeep, Option: mux.OptionData}
+	b := buf.New()
+	if err := meta.WriteTo(b); err != nil {
+		t.Fatal(err)
+	}
+	pay := buf.New()
+	if _, err := serial.WriteUint16(pay, 100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pay.Write([]byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	if err := downW.WriteMultiBuffer(buf.MultiBuffer{b, pay}); err != nil {
+		t.Fatal(err)
+	}
+	_ = downW.Close()
+	upR.Interrupt()
+	time.Sleep(300 * time.Millisecond)
+	if worker.Closed() {
+		t.Fatal("truncated frame killed the worker; must park instead")
+	}
+}
+
+func TestResumeE2ENewPayloadCutSurvives(t *testing.T) {
+	// Hold the server inside New handling so the kill lands
+	// deterministically inside the first-payload window: the replayed
+	// New must land on the idempotent branch, not collide.
+	mux.NewPayloadDelayForTest(300 * time.Millisecond)
+	defer mux.NewPayloadDelayForTest(0)
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	payload := []byte("new-session-first-payload")
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- fx.appUpW.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)})
+	}()
+	time.Sleep(150 * time.Millisecond)
+	h.killCurrent()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal("app write failed:", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("app write stalled")
+	}
+	if got := readExactly(t, fx.appDnR, len(payload), 25*time.Second); !bytes.Equal(got, payload) {
+		t.Fatalf("new-cut echo mismatch: %q", got)
 	}
 }

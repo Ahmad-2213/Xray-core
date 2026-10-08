@@ -191,6 +191,12 @@ type Session struct {
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
+	// unborn marks a stream session whose first payload hasn't been
+	// delivered+counted yet. A replayed New for an unborn ID is the
+	// other half of a cut inside the first payload: deliver to it
+	// instead of colliding. IDs are never reused within a worker, so a
+	// New for a born ID is a genuine duplicate (protocol error).
+	unborn bool
 	// cancel detaches the downstream (dispatcher/freedom) lifetime from
 	// the carrier: invoked on Close so a dead carrier doesn't kill
 	// parked sessions, and dead sessions don't leak outbounds.

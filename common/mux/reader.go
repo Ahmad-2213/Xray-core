@@ -71,11 +71,18 @@ func ReadFullFrameForTest(rr buf.Reader) (buf.MultiBuffer, error) {
 // suffix instead) — either kills the inner stream. So nothing is
 // delivered until the frame is whole (EOF, including the empty-chunk
 // case) or known dead (any other error discards the prefix).
+// Accumulation is capped at buf.Size (our writer never emits bigger
+// chunks; PacketReader enforces the same bound): anything larger is a
+// corrupt or hostile peer, fail it instead of growing memory.
 func readFullFrame(rr buf.Reader) (buf.MultiBuffer, error) {
 	var mb buf.MultiBuffer
 	for {
 		part, err := rr.ReadMultiBuffer()
 		mb = append(mb, part...)
+		if mb.Len() > buf.Size {
+			buf.ReleaseMulti(mb)
+			return nil, errors.New("frame exceeds size bound")
+		}
 		if err != nil {
 			if errors.Cause(err) == io.EOF {
 				return mb, nil

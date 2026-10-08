@@ -2,6 +2,7 @@ package mux
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -439,7 +440,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		}()
 
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
-			return err
+			return &frameReadError{err}
 		}
 		if count {
 			m.rx.Next()
@@ -451,7 +452,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	rr := s.NewReader(reader, &meta.Target)
 	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
-		return rerr
+		return &frameReadError{rerr}
 	}
 	werr := s.output.WriteMultiBuffer(mb)
 	if count {
@@ -461,7 +462,10 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if werr != nil {
 		errors.LogInfoInner(context.Background(), werr, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
-		return buf.Copy(rr, buf.Discard)
+		if derr := buf.Copy(rr, buf.Discard); derr != nil {
+			return &frameReadError{derr}
+		}
+		return nil
 	}
 
 	return nil
@@ -474,7 +478,7 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 	count := m.resume.Enabled
 	if meta.Option.Has(OptionData) {
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
-			return err
+			return &frameReadError{err}
 		}
 	}
 	if count {
@@ -495,7 +499,7 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	}
 	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
-		return err
+		return &frameReadError{err}
 	}
 	defer buf.ReleaseMulti(mb)
 	var raw []byte
@@ -555,7 +559,7 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	}
 	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
-		return err
+		return &frameReadError{err}
 	}
 	defer buf.ReleaseMulti(mb)
 	var raw []byte
@@ -664,6 +668,15 @@ func (m *ClientWorker) fetchOutput() {
 	}
 }
 
+// frameReadError marks bytes that never arrived: the carrier died
+// mid-frame. Unlike decode/protocol errors (corrupt data on a live
+// carrier — fail fast), these must park and wait: the downlink can error
+// before suspension is recorded, and only a rebind clears it.
+type frameReadError struct{ err error }
+
+func (e *frameReadError) Error() string { return e.err.Error() }
+func (e *frameReadError) Unwrap() error { return e.err }
+
 // readLoop processes frames until the carrier errors. True = worker done.
 func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 	var meta FrameMetadata
@@ -696,12 +709,11 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 		}
 
 		if err != nil {
-			// A handler error while suspended is almost certainly the
-			// rebind interrupting this reader (attachCarrierSwap pulls
-			// the pipes from underneath it): park and wait like a read
-			// error instead of killing the worker. Genuine corruption
-			// on a live carrier still fails fast below.
-			if m.gate != nil && m.IsSuspended() {
+			// Transport loss parks even before suspension is recorded
+			// (the downlink can error first); decode and protocol
+			// errors still fail fast.
+			var fre *frameReadError
+			if stderrors.As(err, &fre) {
 				return false
 			}
 			errors.LogInfoInner(context.Background(), err, "failed to process data")
