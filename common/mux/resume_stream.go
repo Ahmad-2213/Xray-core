@@ -69,31 +69,6 @@ func parseMetaPrefix(b []byte) (status SessionStatus, opt bitmask.Byte, metaLen 
 	return status, opt, metaLen, netByte, hasNet, true
 }
 
-// Exported for unit tests (package mux_test).
-func CountedFrameForTest(status SessionStatus, opt bitmask.Byte, metaLen int, netByte byte, hasNet bool) bool {
-	return countedFrame(status, opt, metaLen, netByte, hasNet)
-}
-
-func ParseMetaPrefixForTest(b []byte) (SessionStatus, bitmask.Byte, int, byte, bool, bool) {
-	return parseMetaPrefix(b)
-}
-
-func NewGateForTest(target buf.Writer, done <-chan struct{}, policy ResumePolicy) *carrierGate {
-	return newCarrierGate(target, done, policy)
-}
-
-func GateSuspendForTest(g *carrierGate, suspended bool) { g.setSuspended(suspended) }
-
-func GateSwapTargetForTest(g *carrierGate, target buf.Writer) { g.swapTarget(target) }
-
-func GateAckForTest(g *carrierGate, n uint64) { g.ack(n) }
-
-func GateFlushSinceForTest(g *carrierGate, peerRx uint64) error { return g.flushSince(peerRx) }
-
-func GateWriteAckForTest(g *carrierGate, rx uint64) { g.writeAck(rx) }
-
-func GateUnackedAgeForTest(g *carrierGate) time.Duration { return g.unackedAge() }
-
 type storedFrame struct {
 	seq      uint64
 	sid      uint16

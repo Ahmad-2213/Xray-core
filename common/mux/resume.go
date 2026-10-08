@@ -11,9 +11,12 @@ package mux
 //     stops calling Close/Interrupt on session pipes) and redials through the
 //     worker's own dialer. Bounded retain + replay, tombstones for resets.
 //   - Disabled by default (zero-cost flag-off). Opt-in per outbound tag via
-//     infra/conf "muxResume" key. Old peers see unknown statuses and fail
-//     fast (current behavior); v2 workers are selected via v2.mux.cool magic
-//     target with TTL-cached fallback to v1.
+//     infra/conf "muxResume" key. Version negotiation is in-band on
+//     v1.mux.cool (RequestCommandMux on every protocol): the client
+//     announces Resume first, old peers fail the unknown status fast with
+//     zero dials, and the server sniffs it. No second magic hostname
+//     (which would go out as plain TCP, bypassing Vision, and leak the
+//     announce to whoever answers that name).
 //
 // UDP payloads are never retained (slots only, replayed as tombstones).
 //
@@ -77,29 +80,32 @@ func DisabledPolicy() ResumePolicy {
 var (
 	resumeRegistryMu sync.RWMutex
 	resumeByTag      = make(map[string]ResumePolicy)
-	resumeDefault    = DisabledPolicy()
 )
 
 // RegisterResumePolicy registers an opt-in policy for an outbound tag.
-// Called from infra/conf when "muxResume" is present. Empty tag sets default.
+// Called from infra/conf when "muxResume" is present. Tags must be
+// explicit: an empty tag is ignored (never a global default), so one
+// untagged outbound can't silently enable resume for every mux outbound
+// in the process. Outbounds added outside conf (e.g. gRPC API) stay
+// disabled — fail-closed.
 func RegisterResumePolicy(tag string, p ResumePolicy) {
-	resumeRegistryMu.Lock()
-	defer resumeRegistryMu.Unlock()
 	if tag == "" {
-		resumeDefault = p
 		return
 	}
+	resumeRegistryMu.Lock()
+	defer resumeRegistryMu.Unlock()
 	resumeByTag[tag] = p
 }
 
-// LookupResumePolicy returns the policy for an outbound tag, or the default.
+// LookupResumePolicy returns the policy for an outbound tag, or disabled
+// when the tag was never registered.
 func LookupResumePolicy(tag string) ResumePolicy {
 	resumeRegistryMu.RLock()
 	defer resumeRegistryMu.RUnlock()
 	if p, ok := resumeByTag[tag]; ok {
 		return p
 	}
-	return resumeDefault
+	return DisabledPolicy()
 }
 
 // tokenString renders a short non-secret prefix for logs (never the full

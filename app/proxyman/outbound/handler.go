@@ -150,7 +150,6 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 				h.xudp = nil // same as before
 			}
 			if config.XudpConcurrency > 0 {
-				resume := mux.LookupResumePolicy(h.tag)
 				h.xudp = &mux.ClientManager{
 					Enabled: true,
 					Picker: &mux.IncrementalWorkerPicker{
@@ -161,7 +160,10 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 								MaxConcurrency: uint32(config.XudpConcurrency),
 								MaxConnection:  128,
 							},
-							Resume:      resume,
+							// UDP payloads are never retained or
+							// replayed: resume buys nothing here, so
+							// the XUDP factory stays on v1.
+							Resume:      mux.DisabledPolicy(),
 							OutboundTag: h.tag,
 						},
 					},

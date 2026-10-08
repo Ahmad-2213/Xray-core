@@ -791,7 +791,7 @@ func TestV2BanTTL(t *testing.T) {
 }
 
 func TestV2BanKeyScopesPerTag(t *testing.T) {
-	addr := net.DomainAddress("v2.mux.cool")
+	addr := net.DomainAddress("v1.mux.cool")
 	k1 := mux.V2BanKeyForTest("ws-out", addr)
 	k2 := mux.V2BanKeyForTest("tg-out", addr)
 	if k1 == k2 {

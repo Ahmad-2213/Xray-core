@@ -41,7 +41,10 @@ func (s *Server) Type() interface{} {
 
 // Dispatch implements routing.Dispatcher
 func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	if dest.Address != muxCoolAddress && dest.Address != muxCoolAddressV2 {
+	// Only v1.mux.cool is magic: version negotiation is in-band via the
+	// first frame (Resume announce), so every protocol keeps its Mux
+	// command path. v2.mux.cool is retired (it went out as plain TCP).
+	if dest.Address != muxCoolAddress {
 		return s.dispatcher.Dispatch(ctx, dest)
 	}
 
@@ -62,7 +65,7 @@ func (s *Server) Dispatch(ctx context.Context, dest net.Destination) (*transport
 
 // DispatchLink implements routing.Dispatcher
 func (s *Server) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	if dest.Address != muxCoolAddress && dest.Address != muxCoolAddressV2 {
+	if dest.Address != muxCoolAddress {
 		return s.dispatcher.DispatchLink(ctx, dest, link)
 	}
 	worker, err := NewServerWorker(ctx, s.dispatcher, link)
@@ -141,14 +144,10 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 }
 
 // newPayloadDelay injects latency before the server reads a New frame's
-// first payload. Test-only: lets a kill land deterministically inside the
-// New window to prove a cut there survives via replay.
+// first payload (test-only hook, set via NewPayloadDelayForTest). Lets a
+// kill land deterministically inside the New window to prove a cut there
+// survives via replay.
 var newPayloadDelay atomic.Uint64 // nanoseconds
-
-// NewPayloadDelayForTest sets the injected New-payload delay.
-func NewPayloadDelayForTest(d time.Duration) {
-	newPayloadDelay.Store(uint64(d.Nanoseconds()))
-}
 
 // boundIdentity binds rebinds to the authenticated user behind this
 // worker: email when set, else the account proto string. Empty only for
@@ -507,20 +506,24 @@ func (w *ServerWorker) handleFrame(ctx context.Context, reader *buf.BufferedRead
 	if err != nil {
 		return errors.New("failed to read metadata").Base(err)
 	}
+	return w.handleMeta(ctx, reader, &meta)
+}
 
+func (w *ServerWorker) handleMeta(ctx context.Context, reader *buf.BufferedReader, meta *FrameMetadata) error {
+	var err error
 	switch meta.SessionStatus {
 	case SessionStatusKeepAlive:
-		err = w.handleStatusKeepAlive(&meta, reader)
+		err = w.handleStatusKeepAlive(meta, reader)
 	case SessionStatusEnd:
-		err = w.handleStatusEnd(&meta, reader)
+		err = w.handleStatusEnd(meta, reader)
 	case SessionStatusNew:
-		err = w.handleStatusNew(session.ContextWithIsReverseMux(ctx, false), &meta, reader)
+		err = w.handleStatusNew(session.ContextWithIsReverseMux(ctx, false), meta, reader)
 	case SessionStatusKeep:
-		err = w.handleStatusKeep(&meta, reader)
+		err = w.handleStatusKeep(meta, reader)
 	case SessionStatusResume:
-		err = w.handleStatusResume(&meta, reader)
+		err = w.handleStatusResume(meta, reader)
 	case SessionStatusAck:
-		err = w.handleStatusAck(&meta, reader)
+		err = w.handleStatusAck(meta, reader)
 	default:
 		status := meta.SessionStatus
 		return errors.New("unknown status: ", status)
@@ -552,6 +555,31 @@ func (w *ServerWorker) run(ctx context.Context) {
 	}()
 
 	reader := &buf.BufferedReader{Reader: w.link.Reader}
+
+	// In-band version sniff: a Resume first frame marks a v2 carrier
+	// (announce or rebind); anything else is v1 and flows through the
+	// normal switch. Old servers fail the Resume frame fast with zero
+	// dials — that fast failure, not a magic hostname, is the v2 signal
+	// and the fallback trigger.
+	var first FrameMetadata
+	ferr := first.Unmarshal(reader, session.IsReverseMuxFromContext(ctx))
+	if ferr != nil {
+		ferr = errors.New("failed to read metadata").Base(ferr)
+	} else if first.SessionStatus == SessionStatusResume && first.Option.Has(OptionData) {
+		ferr = w.handleStatusResume(&first, reader)
+	} else {
+		ferr = w.handleMeta(ctx, reader, &first)
+	}
+	if ferr != nil {
+		if w.parkForResume(ctx) {
+			parked = true
+			return
+		}
+		if errors.Cause(ferr) != io.EOF {
+			errors.LogInfoInner(ctx, ferr, "unexpected EOF")
+		}
+		return
+	}
 
 	for {
 		select {

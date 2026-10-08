@@ -2,7 +2,7 @@ package mux
 
 import (
 	"context"
-	stderrors "errors"
+	goerrors "errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -151,13 +151,17 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		return nil, err
 	}
 
-	useV2 := f.Resume.Enabled && !isV2Banned(v2BanKey(f.OutboundTag, muxCoolAddressV2))
+	// Version negotiation is in-band on v1.mux.cool (RequestCommandMux on
+	// every protocol, Vision flow preserved): a v2 worker announces its
+	// resume token as the first frame, and the server sniffs it. Old
+	// servers fail the unknown status fast with zero dials, which is also
+	// the reliable fallback signal. A separate v2 magic hostname would go
+	// out as plain TCP (Vision bypass) and leak the announce to whoever
+	// answers that name on old servers.
+	useV2 := f.Resume.Enabled && !isV2Banned(v2BanKey(f.OutboundTag, muxCoolAddress))
 	target := muxCoolAddress
-	if useV2 {
-		target = muxCoolAddressV2
-	}
 	c.useV2 = useV2
-	c.banKey = v2BanKey(f.OutboundTag, muxCoolAddressV2)
+	c.banKey = v2BanKey(f.OutboundTag, muxCoolAddress)
 	c.redialP = f.Proxy
 	c.redialD = f.Dialer
 	c.redialAddr = target
@@ -179,7 +183,6 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch.Load(), RxCount: 0})
 		if err := writeMetaWithFrame(upLinkWriter, meta, buf.MultiBuffer{payload}); err != nil {
 			useV2 = false
-			target = muxCoolAddress
 			c.useV2 = false
 		}
 	}
@@ -239,9 +242,8 @@ type ackState struct {
 }
 
 var (
-	muxCoolAddress   = net.DomainAddress("v1.mux.cool")
-	muxCoolAddressV2 = net.DomainAddress("v2.mux.cool")
-	muxCoolPort      = net.Port(9527)
+	muxCoolAddress = net.DomainAddress("v1.mux.cool")
+	muxCoolPort    = net.Port(9527)
 )
 
 // NewClientWorker creates a new mux.Client.
@@ -733,7 +735,7 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 			// (the downlink can error first); decode and protocol
 			// errors still fail fast.
 			var fre *frameReadError
-			if stderrors.As(err, &fre) {
+			if goerrors.As(err, &fre) {
 				return false
 			}
 			errors.LogInfoInner(context.Background(), err, "failed to process data")

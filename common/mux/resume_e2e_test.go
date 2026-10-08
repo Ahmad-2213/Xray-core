@@ -478,3 +478,60 @@ func TestResumeE2ENewPayloadCutSurvives(t *testing.T) {
 		t.Fatalf("new-cut echo mismatch: %q", got)
 	}
 }
+
+// oldServer mimics a pre-fork server: the first Resume frame fails fast
+// with an unknown status and zero dials. The client must fall back
+// (close promptly) instead of suspending for the whole episode.
+type oldServer struct{}
+
+func (oldServer) Process(ctx context.Context, link *transport.Link, d internet.Dialer) error {
+	mb, err := link.Reader.ReadMultiBuffer()
+	if err != nil {
+		return err
+	}
+	defer buf.ReleaseMulti(mb)
+	if len(mb) == 0 || len(mb[0].Bytes()) < 6 {
+		return errors.New("old server: short meta")
+	}
+	if mb[0].Bytes()[4] == byte(mux.SessionStatusResume) {
+		return errors.New("old server: unknown status")
+	}
+	return errors.New("old server: expected Resume first")
+}
+
+func TestResumeE2EOldServerFallsBackFast(t *testing.T) {
+	policy := testResumePolicy()
+	factory := &mux.DialingWorkerFactory{
+		Proxy:       oldServer{},
+		Dialer:      stubDialer{},
+		Strategy:    mux.ClientStrategy{MaxConcurrency: 8},
+		Resume:      policy,
+		OutboundTag: "oldserver-test",
+	}
+	worker, err := factory.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	defer mux.ClearV2FailsForTest(mux.V2BanKeyForTest("oldserver-test", net.DomainAddress("v1.mux.cool")))
+
+	appUpR, _ := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	_, appDnW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{
+		{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)},
+	})
+	worker.Dispatch(ctx, &transport.Link{Reader: appUpR, Writer: appDnW})
+
+	// Instant-death handshake with zero traffic: fallback closes the
+	// worker instead of parking it for the episode.
+	deadline := time.Now().Add(5 * time.Second)
+	for !worker.Closed() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !worker.Closed() {
+		t.Fatal("old-server rejection neither fell back nor closed")
+	}
+	if worker.IsSuspended() {
+		t.Fatal("instant-death handshake suspended instead of falling back")
+	}
+}

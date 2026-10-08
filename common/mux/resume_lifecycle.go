@@ -79,20 +79,6 @@ func shouldFallbackV1(tx, rx uint64, age time.Duration) bool {
 	return tx == 0 && rx == 0 && age < 5*time.Second
 }
 
-func BanV2ForTest(host string, ttl time.Duration) { banV2(host, ttl) }
-
-func IsV2BannedForTest(host string) bool { return isV2Banned(host) }
-
-func RecordV2FailForTest(key string) int { return recordV2Fail(key) }
-
-func ClearV2FailsForTest(key string) { clearV2Fails(key) }
-
-func V2BanKeyForTest(tag string, target net.Address) string { return v2BanKey(tag, target) }
-
-func ShouldFallbackV1ForTest(tx, rx uint64, age time.Duration) bool {
-	return shouldFallbackV1(tx, rx, age)
-}
-
 // out returns the stable session-write target: the gate when resume is
 // enabled, the raw carrier pipe otherwise.
 func (m *ClientWorker) out() buf.Writer {
@@ -171,7 +157,7 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 	// only on a streak: one transient dial failure is what resume is for.
 	key := m.banKey
 	if key == "" {
-		key = muxCoolAddressV2.String()
+		key = muxCoolAddress.String()
 	}
 	if shouldFallbackV1(m.gate.TxCount(), m.rx.Value(), time.Since(m.createdAt)) {
 		if recordV2Fail(key) >= 3 {
