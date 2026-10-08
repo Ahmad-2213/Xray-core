@@ -724,6 +724,18 @@ func TestReadFullFrameEmpty(t *testing.T) {
 	}
 }
 
+func TestReadFullFrameOversizeFails(t *testing.T) {
+	// A corrupt/hostile size prefix must fail, never accumulate
+	// unboundedly — and never park as transport loss.
+	big := make([]byte, 9000)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	if _, err := mux.ReadFullFrameForTest(&dribbleReaderForTest{chunks: [][]byte{big}}); err == nil {
+		t.Fatal("oversize frame must fail")
+	}
+}
+
 // ---- Phase 3: v1/v2 interop matrix ----
 
 func TestV2StatusesDoNotAliasV1(t *testing.T) {

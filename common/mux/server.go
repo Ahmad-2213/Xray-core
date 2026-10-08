@@ -367,7 +367,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
 		cancel:       cancel,
-		unborn:       true,
+		// Only a payload-carrying New can be cut mid-delivery: a
+		// payload-less New is complete at its meta, so it is born.
+		unborn: meta.Option.Has(OptionData),
 	}
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
@@ -388,6 +390,16 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		time.Sleep(time.Duration(d))
 	}
 	rr := s.NewReader(reader, &meta.Target)
+	if !w.resumeHasToken {
+		// Flag-off: original upstream streaming delivery — unbounded,
+		// byte-identical v1 path.
+		err = buf.Copy(rr, s.output)
+		if err != nil && buf.IsWriteError(err) {
+			s.Close(false)
+			return buf.Copy(rr, buf.Discard)
+		}
+		return err
+	}
 	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
 		// Never delivered and never counted: the session stays tabled
@@ -439,6 +451,20 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
+	if !w.resumeHasToken {
+		// Flag-off: original upstream streaming delivery — unbounded,
+		// byte-identical v1 path.
+		err := buf.Copy(rr, s.output)
+		if err != nil && buf.IsWriteError(err) {
+			errors.LogInfoInner(context.Background(), err, "failed to write to downstream writer. closing session ", s.ID)
+			s.Close(false)
+			return buf.Copy(rr, buf.Discard)
+		}
+		if err == nil && count {
+			w.countRx(meta)
+		}
+		return err
+	}
 	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
 		return rerr

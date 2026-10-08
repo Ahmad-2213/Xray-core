@@ -450,8 +450,22 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 
 	rr := s.NewReader(reader, &meta.Target)
+	if !m.resume.Enabled {
+		// Flag-off: original upstream streaming delivery — unbounded,
+		// byte-identical v1 path.
+		err := buf.Copy(rr, s.output)
+		if err != nil && buf.IsWriteError(err) {
+			errors.LogInfoInner(context.Background(), err, "failed to write to downstream. closing session ", s.ID)
+			s.Close(false)
+			return buf.Copy(rr, buf.Discard)
+		}
+		return err
+	}
 	mb, rerr := readFullFrame(rr)
 	if rerr != nil {
+		if rerr == errFrameTooLarge {
+			return rerr
+		}
 		return &frameReadError{rerr}
 	}
 	werr := s.output.WriteMultiBuffer(mb)
@@ -499,6 +513,9 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	}
 	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
+		if err == errFrameTooLarge {
+			return err
+		}
 		return &frameReadError{err}
 	}
 	defer buf.ReleaseMulti(mb)
@@ -559,6 +576,9 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	}
 	mb, err := readFullFrame(NewStreamReader(reader))
 	if err != nil {
+		if err == errFrameTooLarge {
+			return err
+		}
 		return &frameReadError{err}
 	}
 	defer buf.ReleaseMulti(mb)
