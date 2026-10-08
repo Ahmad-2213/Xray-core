@@ -443,16 +443,23 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	count := m.resume.Enabled && meta.Target.Network != net.Network_UDP
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
-		// Notify remote peer to close this session. Routed via out() so
-		// the End is counted and retained (and hits the live carrier
-		// after a swap). Async: the gate may be suspended and must
-		// never stall the reader loop.
-		sid := meta.SessionID
-		out := m.out()
-		go func() {
-			closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
-			closingWriter.Close()
-		}()
+		// Resume-safe: do NOT answer an unknown Keep with an End.
+		// A retained/counted End would replay on the next rebind and
+		// close the peer session even when the miss was transient
+		// (e.g. server parked the table a moment earlier). Discard +
+		// count so the sender's replay accounting still advances.
+		if !m.resume.Enabled {
+			// v1 parity: notify remote peer to close this session.
+			// Routed via out() so it hits the live carrier after a
+			// swap. Async: the gate may be suspended and must never
+			// stall the reader loop.
+			sid := meta.SessionID
+			out := m.out()
+			go func() {
+				closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
+				closingWriter.Close()
+			}()
+		}
 
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return &frameReadError{err}

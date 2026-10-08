@@ -433,17 +433,24 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	count := meta.Target.Network != net.Network_UDP
 	s, found := w.sessionManager.Load().Get(meta.SessionID)
 	if !found {
-		// Notify remote peer to close this session. Routed via out() so
-		// the End is counted and retained like any other frame (and hits
-		// the live carrier after a swap, not the dead original pipe).
-		// Async: the gate may be suspended (half-open park) and must
-		// never stall the reader loop.
-		sid := meta.SessionID
-		out := w.out()
-		go func() {
-			closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
-			closingWriter.Close()
-		}()
+		// Resume-safe: do NOT answer an unknown Keep with an End (see
+		// client handleStatusKeep). After parkForResume the table is
+		// empty by design while sessions wait in the handover map; an
+		// End here would be retained/replayed and kill the rebind.
+		// Discard + count so the sender still advances past it.
+		if !w.resumeHasToken {
+			// v1 parity: notify remote peer to close this session.
+			// Routed via out() so it hits the live carrier after a
+			// swap, not the dead original pipe. Async: the gate may
+			// be suspended (half-open park) and must never stall the
+			// reader loop.
+			sid := meta.SessionID
+			out := w.out()
+			go func() {
+				closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
+				closingWriter.Close()
+			}()
+		}
 
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return err
