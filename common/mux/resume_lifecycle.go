@@ -198,6 +198,15 @@ func (m *ClientWorker) serveCarrier(p proxy.Outbound, d internet.Dialer, uplinkR
 		common.Must(m.done.Close())
 		return
 	}
+	if !m.dialProbe.Connected() {
+		// Never got a carrier: fail fast like v1. Retrying here would
+		// pile suspended workers and dial storms during an outage, and
+		// there is no server-side state worth waiting for — the next
+		// dispatch creates a fresh worker. Live sessions (connected at
+		// least once) still suspend and redial below.
+		common.Must(m.done.Close())
+		return
+	}
 	clearV2Fails(key)
 	if m.sessionManager.Size() == 0 {
 		common.Must(m.done.Close())

@@ -576,6 +576,48 @@ func TestResumeE2EDialFlapSurvives(t *testing.T) {
 	}
 }
 
+func TestResumeE2ENeverConnectedFailsFast(t *testing.T) {
+	// The very first dial fails with an app session already waiting: no
+	// carrier ever existed, so there is nothing to resume — fail fast
+	// like v1 instead of suspending (no dial storm, no 10s hang per new
+	// connection during an outage).
+	fd := &flapDialer{}
+	fd.arm(1000)
+	h := &carrierHarness{disp: echoDispatcher{}}
+	policy := testResumePolicy()
+	factory := &mux.DialingWorkerFactory{
+		Proxy:       h,
+		Dialer:      fd,
+		Strategy:    mux.ClientStrategy{MaxConcurrency: 8},
+		Resume:      policy,
+		OutboundTag: "neverconnected-test",
+	}
+	worker, err := factory.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	defer h.closeAll()
+
+	appUpR, _ := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	_, appDnW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{
+		{Target: net.TCPDestination(net.DomainAddress("example.com"), 80)},
+	})
+	worker.Dispatch(ctx, &transport.Link{Reader: appUpR, Writer: appDnW})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !worker.Closed() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !worker.Closed() {
+		t.Fatal("never-connected worker neither failed fast nor closed")
+	}
+	if worker.IsSuspended() {
+		t.Fatal("never-connected dial failure suspended instead of failing fast")
+	}
+}
+
 func TestResumeE2EOldServerFallsBackFast(t *testing.T) {
 	policy := testResumePolicy()
 	factory := &mux.DialingWorkerFactory{
