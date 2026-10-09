@@ -234,6 +234,9 @@ type ClientWorker struct {
 	pipeGen atomic.Uint64
 	// banKey scopes the v2 fallback ban to this outbound tag + server.
 	banKey string
+	// suppressedEnds counts reactive Ends withheld for unknown sessions
+	// while resume is active (see handleStatusKeep). Logged per event.
+	suppressedEnds atomic.Uint64
 	// sawResumeReply records any valid Resume reply (either epoch): a v2
 	// server answers every announce immediately, so its absence at death
 	// is the old-server evidence the fallback predicate needs. Frame
@@ -475,6 +478,8 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		// close the peer session even when the miss was transient
 		// (e.g. server parked the table a moment earlier). Discard +
 		// count so the sender's replay accounting still advances.
+		// Genuinely-unknown sessions now linger on the sender until the
+		// app closes them; each suppression is counted and logged.
 		if !m.resume.Enabled {
 			// v1 parity: notify remote peer to close this session.
 			// Routed via out() so it hits the live carrier after a
@@ -486,6 +491,9 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 				closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
 				closingWriter.Close()
 			}()
+		} else {
+			n := m.suppressedEnds.Add(1)
+			errors.LogInfo(context.Background(), "mux resume: suppressed reactive End for unknown session ", meta.SessionID, " total ", n)
 		}
 
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {

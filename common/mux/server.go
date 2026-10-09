@@ -124,6 +124,9 @@ type ServerWorker struct {
 	// captured at construction (run/adopt run on one goroutine after).
 	localUser string
 	ackMu     ackState
+	// suppressedEnds counts reactive Ends withheld for unknown sessions
+	// once a v2 token is known (see handleStatusKeep).
+	suppressedEnds atomic.Uint64
 	// quiesced closes when this worker's run loop exits. A park hands it
 	// to the handover entry so the adopter can wait out late deliveries
 	// from the old carrier before replaying.
@@ -463,6 +466,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		// empty by design while sessions wait in the handover map; an
 		// End here would be retained/replayed and kill the rebind.
 		// Discard + count so the sender still advances past it.
+		// Genuinely-unknown sessions now linger on the sender until the
+		// app closes them; each suppression is counted and logged.
 		if !w.resumeHasToken {
 			// v1 parity: notify remote peer to close this session.
 			// Routed via out() so it hits the live carrier after a
@@ -475,6 +480,9 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 				closingWriter := NewResponseWriter(sid, out, protocol.TransferTypeStream)
 				closingWriter.Close()
 			}()
+		} else {
+			n := w.suppressedEnds.Add(1)
+			errors.LogInfo(context.Background(), "mux resume: suppressed reactive End for unknown session ", meta.SessionID, " total ", n)
 		}
 
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
