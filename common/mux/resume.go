@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 )
 
@@ -181,29 +182,39 @@ func CountedStatus(s SessionStatus) bool {
 }
 
 // rxState is the receive-side cumulative frame counter with a suspend
-// seal. admit must be called with a FULLY READ frame before delivery:
-// while unsealed it counts and returns true; once sealed (a suspend
-// snapshot was taken) it returns false and the caller drops the frame
-// uncounted — the peer will replay it after rebind. Counting before
-// delivery is safe because the whole frame is already in memory; delivery
-// can then only fail via session/worker close, which needs no replay.
-// Without the seal, a frame delivered-but-uncounted at kill time is
-// replayed and delivered twice (+8KB duplication), and a frame counted
-// past the snapshot desyncs the replay math.
+// seal, a reader generation and the content tip. admit must be called
+// with a FULLY READ frame before delivery: while unsealed and
+// same-generation it counts (chaining the tip) and returns true;
+// once sealed, or for a frame from an older reader generation, it
+// returns false and the caller drops the frame uncounted — the peer
+// will replay it after rebind. The generation closes the stale-reader
+// hole: a reader blocked mid-delivery keeps parsing its already-buffered
+// frames after the swap unseals for the new carrier, and without the
+// generation those frames would count, deliver, and then arrive again
+// via replay (duplication). Counting before delivery is safe because
+// the whole frame is already in memory; delivery can then only fail via
+// session/worker close, which needs no replay.
 type rxState struct {
 	mu     sync.Mutex
 	n      uint64
 	sealed bool
+	gen    uint64
+	tip    uint64
 }
 
-func (r *rxState) admit(counted bool) (uint64, bool) {
+func (r *rxState) admit(gen uint64, counted bool, sid uint16, mb buf.MultiBuffer) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.sealed {
+	if r.sealed || gen != r.gen {
+		if gen != r.gen {
+			traceAdmitGenMismatch(gen, r.gen, r.sealed)
+		}
 		return r.n, false
 	}
 	if counted {
 		r.n++
+		ln, crc := fpDigest(mb)
+		r.tip = chainFP(r.tip, r.n, sid, ln, crc)
 	}
 	return r.n, true
 }
@@ -223,12 +234,43 @@ func (r *rxState) sealAndSnapshot() uint64 {
 	return r.n
 }
 
-// resume adopts another worker's baseline and reopens counting.
+// tipSnapshot returns the count and content tip together, atomically,
+// without sealing: for acks, which must never mix a count with a tip
+// that has already moved past it.
+func (r *rxState) tipSnapshot() (uint64, uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n, r.tip
+}
+
+// resume adopts another worker's baseline (count, tip and generation
+// handling stay with the caller) and reopens counting.
 func (r *rxState) resume(n uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.n = n
 	r.sealed = false
+}
+
+// restore adopts a full handover baseline: count and content tip from
+// the parked entry, reopened for the new generation.
+func (r *rxState) restore(n, tip uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.n = n
+	r.tip = tip
+	r.sealed = false
+}
+
+// newGeneration retires the old reader: bumps the generation and
+// unseals atomically, so frames the stale reader already buffered can
+// never admit again.
+func (r *rxState) newGeneration() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gen++
+	r.sealed = false
+	return r.gen
 }
 
 // unseal reopens counting at the current value. Must hold no other

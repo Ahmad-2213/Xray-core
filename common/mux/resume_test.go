@@ -471,9 +471,9 @@ func TestGateAckCoalescedWhileSuspended(t *testing.T) {
 	carrier := &flakyCarrierForTest{}
 	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
 	mux.GateSuspendForTest(g, true)
-	mux.GateWriteAckForTest(g, 3)
-	mux.GateWriteAckForTest(g, 7)
-	mux.GateWriteAckForTest(g, 6)
+	mux.GateWriteAckForTest(g, 3, 300)
+	mux.GateWriteAckForTest(g, 7, 700)
+	mux.GateWriteAckForTest(g, 6, 600)
 	if err := mux.GateFlushSinceForTest(g, 99); err != nil {
 		t.Fatal("flush failed:", err)
 	}
@@ -481,11 +481,14 @@ func TestGateAckCoalescedWhileSuspended(t *testing.T) {
 	for _, f := range carrier.recorded() {
 		all = append(all, f...)
 	}
-	if len(all) < 8 {
+	if len(all) < 16 {
 		t.Fatalf("coalesced ack missing: %d bytes", len(all))
 	}
-	if got := binary.BigEndian.Uint64(all[len(all)-8:]); got != 7 {
+	if got := binary.BigEndian.Uint64(all[len(all)-16 : len(all)-8]); got != 7 {
 		t.Fatalf("coalesced ack = %d, want latest (7)", got)
+	}
+	if got := binary.BigEndian.Uint64(all[len(all)-8:]); got != 700 {
+		t.Fatalf("coalesced ack hash = %d, want latest (700)", got)
 	}
 }
 
@@ -866,8 +869,7 @@ func TestGateConcurrentFlushStaysConsistent(t *testing.T) {
 	}
 }
 
-func TestGateVerifyRxHashDrift(t *testing.T) {
-	done := make(chan struct{})
+func TestGateVerifyRxHashDrift(t *testing.T) {	done := make(chan struct{})
 	defer close(done)
 	carrier := &flakyCarrierForTest{}
 	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
@@ -902,5 +904,32 @@ func TestGateVerifyRxHashDrift(t *testing.T) {
 	}
 	if ok, drift := mux.GateVerifyRxHashForTest(g, baseSeq, base); !ok || drift {
 		t.Fatalf("base checkpoint must verify cleanly: ok=%v drift=%v", ok, drift)
+	}
+}
+
+
+func TestRxStateAdmitGeneration(t *testing.T) {
+	r := mux.NewRxStateForTest()
+	mb := countedFrameBytesForTest(t, 9, mux.SessionStatusKeep, "gen-probe")
+	// Fresh generation admits.
+	if n, ok := mux.RxAdmitForTest(r, 0, true, 9, mb); !ok || n != 1 {
+		t.Fatalf("fresh admit = (%d, %v), want (1, true)", n, ok)
+	}
+	// Seal drops everything, counting nothing.
+	mux.RxSealForTest(r)
+	if _, ok := mux.RxAdmitForTest(r, 0, true, 9, mb); ok {
+		t.Fatal("sealed admit must drop")
+	}
+	// New generation reopens, but the old generation stays dead: the
+	// stale reader's buffered frames can never admit again.
+	g := mux.RxNewGenerationForTest(r)
+	if g != 1 {
+		t.Fatalf("new generation = %d, want 1", g)
+	}
+	if _, ok := mux.RxAdmitForTest(r, 0, true, 9, mb); ok {
+		t.Fatal("stale-generation admit must drop")
+	}
+	if n, ok := mux.RxAdmitForTest(r, 1, true, 9, mb); !ok || n != 2 {
+		t.Fatalf("current-generation admit = (%d, %v), want (2, true)", n, ok)
 	}
 }

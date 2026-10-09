@@ -215,9 +215,6 @@ type ClientWorker struct {
 	token          [16]byte
 	epoch          atomic.Uint64
 	rx             rxState
-	// rxTip chains admitted frames (see chainFP), sent as Hash in the
-	// next Resume. Frozen by the seal exactly like rx.
-	rxTip          uint64
 	ackMu          ackState
 	// Phase 2 suspend/resume state. gate is nil unless resume is enabled.
 	gate        *carrierGate
@@ -275,6 +272,8 @@ var (
 var deliverDelay atomic.Uint64 // nanoseconds
 
 var deliverInDelay atomic.Int64
+
+var deliverCycles atomic.Int64
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
@@ -449,7 +448,7 @@ func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.Bu
 	return nil
 }
 
-func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
+func (m *ClientWorker) handleStatusNew(gen uint64, meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !m.resume.Enabled {
 		// Flag-off: original upstream path (raw error fails fast).
 		if meta.Option.Has(OptionData) {
@@ -462,13 +461,14 @@ func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.Buffered
 			return &frameReadError{err}
 		}
 	}
-	// New carries no rx slot on this side; the admit only honors a seal
-	// so a racing suspend still funnels the frame into the replay path.
-	m.rx.admit(false)
+	// New carries no rx slot on this side; the admit only honors the
+	// seal and generation so a racing suspend still funnels the frame
+	// into the replay path.
+	m.rx.admit(gen, false, meta.SessionID, nil)
 	return nil
 }
 
-func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.BufferedReader) error {
+func (m *ClientWorker) handleStatusKeep(gen uint64, meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
 		return nil
 	}
@@ -513,11 +513,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		if rerr != nil {
 			return &frameReadError{rerr}
 		}
-		ln, crc := fpDigest(mb)
-		if n, ok := m.rx.admit(count); ok {
-			if count {
-				m.rxTip = chainFP(m.rxTip, n, meta.SessionID, ln, crc)
-			}
+		if n, ok := m.rx.admit(gen, count, meta.SessionID, mb); ok {
 			traceAdmit(nil, n, meta.SessionID, mb, "down")
 			buf.ReleaseMulti(mb)
 			m.maybeSendAck()
@@ -546,21 +542,19 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		}
 		return &frameReadError{rerr}
 	}
-	// Sealed mid-suspend: drop uncounted; the peer replays it after
-	// rebind. Delivering past the snapshot would duplicate it.
-	n, ok := m.rx.admit(count)
+	// Sealed mid-suspend, or stale reader generation after a swap: drop
+	// uncounted; the peer replays it after rebind. Delivering past the
+	// snapshot would duplicate it.
+	n, ok := m.rx.admit(gen, count, meta.SessionID, mb)
 	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped Keep while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
 	}
-	if count {
-		ln, crc := fpDigest(mb)
-		m.rxTip = chainFP(m.rxTip, n, meta.SessionID, ln, crc)
-	}
 	traceAdmit(s, n, meta.SessionID, mb, "down")
 	if d := deliverDelay.Load(); d > 0 {
 		deliverInDelay.Add(1)
+		deliverCycles.Add(1)
 		time.Sleep(time.Duration(d))
 		deliverInDelay.Add(-1)
 	}
@@ -578,7 +572,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	return nil
 }
 
-func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
+func (m *ClientWorker) handleStatusEnd(gen uint64, meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !m.resume.Enabled {
 		// Flag-off: original upstream close-first path.
 		if s, found := m.sessionManager.Get(meta.SessionID); found {
@@ -591,20 +585,19 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 		}
 		return nil
 	}
-	// Resume path: consume the frame, then admit. A sealed End belongs
-	// to a suspend in progress: leave it uncounted (and the session
-	// open) so the rebind replays it.
+	// Resume path: consume the frame, then admit. A sealed End (or a
+	// stale generation) belongs to a suspend in progress: leave it
+	// uncounted (and the session open) so the rebind replays it.
 	if meta.Option.Has(OptionData) {
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return &frameReadError{err}
 		}
 	}
-	n, ok := m.rx.admit(true)
+	n, ok := m.rx.admit(gen, true, meta.SessionID, nil)
 	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped End while sealed sid ", meta.SessionID)
 		return nil
 	}
-	m.rxTip = chainFP(m.rxTip, n, meta.SessionID, 0, 0)
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
 		traceAdmit(s, n, meta.SessionID, nil, "down")
 		s.Close(false)
@@ -722,7 +715,7 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	for _, b := range mb {
 		raw = append(raw, b.Bytes()...)
 	}
-	if len(raw) < ackPayloadLen {
+	if len(raw) < minAckPayloadLen {
 		return errors.New("short ack payload")
 	}
 	ap, err := decodeAck(raw)
@@ -732,12 +725,24 @@ func (m *ClientWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	if m.gate != nil {
 		m.gate.ack(ap.RxCount)
 	}
+	if ap.HasHash {
+		if g := m.gate; g != nil {
+			if ok, drift, local := g.verifyRxHash(ap.RxCount, ap.Hash); drift {
+				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", m.tokenString(), " rx ", ap.RxCount, " peer ", ap.Hash, " local ", local)
+				return errors.New("resume content drift")
+			} else if !ok {
+				errors.LogInfo(context.Background(), "mux resume: hash outside retained window, skipping drift check")
+			}
+		}
+	}
 	return nil
 }
 
-// maybeSendAck emits Ack{rxCount} at most every AckEveryMs when rx advanced.
+// maybeSendAck emits Ack{rxCount, tip} at most every AckEveryMs when rx advanced.
 // A trailing ack is scheduled when rate-limited with unacked rx, so a
 // burst's last frame is never left unacked (see server maybeSendAck).
+// Count and tip come from one atomic snapshot so the sender never
+// verifies a count against a tip that has already moved past it.
 func (m *ClientWorker) maybeSendAck() {
 	if !m.resume.Enabled || m.gate == nil {
 		return
@@ -749,7 +754,7 @@ func (m *ClientWorker) maybeSendAck() {
 	interval := time.Duration(intervalMs) * time.Millisecond
 	now := time.Now()
 	m.ackMu.mu.Lock()
-	count := m.rx.Value()
+	count, tip := m.rx.tipSnapshot()
 	advanced := count != m.ackMu.lastSent
 	// Frame-count trigger: bulk traffic must not wait out the whole
 	// timer per window (see server maybeSendAck).
@@ -757,7 +762,7 @@ func (m *ClientWorker) maybeSendAck() {
 		m.ackMu.lastSent = count
 		m.ackMu.lastTime = now
 		m.ackMu.mu.Unlock()
-		m.gate.writeAck(count)
+		m.gate.writeAck(count, tip)
 		return
 	}
 	if advanced && !m.ackMu.pending {
@@ -774,7 +779,7 @@ func (m *ClientWorker) maybeSendAck() {
 func (m *ClientWorker) sendTrailingAck() {
 	m.ackMu.mu.Lock()
 	m.ackMu.pending = false
-	count := m.rx.Value()
+	count, tip := m.rx.tipSnapshot()
 	if count == m.ackMu.lastSent {
 		m.ackMu.mu.Unlock()
 		return
@@ -783,7 +788,7 @@ func (m *ClientWorker) sendTrailingAck() {
 	m.ackMu.lastTime = time.Now()
 	m.ackMu.mu.Unlock()
 	if m.gate != nil {
-		m.gate.writeAck(count)
+		m.gate.writeAck(count, tip)
 	}
 }
 
@@ -803,7 +808,7 @@ func (m *ClientWorker) fetchOutput() {
 
 	for {
 		reader, gen := m.currentDownReaderGen()
-		if m.readLoop(reader) {
+		if m.readLoop(reader, gen) {
 			return
 		}
 		// Carrier read failed. v1 path (or closed worker): fail fast.
@@ -834,9 +839,14 @@ func (e *frameReadError) Error() string { return e.err.Error() }
 func (e *frameReadError) Unwrap() error { return e.err }
 
 // readLoop processes frames until the carrier errors. True = worker done.
-func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
+// gen is the pipe generation this reader belongs to: if a swap landed
+// (stale reader with buffered leftovers), stop at once so fetchOutput
+// switches to the new reader instead of parsing dead bytes the new
+// generation must replay.
+func (m *ClientWorker) readLoop(reader *buf.BufferedReader, gen uint64) bool {
 	var meta FrameMetadata
 	for {
+		_ = gen
 		err := meta.Unmarshal(reader, false)
 		if err != nil {
 			if errors.Cause(err) != io.EOF {
@@ -849,11 +859,11 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader) bool {
 		case SessionStatusKeepAlive:
 			err = m.handleStatueKeepAlive(&meta, reader)
 		case SessionStatusEnd:
-			err = m.handleStatusEnd(&meta, reader)
+			err = m.handleStatusEnd(gen, &meta, reader)
 		case SessionStatusNew:
-			err = m.handleStatusNew(&meta, reader)
+			err = m.handleStatusNew(gen, &meta, reader)
 		case SessionStatusKeep:
-			err = m.handleStatusKeep(&meta, reader)
+			err = m.handleStatusKeep(gen, &meta, reader)
 		case SessionStatusResume:
 			err = m.handleStatusResume(&meta, reader)
 		case SessionStatusAck:

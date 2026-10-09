@@ -29,12 +29,20 @@ const resumePayloadLen = 16 + 8 + 8 + 8
 // minResumePayloadLen accepts pre-extension 32-byte resumes (no hash).
 const minResumePayloadLen = 16 + 8 + 8
 
-// AckPayload reports the receiver's cumulative counted-frame count.
+// AckPayload reports the receiver's cumulative counted-frame count and
+// content tip. Hash extends the drift tripwire to every ack (fail
+// within one ack interval instead of only at rebind); absent on
+// pre-extension 8-byte acks (check skipped, fail open).
 type AckPayload struct {
 	RxCount uint64
+	Hash    uint64
+	HasHash bool // wire presence only, never encoded
 }
 
-const ackPayloadLen = 8
+const ackPayloadLen = 8 + 8
+
+// minAckPayloadLen accepts pre-extension 8-byte acks (no hash).
+const minAckPayloadLen = 8
 
 func encodeResume(p ResumePayload) *buf.Buffer {
 	size := minResumePayloadLen
@@ -68,18 +76,29 @@ func decodeResume(p []byte) (ResumePayload, error) {
 }
 
 func encodeAck(p AckPayload) *buf.Buffer {
+	size := minAckPayloadLen
+	if p.HasHash {
+		size = ackPayloadLen
+	}
 	b := buf.New()
-	b.Extend(int32(ackPayloadLen))
+	b.Extend(int32(size))
 	binary.BigEndian.PutUint64(b.BytesRange(0, 8), p.RxCount)
+	if p.HasHash {
+		binary.BigEndian.PutUint64(b.BytesRange(8, 16), p.Hash)
+	}
 	return b
 }
 
 func decodeAck(p []byte) (AckPayload, error) {
 	var a AckPayload
-	if len(p) < ackPayloadLen {
+	if len(p) < minAckPayloadLen {
 		return a, errors.New("short ack payload: ", len(p))
 	}
 	a.RxCount = binary.BigEndian.Uint64(p[:8])
+	if len(p) >= ackPayloadLen {
+		a.Hash = binary.BigEndian.Uint64(p[8:16])
+		a.HasHash = true
+	}
 	return a, nil
 }
 

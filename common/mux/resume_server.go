@@ -12,7 +12,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
-// maybeSendAck emits Ack{rxCount} throttled, via the gate once present.
+// maybeSendAck emits Ack{rxCount, tip} throttled, via the gate once present.
 // A trailing ack is scheduled when rate-limited with unacked rx, so a
 // burst's last frame is never left unacked: without it the peer's
 // half-open detector would trip on a healthy-but-quiet carrier.
@@ -24,7 +24,7 @@ func (w *ServerWorker) maybeSendAck() {
 	interval := time.Duration(intervalMs) * time.Millisecond
 	now := time.Now()
 	w.ackMu.mu.Lock()
-	count := w.rx.Value()
+	count, tip := w.rx.tipSnapshot()
 	advanced := count != w.ackMu.lastSent
 	// Frame-count trigger: bulk traffic must not wait out the whole
 	// timer per window; combined with the timer below this bounds both
@@ -35,7 +35,7 @@ func (w *ServerWorker) maybeSendAck() {
 		w.ackMu.lastTime = now
 		w.ackMu.mu.Unlock()
 		if g := w.gate.Load(); g != nil {
-			g.writeAck(count)
+			g.writeAck(count, tip)
 		}
 		return
 	}
@@ -53,7 +53,7 @@ func (w *ServerWorker) maybeSendAck() {
 func (w *ServerWorker) sendTrailingAck() {
 	w.ackMu.mu.Lock()
 	w.ackMu.pending = false
-	count := w.rx.Value()
+	count, tip := w.rx.tipSnapshot()
 	if count == w.ackMu.lastSent {
 		w.ackMu.mu.Unlock()
 		return
@@ -62,7 +62,7 @@ func (w *ServerWorker) sendTrailingAck() {
 	w.ackMu.lastTime = time.Now()
 	w.ackMu.mu.Unlock()
 	if g := w.gate.Load(); g != nil {
-		g.writeAck(count)
+		g.writeAck(count, tip)
 	}
 }
 
@@ -113,8 +113,7 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 		}
 	}
 	entry.manager.Reparent(w.sessionManager.Load())
-	w.rx.resume(entry.rx)
-	w.rxTip = entry.tipRx
+	w.rx.restore(entry.rx, entry.tipRx)
 	traceLogRecv("adopt", entry.rx)
 	traceLogSendWindow("adopt", rp.RxCount)
 	traceDumpAdopt(`G:\Cache\Temp\opencode\adopt-tuples.log`, entry.rx, rp.RxCount)
@@ -156,10 +155,12 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 	// Reply with our rx so the client replays exactly what we
 	// missed, then flush our retained suffix past the client's rx,
 	// and only then unsuspend: live writes must never precede the
-	// replay, or the peer double-counts.
+	// replay, or the peer double-counts. Count and tip come from one
+	// atomic snapshot so they can never describe different instants.
+	replyRx, replyTip := w.rx.tipSnapshot()
 	reply := FrameMetadata{SessionStatus: SessionStatusResume}
 	reply.Option.Set(OptionData)
-	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value(), Hash: w.rxTip, HasHash: true})
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: replyRx, Hash: replyTip, HasHash: true})
 	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
 		return err
 	}
@@ -271,7 +272,8 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	}
 	reply := FrameMetadata{SessionStatus: SessionStatusResume}
 	reply.Option.Set(OptionData)
-	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: w.rx.Value(), Hash: w.rxTip, HasHash: true})
+	negRx, negTip := w.rx.tipSnapshot()
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: negRx, Hash: negTip, HasHash: true})
 	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
 		return err
 	}
@@ -291,7 +293,7 @@ func (w *ServerWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	for _, b := range mb {
 		raw = append(raw, b.Bytes()...)
 	}
-	if len(raw) < ackPayloadLen {
+	if len(raw) < minAckPayloadLen {
 		return errors.New("short ack payload")
 	}
 	ap, err := decodeAck(raw)
@@ -300,6 +302,14 @@ func (w *ServerWorker) handleStatusAck(meta *FrameMetadata, reader *buf.Buffered
 	}
 	if g := w.gate.Load(); g != nil {
 		g.ack(ap.RxCount)
+		if ap.HasHash {
+			if ok, drift, local := g.verifyRxHash(ap.RxCount, ap.Hash); drift {
+				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", w.tokenString(), " rx ", ap.RxCount, " peer ", ap.Hash, " local ", local)
+				return errors.New("resume content drift")
+			} else if !ok {
+				errors.LogInfo(context.Background(), "mux resume: hash outside retained window, skipping drift check")
+			}
+		}
 	}
 	return nil
 }

@@ -269,11 +269,12 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	// mid-delivery (admitted but not yet delivered), and Value() taken
 	// above that point would snapshot k-1 for a delivered frame k, which
 	// the peer then replays into a duplicate. The sealed snapshot is the
-	// exact delivered set.
-	snapRx := m.rx.sealAndSnapshot()
+	// exact delivered set. Count and tip come from one atomic snapshot.
+	m.rx.seal()
+	snapRx, snapTip := m.rx.tipSnapshot()
 	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", myEpoch, " snapRx ", snapRx)
 	traceLogRecv("redial", snapRx)
-	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: snapRx, Hash: m.rxTip, HasHash: true}
+	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: snapRx, Hash: snapTip, HasHash: true}
 	meta := FrameMetadata{SessionStatus: SessionStatusResume}
 	meta.Option.Set(OptionData)
 	payload := encodeResume(resume)
@@ -329,9 +330,11 @@ func (m *ClientWorker) attachCarrierSwap(upW buf.Writer, downR buf.Reader) {
 	if m.gate != nil {
 		m.gate.swapTarget(upW)
 	}
-	// The new downlink (and its Resume reply) is installed: reopen
-	// counting so the fresh carrier's frames admit again.
-	m.rx.unseal()
+	// The new downlink (and its Resume reply) is installed: retire the
+	// old reader generation and reopen counting so the fresh carrier's
+	// frames admit again. Frames the stale reader already buffered can
+	// never admit again (generation mismatch) — the peer replays them.
+	m.rx.newGeneration()
 }
 
 // enterSuspend parks forwarding once; records the deadline on first entry.

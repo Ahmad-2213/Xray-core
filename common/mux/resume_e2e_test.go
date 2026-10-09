@@ -437,15 +437,16 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	}
 }
 
-// TestResumeE2EDelayedDeliveryByteExact kills while a fully-read frame
-// waits on slow delivery, then drains with a silence window. Pre-seal
-// code snapshots k-1 and replays the delivered frame (duplication, so
-// extra bytes arrive); sealed code admits before the delay, so the
-// snapshot covers it and the rebind skips it. Single small payload: the
-// only bytes that may ever arrive are the echo itself, so any surplus
-// byte is proof of duplication.
-func TestResumeE2EDelayedDeliveryByteExact(t *testing.T) {
-	mux.DeliverDelayForTest(1500 * time.Millisecond)
+// TestResumeE2EStaleReaderGenByteExact kills while the downlink reader
+// holds already-pulled frames buffered behind a blocked delivery. Long
+// handler sleeps let the pipe backlog deepen, so the pull preceding the
+// second sleep grabs several complete frames; the kill then lands
+// mid-sleep with a deep reader buffer, and the redial, swap and unseal
+// all happen before it ends. Pre-generation code lets the stale reader
+// go on parsing its leftovers after the swap unseals, duplicating
+// whatever the rebind replays; the generation guard drops them instead.
+func TestResumeE2EStaleReaderGenByteExact(t *testing.T) {
+	mux.DeliverDelayForTest(3 * time.Second)
 	defer mux.DeliverDelayForTest(0)
 	h := &carrierHarness{disp: echoDispatcher{}}
 	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
@@ -453,21 +454,25 @@ func TestResumeE2EDelayedDeliveryByteExact(t *testing.T) {
 	defer h.closeAll()
 	defer mux.HsResetForTest()
 
-	payload := bytes.Repeat([]byte{0xCD}, 8*1024)
+	const total = 512 * 1024
+	payload := bytes.Repeat([]byte{0xD0}, total)
 	writeDone := make(chan error, 1)
 	go func() {
 		writeDone <- fx.appUpW.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)})
 	}()
-	// Kill exactly while a frame is blocked inside delayed delivery (not
-	// after a fixed sleep, which races frame arrival and flakes).
-	deadline := time.Now().Add(testTimeout(15 * time.Second))
-	for mux.DeliverBlockedForTest() == 0 {
+	// Wait for the second delayed sleep: by then the pipe backlog is
+	// deep, so the pull preceding this sleep grabbed several complete
+	// frames behind it.
+	deadline := time.Now().Add(testTimeout(30 * time.Second))
+	for mux.DeliverCyclesForTest() < 2 {
 		if time.Now().After(deadline) {
-			t.Fatal("no frame entered delayed delivery before kill window")
+			t.Fatal("delivery never blocked twice before kill window")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	time.Sleep(500 * time.Millisecond)
 	h.killCurrent()
+	mux.DeliverDelayForTest(0)
 	select {
 	case err := <-writeDone:
 		if err != nil {
@@ -476,11 +481,9 @@ func TestResumeE2EDelayedDeliveryByteExact(t *testing.T) {
 	case <-time.After(testTimeout(60 * time.Second)):
 		t.Fatal("app write stalled")
 	}
-	if got := readExactly(t, fx.appDnR, len(payload), testTimeout(60*time.Second)); !bytes.Equal(got, payload) {
-		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(got), len(payload))
+	if got := readExactly(t, fx.appDnR, total, testTimeout(60*time.Second)); !bytes.Equal(got, payload) {
+		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(got), total)
 	}
-	// Silence window: nothing else may ever arrive. A replayed duplicate
-	// lands here within ~2s (redial cadence); data means duplication.
 	mb, err := fx.appDnR.ReadMultiBufferTimeout(5 * time.Second)
 	if err == nil {
 		n := 0

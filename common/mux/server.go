@@ -100,9 +100,6 @@ type ServerWorker struct {
 	timer          *time.Ticker
 	tx             Counter
 	rx             rxState
-	// rxTip chains admitted frames (see chainFP), sent as Hash in the
-	// next Resume reply. Carried across adopt via the handover entry.
-	rxTip          uint64
 	resumeToken    [16]byte
 	resumeHasToken bool
 	resumeUser     string
@@ -359,15 +356,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			// Admit before delivery (see handleStatusKeep): a sealed
 			// replay cut drops here uncounted instead of duplicating
 			// past the park snapshot.
-			n, ok := w.rx.admit(meta.Target.Network == net.Network_TCP)
+			n, ok := w.rx.admit(0, meta.Target.Network == net.Network_TCP, meta.SessionID, mb)
 			if !ok {
 				errors.LogInfo(context.Background(), "mux resume: dropped New while sealed sid ", meta.SessionID)
 				buf.ReleaseMulti(mb)
 				return nil
-			}
-			if meta.Target.Network == net.Network_TCP {
-				ln, crc := fpDigest(mb)
-				w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
 			}
 			traceAdmit(existing, n, meta.SessionID, mb, "up")
 			werr := existing.output.WriteMultiBuffer(mb)
@@ -409,10 +402,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	}
 	go handle(ctx, s, w.out())
 	if !meta.Option.Has(OptionData) {
-		if n, ok := w.rx.admit(meta.Target.Network == net.Network_TCP); ok {
-			if w.resumeHasToken && meta.Target.Network == net.Network_TCP {
-				w.rxTip = chainFP(w.rxTip, n, meta.SessionID, 0, 0)
-			}
+		if n, ok := w.rx.admit(0, meta.Target.Network == net.Network_TCP, meta.SessionID, nil); ok {
 			traceAdmit(s, n, meta.SessionID, nil, "up")
 			w.maybeSendAck()
 		}
@@ -446,15 +436,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	// Admit before delivery: a sealed first payload drops here uncounted
 	// (staying unborn for the idempotent replay branch) instead of
 	// duplicating past the park snapshot.
-	n, ok := w.rx.admit(meta.Target.Network == net.Network_TCP)
+	n, ok := w.rx.admit(0, meta.Target.Network == net.Network_TCP, meta.SessionID, mb)
 	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped New while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
-	}
-	if meta.Target.Network == net.Network_TCP {
-		ln, crc := fpDigest(mb)
-		w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
 	}
 	traceAdmit(s, n, meta.SessionID, mb, "up")
 	werr := s.output.WriteMultiBuffer(mb)
@@ -520,11 +506,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		if rerr != nil {
 			return rerr
 		}
-		ln, crc := fpDigest(mb)
-		if n, ok := w.rx.admit(count); ok {
-			if count {
-				w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
-			}
+		if n, ok := w.rx.admit(0, count, meta.SessionID, mb); ok {
 			traceAdmit(nil, n, meta.SessionID, mb, "up")
 			buf.ReleaseMulti(mb)
 			w.maybeSendAck()
@@ -545,7 +527,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			return buf.Copy(rr, buf.Discard)
 		}
 		if err == nil && count {
-			if n, ok := w.rx.admit(true); ok {
+			if n, ok := w.rx.admit(0, true, meta.SessionID, nil); ok {
 				traceAdmit(s, n, meta.SessionID, nil, "up")
 				w.maybeSendAck()
 			}
@@ -557,15 +539,11 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return rerr
 	}
 	// Sealed mid-park: drop uncounted; the peer replays it after rebind.
-	n, ok := w.rx.admit(count)
+	n, ok := w.rx.admit(0, count, meta.SessionID, mb)
 	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped Keep while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
-	}
-	if count {
-		ln, crc := fpDigest(mb)
-		w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
 	}
 	traceAdmit(s, n, meta.SessionID, mb, "up")
 	werr := s.output.WriteMultiBuffer(mb)
@@ -601,12 +579,11 @@ func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 			return err
 		}
 	}
-	n, ok := w.rx.admit(true)
+	n, ok := w.rx.admit(0, true, meta.SessionID, nil)
 	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped End while sealed sid ", meta.SessionID)
 		return nil
 	}
-	w.rxTip = chainFP(w.rxTip, n, meta.SessionID, 0, 0)
 	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
 		traceAdmit(s, n, meta.SessionID, nil, "up")
 		s.Close(false)
@@ -790,6 +767,7 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	// duplicating on replay. Sealing only after the abort checks above,
 	// so a refused park never stalls counting.
 	snap := w.rx.sealAndSnapshot()
+	_, snapTip := w.rx.tipSnapshot()
 	traceLogRecv("park", snap)
 	user := w.resumeUser
 	if user == "" {
@@ -814,7 +792,7 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 		// Closed by this worker's run loop defer when it exits; the
 		// adopter waits on it so late deliveries can't race the replay.
 		quiesced: w.quiesced,
-		tipRx:    w.rxTip,
+		tipRx:    snapTip,
 	})
 	w.sessionManager.Store(NewSessionManager())
 	common.Interrupt(w.link.Writer)

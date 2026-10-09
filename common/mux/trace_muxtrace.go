@@ -10,7 +10,6 @@ package mux
 
 import (
 	"context"
-	"hash/crc32"
 	"os"
 	"strconv"
 	"strings"
@@ -40,6 +39,7 @@ var (
 	traceSendOff  = map[*carrierGate]map[uint16]uint64{}
 	traceRecvRing []fpTuple
 	traceRecvOff  = map[*Session]uint64{}
+	traceWrites   = map[[2]uint64]int{}
 )
 
 func fpAppendRing(ring []fpTuple, t fpTuple) []fpTuple {
@@ -67,19 +67,10 @@ func traceRetain(g *carrierGate, seq uint64, sid uint16, ln int, crc uint32) {
 }
 
 // traceAdmit records a receiver-side counted frame at admit time. s may
-// be nil (unknown session); mb may be nil (already consumed, e.g. End).
-// dir is "down" on the client, "up" on the server.
+// be nil (unknown session). dir is "down" on the client, "up" on the
+// server.
 func traceAdmit(s *Session, n uint64, sid uint16, mb buf.MultiBuffer, dir string) {
-	ln, crc := 0, uint32(0)
-	if mb != nil {
-		h := crc32.NewIEEE()
-		for _, b := range mb {
-			by := b.Bytes()
-			ln += len(by)
-			h.Write(by)
-		}
-		crc = h.Sum32()
-	}
+	ln, crc := fpDigest(mb)
 	traceMu.Lock()
 	defer traceMu.Unlock()
 	var off uint64
@@ -88,6 +79,12 @@ func traceAdmit(s *Session, n uint64, sid uint16, mb buf.MultiBuffer, dir string
 		traceRecvOff[s] = off + uint64(ln)
 	}
 	traceRecvRing = fpAppendRing(traceRecvRing, fpTuple{n, sid, off, ln, crc, dir})
+}
+
+// traceAdmitGenMismatch fires when admit rejects a stale generation. Any
+// single hit proves the stale-reader race happened (and was contained).
+func traceAdmitGenMismatch(gen, curGen uint64, sealed bool) {
+	errors.LogInfo(context.Background(), "mux trace: stale admit gen ", gen, " cur ", curGen, " sealed ", sealed)
 }
 
 // traceReset clears rings and offsets. Called from HsResetForTest so
@@ -100,6 +97,7 @@ func traceReset() {
 	traceRecvRing = nil
 	traceSendOff = map[*carrierGate]map[uint16]uint64{}
 	traceRecvOff = map[*Session]uint64{}
+	traceWrites = map[[2]uint64]int{}
 }
 
 // traceLogRecv dumps the admitted tuples with a prefix and the
@@ -156,6 +154,20 @@ func writeTuple(sb *strings.Builder, t fpTuple) {
 	sb.WriteByte(' ')
 	sb.WriteString(t.dir)
 	sb.WriteByte('\n')
+}
+
+// traceWriteCount records a successful target write keyed by epoch and
+// seq. Any count above 1 is a live+flush double-cover of the same bytes
+// on one carrier (ERROR): legitimate replays always follow an epoch bump.
+func traceWriteCount(epoch, seq uint64) {
+	traceMu.Lock()
+	defer traceMu.Unlock()
+	k := [2]uint64{epoch, seq}
+	n := traceWrites[k] + 1
+	traceWrites[k] = n
+	if n > 1 {
+		errors.LogInfo(context.Background(), "mux trace: ERROR double write epoch ", epoch, " seq ", seq)
+	}
 }
 
 // traceLogFlush records the first 8 seqs a flush actually wrote.

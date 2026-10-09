@@ -103,12 +103,12 @@ type carrierGate struct {
 	baseSeq        uint64
 	storedByte     int64
 	streamBytes    map[uint16]int64
-	// ackedSeq is the high-water cumulative ack: the peer has counted
-	// (and consumed from its wire) everything up to it. It is the ONLY
-	// sound skip condition for live writers. A "written to target"
-	// mark is unsound here: a carrier can die after the mark with the
-	// pipe content discarded, turning the skip into a permanent hole.
-	ackedSeq       uint64
+	// lastFlushMax/lastFlushEpoch record the newest completed flush:
+	// live writers skip only seqs it covered on the still-current
+	// target. Stale-epoch marks never suppress (their carrier may have
+	// died with the bytes); the superseding flush re-covers via peerRx.
+	lastFlushMax   uint64
+	lastFlushEpoch uint64
 	// hashTip/hashTipSeq chain the latest retained frame; hashBase/
 	// hashBaseSeq checkpoint the newest freed one. Together they verify
 	// a peer's (RxCount, Hash) tip against sent history: exact hit on a
@@ -144,8 +144,9 @@ type carrierGate struct {
 
 	ackCh      chan struct{}
 	resumeCh   chan struct{}
-	pendingAck uint64
-	hasPending bool
+	pendingAck  uint64
+	pendingHash uint64
+	hasPending  bool
 
 	ackRecvMu   sync.Mutex
 	lastAckTime time.Time
@@ -241,9 +242,6 @@ func (g *carrierGate) SetLabel(s string) {
 // ack frees retained frames up to n (cumulative) and unblocks writers.
 func (g *carrierGate) ack(n uint64) {
 	g.mu.Lock()
-	if n > g.ackedSeq {
-		g.ackedSeq = n
-	}
 	for len(g.frames) > 0 && g.frames[0].seq <= n {
 		g.hashBase, g.hashBaseSeq = g.frames[0].h, g.frames[0].seq
 		g.storedByte -= int64(len(g.frames[0].raw))
@@ -401,19 +399,18 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 			}
 			continue
 		}
-		// Woke via resume: the rebind flush owns retransmission of
-		// everything it covered. Only forward what it missed
-		// (stored after its snapshot); otherwise we'd double-send.
-		// Skip only on ackedSeq (peer HAS it — sound). A "written"
-		// mark is unsound: the carrier can die after marking with the
-		// pipe content discarded. Inline ackedSeq read: g.mu is held,
-		// and a helper would self-deadlock on it.
-		if seq <= g.ackedSeq {
+		// Skip only if the current flush already covered this seq on
+		// the current target epoch: a mark from an older epoch is
+		// stale (its carrier may have died with the bytes), and the
+		// superseding flush re-covers the tail via peerRx truth.
+		// Inline reads: g.mu is held, and helpers would self-deadlock.
+		if seq <= g.lastFlushMax && g.lastFlushEpoch == g.targetEpoch.Load() {
 			g.mu.Unlock()
 			g.flushMu.Unlock()
 			return nil
 		}
 		target := g.target
+		epoch := g.targetEpoch.Load()
 		g.mu.Unlock()
 		raw, ok := g.rawCopyOf(seq)
 		if !ok {
@@ -428,6 +425,7 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 			g.requestSuspend()
 			continue
 		}
+		traceWriteCount(epoch, seq)
 		// Deliberately no coverage mark here: only the peer's rx decides
 		// replay ranges (see flushSince), and marks conflate "written"
 		// with "received". A live-sent seq stays replayable until acked.
@@ -585,8 +583,10 @@ func (g *carrierGate) forwardUncounted(mb buf.MultiBuffer) error {
 	return target.WriteMultiBuffer(mb)
 }
 
-// writeAckFrame emits Ack{rx} live or records it for the rebind flush.
-func (g *carrierGate) writeAck(rx uint64) {
+// writeAckFrame emits Ack{rx, hash} live or records it for the rebind
+// flush. Count and tip travel together (same instant) so the sender
+// never verifies a count against a tip that has moved past it.
+func (g *carrierGate) writeAck(rx, h uint64) {
 	g.mu.Lock()
 	if g.isDoneLocked() {
 		g.mu.Unlock()
@@ -595,6 +595,7 @@ func (g *carrierGate) writeAck(rx uint64) {
 	if g.suspended {
 		if !g.hasPending || rx > g.pendingAck {
 			g.pendingAck = rx
+			g.pendingHash = h
 			g.hasPending = true
 		}
 		g.mu.Unlock()
@@ -604,7 +605,7 @@ func (g *carrierGate) writeAck(rx uint64) {
 	g.mu.Unlock()
 	meta := FrameMetadata{SessionStatus: SessionStatusAck}
 	meta.Option.Set(OptionData)
-	payload := encodeAck(AckPayload{RxCount: rx})
+	payload := encodeAck(AckPayload{RxCount: rx, Hash: h, HasHash: true})
 	_ = writeMetaWithFrame(target, meta, buf.MultiBuffer{payload})
 }
 
@@ -625,10 +626,11 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	id := g.flushID.Add(1)
 	epoch := g.targetEpoch.Load()
 	g.mu.Lock()
-	var ackToSend uint64
+	var ackToSend, ackHashToSend uint64
 	hasAck := g.hasPending
 	if hasAck {
 		ackToSend = g.pendingAck
+		ackHashToSend = g.pendingHash
 		g.hasPending = false
 	}
 	target := g.target
@@ -653,18 +655,22 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	if hasAck {
 		meta := FrameMetadata{SessionStatus: SessionStatusAck}
 		meta.Option.Set(OptionData)
-		payload := encodeAck(AckPayload{RxCount: ackToSend})
+		payload := encodeAck(AckPayload{RxCount: ackToSend, Hash: ackHashToSend, HasHash: true})
 		if err := writeMetaWithFrame(target, meta, buf.MultiBuffer{payload}); err != nil {
 			return err
 		}
 	}
-	for _, raw := range frames {
+	for i, raw := range frames {
 		if g.targetEpoch.Load() != epoch {
 			break
 		}
 		if err := target.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(raw)}); err != nil {
 			return err
 		}
+		traceWriteCount(epoch, fseqs[i])
 	}
+	g.mu.Lock()
+	g.lastFlushMax, g.lastFlushEpoch = maxSent, epoch
+	g.mu.Unlock()
 	return nil
 }

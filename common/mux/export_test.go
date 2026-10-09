@@ -23,12 +23,18 @@ func NewPayloadDelayForTest(d time.Duration) {
 func DeliverDelayForTest(d time.Duration) {
 	deliverDelay.Store(uint64(d.Nanoseconds()))
 	deliverInDelay.Store(0)
+	deliverCycles.Store(0)
 }
 
 // DeliverBlockedForTest reports how many frames are currently inside the
 // delivery delay.
 func DeliverBlockedForTest() int64 {
 	return deliverInDelay.Load()
+}
+
+// DeliverCyclesForTest counts entered delivery delays (sleep cycles).
+func DeliverCyclesForTest() int64 {
+	return deliverCycles.Load()
 }
 
 func DecodeResumeForTest(p []byte) (ResumePayload, error) {
@@ -78,7 +84,7 @@ func GateHashStateForTest(g *carrierGate) (tipSeq, tip, baseSeq, base uint64) {
 
 func GateFlushSinceForTest(g *carrierGate, peerRx uint64) error { return g.flushSince(peerRx) }
 
-func GateWriteAckForTest(g *carrierGate, rx uint64) { g.writeAck(rx) }
+func GateWriteAckForTest(g *carrierGate, rx, h uint64) { g.writeAck(rx, h) }
 
 func GateUnackedAgeForTest(g *carrierGate) time.Duration { return g.unackedAge() }
 
@@ -89,6 +95,26 @@ func HsResetForTest() {
 	defer hsMu.Unlock()
 	hsEntries = make(map[[16]byte]*suspendedWorker)
 	traceReset()
+}
+
+// RxStateForTest exposes admit/seal/generation for the deterministic
+// guard unit test below (white-box, no timing involved).
+type RxStateForTest = rxState
+
+func NewRxStateForTest() *RxStateForTest {
+	return &RxStateForTest{}
+}
+
+func RxAdmitForTest(r *RxStateForTest, gen uint64, counted bool, sid uint16, mb buf.MultiBuffer) (uint64, bool) {
+	return r.admit(gen, counted, sid, mb)
+}
+
+func RxSealForTest(r *RxStateForTest) {
+	r.seal()
+}
+
+func RxNewGenerationForTest(r *RxStateForTest) uint64 {
+	return r.newGeneration()
 }
 
 func HsLenForTest() int {
