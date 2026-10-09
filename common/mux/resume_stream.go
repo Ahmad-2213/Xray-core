@@ -387,9 +387,7 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 		// No deadlock: flushes never take sendMu (held by our caller),
 		// and waits happen outside both mutexes.
 		g.flushMu.Lock()
-		println("DBG fwd got flushMu")
 		g.mu.Lock()
-		println("DBG fwd got mu")
 		if g.isDoneLocked() {
 			g.mu.Unlock()
 			g.flushMu.Unlock()
@@ -417,7 +415,6 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 		}
 		target := g.target
 		g.mu.Unlock()
-		println("DBG fwd writing target")
 		raw, ok := g.rawCopyOf(seq)
 		if !ok {
 			// Acknowledged meanwhile: peer has it.
