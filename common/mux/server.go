@@ -172,7 +172,7 @@ func boundIdentity(ctx context.Context) string {
 }
 
 func handle(ctx context.Context, s *Session, output buf.Writer) {
-	writer := NewResponseWriter(s.ID, output, s.transferType)
+	writer := NewResponseWriter(s.ID, output, s.loadTransferType())
 	if err := buf.Copy(s.input, writer); err != nil {
 		errors.LogInfoInner(ctx, err, "session ", s.ID, " ends.")
 		writer.hasError = true
@@ -322,9 +322,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			output:       x.Mux.output,
 			parent:       w.sessionManager.Load(),
 			ID:           meta.SessionID,
-			transferType: protocol.TransferTypePacket,
 			XUDP:         x,
 		}
+		x.Mux.storeTransferType(protocol.TransferTypePacket)
 		x.Status = Active
 		if !w.sessionManager.Load().Add(x.Mux) {
 			x.Mux.Close(false)
@@ -375,20 +375,20 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		return errors.New("failed to dispatch request.").Base(err)
 	}
 	s := &Session{
-		input:        link.Reader,
-		output:       link.Writer,
-		parent:       w.sessionManager.Load(),
-		ID:           meta.SessionID,
-		transferType: protocol.TransferTypeStream,
-		cancel:       cancel,
+		input:  link.Reader,
+		output: link.Writer,
+		parent: w.sessionManager.Load(),
+		ID:     meta.SessionID,
+		cancel: cancel,
 		// Only a payload-carrying New on a resume carrier can be cut
 		// mid-delivery: a payload-less New is complete at its meta, and
 		// flag-off sessions never take the idempotent replay branch, so
 		// both stay born from birth.
 		unborn: w.resumeHasToken && meta.Option.Has(OptionData),
 	}
+	s.storeTransferType(protocol.TransferTypeStream)
 	if meta.Target.Network == net.Network_UDP {
-		s.transferType = protocol.TransferTypePacket
+		s.storeTransferType(protocol.TransferTypePacket)
 	}
 	if !w.sessionManager.Load().Add(s) {
 		s.Close(false)

@@ -354,11 +354,7 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
-	transferType := protocol.TransferTypeStream
-	if ob.Target.Network == net.Network_UDP {
-		transferType = protocol.TransferTypePacket
-	}
-	s.transferType = transferType
+	transferType := s.loadTransferType()
 	var inbound *session.Inbound
 	if session.IsReverseMuxFromContext(ctx) {
 		inbound = session.InboundFromContext(ctx)
@@ -413,6 +409,16 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 	if s == nil {
 		return false
 	}
+	// Compute the transfer type synchronously, before the session is
+	// shared: fetchInput used to assign it on its own goroutine, racing
+	// the reader loop's first NewReader.
+	transferType := protocol.TransferTypeStream
+	if outbounds := session.OutboundsFromContext(ctx); len(outbounds) > 0 {
+		if ob := outbounds[len(outbounds)-1]; ob.Target.Network == net.Network_UDP {
+			transferType = protocol.TransferTypePacket
+		}
+	}
+	s.storeTransferType(transferType)
 	go fetchInput(ctx, s, m.out())
 	if _, ok := link.Reader.(*pipe.Reader); !ok {
 		select {

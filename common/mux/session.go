@@ -5,6 +5,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -187,7 +188,11 @@ type Session struct {
 	pmu          sync.Mutex
 	parent       *SessionManager
 	ID           uint16
-	transferType protocol.TransferType
+	// transferType is written once before the session is shared
+	// (Dispatch computes it synchronously after Allocate) and read on
+	// the reader goroutine: atomic so a fast echo can't race the
+	// fetchInput goroutine that used to assign it (upstream race).
+	transferType atomic.Uint32 // protocol.TransferType
 	closed       bool
 	done         *done.Instance
 	XUDP         *XUDP
@@ -255,9 +260,19 @@ func (s *Session) Close(locked bool) error {
 	return nil
 }
 
+// storeTransferType records the session's transfer type. Must be called
+// before the session is shared across goroutines (or via atomics after).
+func (s *Session) storeTransferType(t protocol.TransferType) {
+	s.transferType.Store(uint32(t))
+}
+
+func (s *Session) loadTransferType() protocol.TransferType {
+	return protocol.TransferType(s.transferType.Load())
+}
+
 // NewReader creates a buf.Reader based on the transfer type of this Session.
 func (s *Session) NewReader(reader *buf.BufferedReader, dest *net.Destination) buf.Reader {
-	if s.transferType == protocol.TransferTypeStream {
+	if s.loadTransferType() == protocol.TransferTypeStream {
 		return NewStreamReader(reader)
 	}
 	return NewPacketReader(reader, dest)
