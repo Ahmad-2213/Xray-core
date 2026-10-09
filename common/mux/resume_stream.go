@@ -98,7 +98,12 @@ type carrierGate struct {
 	baseSeq        uint64
 	storedByte     int64
 	streamBytes    map[uint16]int64
-	flushSeq       uint64
+	// ackedSeq is the high-water cumulative ack: the peer has counted
+	// (and consumed from its wire) everything up to it. It is the ONLY
+	// sound skip condition for live writers. A "written to target"
+	// mark is unsound here: a carrier can die after the mark with the
+	// pipe content discarded, turning the skip into a permanent hole.
+	ackedSeq       uint64
 	onCarrierError func()
 
 	// flushMu serializes rebind flushes: overlapping adopts on one gate
@@ -218,6 +223,9 @@ func (g *carrierGate) SetLabel(s string) {
 // ack frees retained frames up to n (cumulative) and unblocks writers.
 func (g *carrierGate) ack(n uint64) {
 	g.mu.Lock()
+	if n > g.ackedSeq {
+		g.ackedSeq = n
+	}
 	for len(g.frames) > 0 && g.frames[0].seq <= n {
 		g.storedByte -= int64(len(g.frames[0].raw))
 		g.streamBytes[g.frames[0].sid] -= int64(len(g.frames[0].raw))
@@ -355,9 +363,11 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 		// Woke via resume: the rebind flush owns retransmission of
 		// everything it covered. Only forward what it missed
 		// (stored after its snapshot); otherwise we'd double-send.
-		// Inline flushSeq read: g.mu is held, and flushedThrough
-		// would self-deadlock on it.
-		if seq <= g.flushSeq {
+		// Skip only on ackedSeq (peer HAS it — sound). A "written"
+		// mark is unsound: the carrier can die after marking with the
+		// pipe content discarded. Inline ackedSeq read: g.mu is held,
+		// and a helper would self-deadlock on it.
+		if seq <= g.ackedSeq {
 			g.mu.Unlock()
 			g.flushMu.Unlock()
 			return nil
@@ -377,11 +387,9 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 			g.requestSuspend()
 			continue
 		}
-		// Deliberately no coverage mark here: only flushes mark.
-		// A live-sent seq stays replayable, and the next flush's
-		// low-water max(peerRx, flushSeq) lets the peer's rx (truth)
-		// decide — marking live sends would suppress legitimate
-		// replays of frames the peer never received.
+		// Deliberately no coverage mark here: only the peer's rx decides
+		// replay ranges (see flushSince), and marks conflate "written"
+		// with "received". A live-sent seq stays replayable until acked.
 		g.flushMu.Unlock()
 		return nil
 	}
@@ -445,13 +453,6 @@ func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16) (seq ui
 	g.storedByte += int64(len(raw))
 	g.streamBytes[sid] += int64(len(raw))
 	return seq, false, nil
-}
-
-// flushedThrough reports whether seq was covered by a rebind flush.
-func (g *carrierGate) flushedThrough(seq uint64) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return seq <= g.flushSeq
 }
 
 // rawCopyOf returns a private copy of the retained frame, if still held.
@@ -577,18 +578,13 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	}
 	target := g.target
 	low := peerRx
-	if g.flushSeq > low {
-		low = g.flushSeq
-	}
 	var frames [][]byte
-	var seqs []uint64
 	maxSent := low
 	for _, f := range g.frames {
 		if f.seq > low {
 			cp := make([]byte, len(f.raw))
 			copy(cp, f.raw)
 			frames = append(frames, cp)
-			seqs = append(seqs, f.seq)
 			if f.seq > maxSent {
 				maxSent = f.seq
 			}
@@ -604,28 +600,13 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 			return err
 		}
 	}
-	written := low
-	for i, raw := range frames {
+	for _, raw := range frames {
 		if g.targetEpoch.Load() != epoch {
 			break
 		}
 		if err := target.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(raw)}); err != nil {
-			g.markFlushed(written)
 			return err
 		}
-		written = seqs[i]
 	}
-	g.markFlushed(written)
 	return nil
-}
-
-// markFlushed records the highest seq known written to the live target.
-// Live forwards advance it too (see forwardRetained): coverage truth
-// stays the peer's rx, this only skips known-sent ranges.
-func (g *carrierGate) markFlushed(seq uint64) {
-	g.mu.Lock()
-	if seq > g.flushSeq {
-		g.flushSeq = seq
-	}
-	g.mu.Unlock()
 }
