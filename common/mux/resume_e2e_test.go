@@ -298,7 +298,7 @@ func TestResumeE2ERebindSurvives(t *testing.T) {
 
 	ping1 := []byte("ping-before-kill")
 	writeChunk(t, fx.appUpW, ping1)
-	if got := readExactly(t, fx.appDnR, len(ping1), 10*time.Second); !bytes.Equal(got, ping1) {
+	if got := readExactly(t, fx.appDnR, len(ping1), testTimeout(10*time.Second)); !bytes.Equal(got, ping1) {
 		t.Fatalf("pre-kill echo mismatch: %q", got)
 	}
 
@@ -307,7 +307,7 @@ func TestResumeE2ERebindSurvives(t *testing.T) {
 
 	ping2 := []byte("ping-after-rebind-same-socket")
 	writeChunk(t, fx.appUpW, ping2)
-	if got := readExactly(t, fx.appDnR, len(ping2), 20*time.Second); !bytes.Equal(got, ping2) {
+	if got := readExactly(t, fx.appDnR, len(ping2), testTimeout(20*time.Second)); !bytes.Equal(got, ping2) {
 		t.Fatalf("post-rebind echo mismatch: %q", got)
 	}
 }
@@ -320,7 +320,7 @@ func TestResumeE2EFailedRedialsThenSuccess(t *testing.T) {
 	defer mux.HsResetForTest()
 
 	writeChunk(t, fx.appUpW, []byte("warmup"))
-	_ = readExactly(t, fx.appDnR, len("warmup"), 10*time.Second)
+	_ = readExactly(t, fx.appDnR, len("warmup"), testTimeout(10*time.Second))
 
 	// Fail the next two redials only: a park is waiting, so the third
 	// redial must still adopt and resume.
@@ -328,7 +328,7 @@ func TestResumeE2EFailedRedialsThenSuccess(t *testing.T) {
 	h.killCurrent()
 	ping := []byte("ping-after-two-failed-redials")
 	writeChunk(t, fx.appUpW, ping)
-	if got := readExactly(t, fx.appDnR, len(ping), 25*time.Second); !bytes.Equal(got, ping) {
+	if got := readExactly(t, fx.appDnR, len(ping), testTimeout(25*time.Second)); !bytes.Equal(got, ping) {
 		t.Fatalf("echo after failed redials mismatch: %q", got)
 	}
 }
@@ -366,7 +366,7 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 			if n >= total {
 				return
 			}
-			mb, err := fx.appDnR.ReadMultiBufferTimeout(15 * time.Second)
+			mb, err := fx.appDnR.ReadMultiBufferTimeout(testTimeout(15 * time.Second))
 			if err != nil {
 				return
 			}
@@ -391,7 +391,7 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	// Kill when the receiver has real bytes (deterministic mid-flight
 	// cut with data in flight), not after a fixed sleep: under loaded
 	// or instrumented runtimes 50ms may land before the first byte.
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(testTimeout(15 * time.Second))
 	for {
 		echoMu.Lock()
 		n := len(echoed)
@@ -416,7 +416,7 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	}()
 	select {
 	case <-joinDone:
-	case <-time.After(60 * time.Second):
+	case <-time.After(testTimeout(60 * time.Second)):
 		t.Fatal("mid-payload flow stalled (writer or drain stuck)")
 	}
 	echoMu.Lock()
@@ -453,7 +453,7 @@ func TestResumeE2EDelayedDeliveryByteExact(t *testing.T) {
 	}()
 	// Kill exactly while a frame is blocked inside delayed delivery (not
 	// after a fixed sleep, which races frame arrival and flakes).
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(testTimeout(15 * time.Second))
 	for mux.DeliverBlockedForTest() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("no frame entered delayed delivery before kill window")
@@ -466,10 +466,10 @@ func TestResumeE2EDelayedDeliveryByteExact(t *testing.T) {
 		if err != nil {
 			t.Fatal("app write failed:", err)
 		}
-	case <-time.After(60 * time.Second):
+	case <-time.After(testTimeout(60 * time.Second)):
 		t.Fatal("app write stalled")
 	}
-	if got := readExactly(t, fx.appDnR, len(payload), 60*time.Second); !bytes.Equal(got, payload) {
+	if got := readExactly(t, fx.appDnR, len(payload), testTimeout(60*time.Second)); !bytes.Equal(got, payload) {
 		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(got), len(payload))
 	}
 	// Silence window: nothing else may ever arrive. A replayed duplicate
@@ -506,10 +506,10 @@ func TestResumeE2EBulkCompletes(t *testing.T) {
 		if err != nil {
 			t.Fatal("bulk write failed:", err)
 		}
-	case <-time.After(60 * time.Second):
+	case <-time.After(testTimeout(60 * time.Second)):
 		t.Fatal("bulk write stalled (window/ack liveness)")
 	}
-	if got := readExactly(t, fx.appDnR, total, 60*time.Second); !bytes.Equal(got, big) {
+	if got := readExactly(t, fx.appDnR, total, testTimeout(60*time.Second)); !bytes.Equal(got, big) {
 		t.Fatal("bulk echo mismatch")
 	}
 }
@@ -587,10 +587,10 @@ func TestResumeE2ENewPayloadCutSurvives(t *testing.T) {
 		if err != nil {
 			t.Fatal("app write failed:", err)
 		}
-	case <-time.After(30 * time.Second):
+	case <-time.After(testTimeout(30 * time.Second)):
 		t.Fatal("app write stalled")
 	}
-	if got := readExactly(t, fx.appDnR, len(payload), 25*time.Second); !bytes.Equal(got, payload) {
+	if got := readExactly(t, fx.appDnR, len(payload), testTimeout(25*time.Second)); !bytes.Equal(got, payload) {
 		t.Fatalf("new-cut echo mismatch: %q", got)
 	}
 }
@@ -629,7 +629,7 @@ func TestResumeE2EDialFlapSurvives(t *testing.T) {
 	defer mux.HsResetForTest()
 
 	writeChunk(t, fx.appUpW, []byte("before-flap"))
-	if got := readExactly(t, fx.appDnR, len("before-flap"), 10*time.Second); !bytes.Equal(got, []byte("before-flap")) {
+	if got := readExactly(t, fx.appDnR, len("before-flap"), testTimeout(10*time.Second)); !bytes.Equal(got, []byte("before-flap")) {
 		t.Fatalf("pre-flap echo mismatch: %q", got)
 	}
 	// Flap the next 4 dials mid-episode, then recover: dial failures
@@ -638,7 +638,7 @@ func TestResumeE2EDialFlapSurvives(t *testing.T) {
 	h.killCurrent()
 	ping := []byte("ping-after-flap")
 	writeChunk(t, fx.appUpW, ping)
-	if got := readExactly(t, fx.appDnR, len(ping), 25*time.Second); !bytes.Equal(got, ping) {
+	if got := readExactly(t, fx.appDnR, len(ping), testTimeout(25*time.Second)); !bytes.Equal(got, ping) {
 		t.Fatalf("post-flap echo mismatch: %q", got)
 	}
 	if fx.worker.Closed() {
