@@ -166,11 +166,21 @@ func TestMasqueWarpConfig(t *testing.T) {
 				Warp: &masque.Warp{PrivateKey: pkcs8, PublicKey: publicKey, Address: []string{"172.16.0.2/32"}},
 			},
 		},
+		{
+			// Empty publicKey is valid: verify via CA and/or
+			// tlsSettings pinnedPeerCertSha256 instead (custom SNI).
+			Input:  withPublicKey(""),
+			Parser: loadJSON(creator),
+			Output: &masque.Config{
+				Host: "cloudflareaccess.com",
+				Path: "/",
+				Warp: &masque.Warp{PrivateKey: pkcs8, PublicKey: nil, Address: []string{"172.16.0.2/32"}},
+			},
+		},
 	})
 	for _, input := range []string{
 		`{"warp": {}}`,
 		withAddress(`[]`),
-		withPublicKey(""),
 		withPublicKey("not a key"),
 		withPublicKey(base64.StdEncoding.EncodeToString([]byte("not a key"))),
 		withPublicKey(base64.StdEncoding.EncodeToString(pkcs8)),
