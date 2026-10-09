@@ -22,6 +22,9 @@ type suspendedWorker struct {
 	// quiesced closes when the parking worker's run loop exits. Nil
 	// for test-built entries; adopters wait on it with a timeout.
 	quiesced <-chan struct{}
+	// tipRx continues the receiver content chain across the adopt so
+	// the next Resume carries an unbroken tip.
+	tipRx uint64
 }
 
 // tokenDone is the token-scoped lifetime channel. The gate adopted onto a

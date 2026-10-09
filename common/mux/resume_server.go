@@ -97,8 +97,26 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 		}
 	}
 	// Adopt the parked table, gate (with retain store) and rx baseline.
+	// Fail closed on content drift: the peer's (rx, hash) tip must match
+	// our sent history. A mismatch means the streams diverged (silent
+	// corruption); close instead of replaying into it. Outside the
+	// retained window the check is impossible — log and proceed.
+	if rp.HasHash {
+		if g := entry.gate; g != nil {
+			if ok, drift := g.verifyRxHash(rp.RxCount, rp.Hash); drift {
+				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", tokenString(rp.Token), " rx ", rp.RxCount)
+				closeEntry(entry)
+				return errors.New("resume content drift")
+			} else if !ok {
+				errors.LogInfo(context.Background(), "mux resume: hash outside retained window, skipping drift check")
+			}
+		}
+	}
 	entry.manager.Reparent(w.sessionManager.Load())
 	w.rx.resume(entry.rx)
+	w.rxTip = entry.tipRx
+	traceLogRecv("adopt", entry.rx)
+	traceLogSendWindow("adopt", rp.RxCount)
 	w.rsMu.Lock()
 	if entry.gate != nil {
 		w.gate.Store(entry.gate)
@@ -139,7 +157,7 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 	// replay, or the peer double-counts.
 	reply := FrameMetadata{SessionStatus: SessionStatusResume}
 	reply.Option.Set(OptionData)
-	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value(), Hash: w.rxTip, HasHash: true})
 	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
 		return err
 	}
@@ -183,7 +201,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	for _, b := range mb {
 		raw = append(raw, b.Bytes()...)
 	}
-	if len(raw) < resumePayloadLen {
+	if len(raw) < minResumePayloadLen {
 		return errors.New("short resume payload")
 	}
 	rp, err := decodeResume(raw)
@@ -250,7 +268,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	}
 	reply := FrameMetadata{SessionStatus: SessionStatusResume}
 	reply.Option.Set(OptionData)
-	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: w.rx.Value()})
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: w.rx.Value(), Hash: w.rxTip, HasHash: true})
 	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
 		return err
 	}

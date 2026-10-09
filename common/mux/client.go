@@ -184,7 +184,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 		// Uncounted: bypasses the gate, direct to the pipe.
 		meta := FrameMetadata{SessionStatus: SessionStatusResume}
 		meta.Option.Set(OptionData)
-		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch.Load(), RxCount: 0})
+		payload := encodeResume(ResumePayload{Token: c.token, Epoch: c.epoch.Load(), RxCount: 0, Hash: 0, HasHash: true})
 		if err := writeMetaWithFrame(upLinkWriter, meta, buf.MultiBuffer{payload}); err != nil {
 			useV2 = false
 			c.useV2 = false
@@ -215,6 +215,9 @@ type ClientWorker struct {
 	token          [16]byte
 	epoch          atomic.Uint64
 	rx             rxState
+	// rxTip chains admitted frames (see chainFP), sent as Hash in the
+	// next Resume. Frozen by the seal exactly like rx.
+	rxTip          uint64
 	ackMu          ackState
 	// Phase 2 suspend/resume state. gate is nil unless resume is enabled.
 	gate        *carrierGate
@@ -502,11 +505,23 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			errors.LogInfo(context.Background(), "mux resume: suppressed reactive End for unknown session ", meta.SessionID, " total ", n)
 		}
 
-		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
-			return &frameReadError{err}
+		// Read the payload for the content chain before discarding: the
+		// sender chained it, so the tip must include it for later
+		// verification, even though the session is unknown.
+		mb, rerr := readFullFrame(NewStreamReader(reader))
+		if rerr != nil {
+			return &frameReadError{rerr}
 		}
-		if m.rx.admit(count) {
+		ln, crc := fpDigest(mb)
+		if n, ok := m.rx.admit(count); ok {
+			if count {
+				m.rxTip = chainFP(m.rxTip, n, meta.SessionID, ln, crc)
+			}
+			traceAdmit(nil, n, meta.SessionID, mb)
+			buf.ReleaseMulti(mb)
 			m.maybeSendAck()
+		} else {
+			buf.ReleaseMulti(mb)
 		}
 		return nil
 	}
@@ -532,11 +547,17 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 	// Sealed mid-suspend: drop uncounted; the peer replays it after
 	// rebind. Delivering past the snapshot would duplicate it.
-	if !m.rx.admit(count) {
+	n, ok := m.rx.admit(count)
+	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped Keep while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
 	}
+	if count {
+		ln, crc := fpDigest(mb)
+		m.rxTip = chainFP(m.rxTip, n, meta.SessionID, ln, crc)
+	}
+	traceAdmit(s, n, meta.SessionID, mb)
 	if d := deliverDelay.Load(); d > 0 {
 		deliverInDelay.Add(1)
 		time.Sleep(time.Duration(d))
@@ -577,12 +598,17 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 			return &frameReadError{err}
 		}
 	}
-	if !m.rx.admit(true) {
+	n, ok := m.rx.admit(true)
+	if !ok {
 		errors.LogInfo(context.Background(), "mux resume: dropped End while sealed sid ", meta.SessionID)
 		return nil
 	}
+	m.rxTip = chainFP(m.rxTip, n, meta.SessionID, 0, 0)
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
+		traceAdmit(s, n, meta.SessionID, nil)
 		s.Close(false)
+	} else {
+		traceAdmit(nil, n, meta.SessionID, nil)
 	}
 	m.maybeSendAck()
 	return nil
@@ -609,7 +635,7 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	for _, b := range mb {
 		raw = append(raw, b.Bytes()...)
 	}
-	if len(raw) < resumePayloadLen {
+	if len(raw) < minResumePayloadLen {
 		return errors.New("short resume payload")
 	}
 	rp, err := decodeResume(raw)
@@ -628,6 +654,25 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		// raced a park, or a previous park expired). Stay suspended and
 		// keep redialing on cadence; do NOT resume, flush, or clear.
 		return nil
+	}
+	// Stale reply: a newer redial has since been sent (epochs advance
+	// per attempt). Acting on it would flush an outdated range and
+	// double-cover frames the newer attempt already owns.
+	if rp.Epoch < m.epoch.Load() {
+		return nil
+	}
+	// Fail closed on content drift: the server's (rx, hash) tip must
+	// match our sent history. Returning a plain error tears the worker
+	// down via the read loop (fail closed, today's behavior).
+	if rp.HasHash {
+		if g := m.gate; g != nil {
+			if ok, drift := g.verifyRxHash(rp.RxCount, rp.Hash); drift {
+				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", m.tokenString(), " rx ", rp.RxCount)
+				return errors.New("resume content drift")
+			} else if !ok {
+				errors.LogInfo(context.Background(), "mux resume: hash outside retained window, skipping drift check")
+			}
+		}
 	}
 	flushed := 0
 	go func() {

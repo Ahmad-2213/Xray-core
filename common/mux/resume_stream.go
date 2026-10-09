@@ -21,6 +21,7 @@ package mux
 
 import (
 	"context"
+	"hash/crc32"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -77,6 +78,10 @@ type storedFrame struct {
 	sid      uint16
 	raw      []byte
 	storedAt time.Time
+	// h chains this frame into the cumulative content hash (see
+	// chainFP): h == chain(tip-before, seq, sid, payload). Freed with
+	// the frame; the base checkpoint below covers older seqs.
+	h uint64
 }
 
 type carrierGate struct {
@@ -104,12 +109,21 @@ type carrierGate struct {
 	// mark is unsound here: a carrier can die after the mark with the
 	// pipe content discarded, turning the skip into a permanent hole.
 	ackedSeq       uint64
+	// hashTip/hashTipSeq chain the latest retained frame; hashBase/
+	// hashBaseSeq checkpoint the newest freed one. Together they verify
+	// a peer's (RxCount, Hash) tip against sent history: exact hit on a
+	// retained frame or the base, fail-closed drift close on mismatch.
+	hashTip     uint64
+	hashTipSeq  uint64
+	hashBase    uint64
+	hashBaseSeq uint64
 	onCarrierError func()
 
 	// flushMu serializes rebind flushes: overlapping adopts on one gate
 	// would double-forward the same suffix (frame-aligned duplication
-	// under churn). Live writers wait on activeFlush instead of racing
-	// the flush, and mark what they forward so a later flush skips it.
+	// under churn). Live writers hold the same mutex across their
+	// coverage check and write, so check and write are atomic against a
+	// flush in either order.
 	flushMu sync.Mutex
 	// targetEpoch bumps on every swapTarget. A flush aborts when its
 	// epoch goes stale so a still-blocked previous-episode goroutine
@@ -227,6 +241,7 @@ func (g *carrierGate) ack(n uint64) {
 		g.ackedSeq = n
 	}
 	for len(g.frames) > 0 && g.frames[0].seq <= n {
+		g.hashBase, g.hashBaseSeq = g.frames[0].h, g.frames[0].seq
 		g.storedByte -= int64(len(g.frames[0].raw))
 		g.streamBytes[g.frames[0].sid] -= int64(len(g.frames[0].raw))
 		if g.streamBytes[g.frames[0].sid] <= 0 {
@@ -241,6 +256,27 @@ func (g *carrierGate) ack(n uint64) {
 	g.lastAckTime = time.Now()
 	g.ackRecvMu.Unlock()
 	g.notifyAck()
+}
+
+// verifyRxHash checks a peer's (rx, hash) tip against sent history: an
+// exact hit on a retained frame or the base checkpoint. ok=false means
+// outside the window (check skipped, fail open); drift=true on mismatch
+// (fail closed: the streams have diverged).
+func (g *carrierGate) verifyRxHash(rx, h uint64) (ok bool, drift bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if rx == g.hashBaseSeq {
+		return true, h != g.hashBase
+	}
+	for _, f := range g.frames {
+		if f.seq == rx {
+			return true, f.h != h
+		}
+		if f.seq > rx {
+			break
+		}
+	}
+	return false, false
 }
 
 // unackedAge returns how long the oldest retained frame has waited for
@@ -306,7 +342,7 @@ func (g *carrierGate) writeCounted(mb buf.MultiBuffer) error {
 			return err
 		}
 		g.sendMu.Lock()
-		seq, retry, err := g.retain(mb, need, sid)
+		seq, retry, err := g.retain(mb, need, sid, metaLen)
 		if err != nil {
 			g.sendMu.Unlock()
 			return err
@@ -430,7 +466,7 @@ func (g *carrierGate) reserve(need int64, sid uint16) error {
 // retain stores a private copy and assigns its seq, consuming mb.
 // Caller holds sendMu. Caps were reserved beforehand and are re-verified
 // here; on a lost race it returns retry=true with mb untouched.
-func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16) (seq uint64, retry bool, err error) {
+func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16, metaLen int) (seq uint64, retry bool, err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.isDoneLocked() {
@@ -449,9 +485,18 @@ func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16) (seq ui
 	g.tx.n++
 	seq = g.tx.n
 	g.tx.mu.Unlock()
-	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw, storedAt: time.Now()})
+	// Chain the payload (post-metadata bytes, exactly what the peer's
+	// readFullFrame reassembly reproduces) into the cumulative hash.
+	pay := raw
+	if off := 2 + metaLen; off >= 0 && off <= len(raw) {
+		pay = raw[off:]
+	}
+	h := chainFP(g.hashTip, seq, sid, len(pay), crc32.ChecksumIEEE(pay))
+	g.hashTip, g.hashTipSeq = h, seq
+	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw, storedAt: time.Now(), h: h})
 	g.storedByte += int64(len(raw))
 	g.streamBytes[sid] += int64(len(raw))
+	traceRetain(g, seq, sid, raw)
 	return seq, false, nil
 }
 
@@ -579,12 +624,14 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	target := g.target
 	low := peerRx
 	var frames [][]byte
+	var fseqs []uint64
 	maxSent := low
 	for _, f := range g.frames {
 		if f.seq > low {
 			cp := make([]byte, len(f.raw))
 			copy(cp, f.raw)
 			frames = append(frames, cp)
+			fseqs = append(fseqs, f.seq)
 			if f.seq > maxSent {
 				maxSent = f.seq
 			}
@@ -592,6 +639,7 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 	}
 	g.mu.Unlock()
 	errors.LogInfo(context.Background(), "mux resume: flush#", id, " ", g.gateLabel(), " peerRx ", peerRx, " fromSeq ", low+1, " toSeq ", maxSent, " frames ", len(frames))
+	traceLogFlush(id, g.gateLabel(), fseqs)
 	if hasAck {
 		meta := FrameMetadata{SessionStatus: SessionStatusAck}
 		meta.Option.Set(OptionData)

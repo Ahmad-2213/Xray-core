@@ -65,6 +65,16 @@ func GateSwapTargetForTest(g *carrierGate, target buf.Writer) { g.swapTarget(tar
 
 func GateAckForTest(g *carrierGate, n uint64) { g.ack(n) }
 
+func GateVerifyRxHashForTest(g *carrierGate, rx, h uint64) (bool, bool) {
+	return g.verifyRxHash(rx, h)
+}
+
+func GateHashStateForTest(g *carrierGate) (tipSeq, tip, baseSeq, base uint64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.hashTipSeq, g.hashTip, g.hashBaseSeq, g.hashBase
+}
+
 func GateFlushSinceForTest(g *carrierGate, peerRx uint64) error { return g.flushSince(peerRx) }
 
 func GateWriteAckForTest(g *carrierGate, rx uint64) { g.writeAck(rx) }

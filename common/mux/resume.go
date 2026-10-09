@@ -196,16 +196,16 @@ type rxState struct {
 	sealed bool
 }
 
-func (r *rxState) admit(counted bool) bool {
+func (r *rxState) admit(counted bool) (uint64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.sealed {
-		return false
+		return r.n, false
 	}
 	if counted {
 		r.n++
 	}
-	return true
+	return r.n, true
 }
 
 // seal stops further counting; sealAndSnapshot seals and returns the

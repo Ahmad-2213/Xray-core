@@ -371,8 +371,7 @@ func TestGateTransientLossRetriedInOrder(t *testing.T) {
 	}
 }
 
-func TestGateSuspendBlocksUntilResume(t *testing.T) {
-	done := make(chan struct{})
+func TestGateSuspendBlocksUntilResume(t *testing.T) {	done := make(chan struct{})
 	defer close(done)
 	carrier := &flakyCarrierForTest{}
 	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
@@ -818,5 +817,90 @@ func TestFallbackV1Matrix(t *testing.T) {
 	}
 	if mux.ShouldFallbackV1ForTest(true, false, 6*time.Second) {
 		t.Fatal("old carrier must not fall back")
+	}
+}
+
+
+
+func TestGateConcurrentFlushStaysConsistent(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	const n = 6
+	for i := 1; i <= n; i++ {
+		mb := countedFrameBytesForTest(t, 1, mux.SessionStatusKeep, string([]byte{byte(0xC0 + i), byte(i), byte(i >> 8)}))
+		if err := g.WriteMultiBuffer(mb); err != nil {
+			t.Fatalf("frame %d not absorbed: %v", i, err)
+		}
+	}
+	mux.GateSuspendForTest(g, true)
+	// Overlapping adopts on one gate (kill during a running flush):
+	// concurrent flushes must not corrupt, deadlock, or lose frames.
+	// Each flush independently honors its own peerRx, so with identical
+	// peerRx every flush legitimately replays the full suffix; liveness
+	// (every frame forwarded at least once) is what must hold.
+	var wg sync.WaitGroup
+	for k := 0; k < 4; k++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = mux.GateFlushSinceForTest(g, 0)
+		}()
+	}
+	wg.Wait()
+	seen := map[string]bool{}
+	for _, f := range carrier.recorded() {
+		seen[string(f)] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("forwarded %d distinct frames, want all %d (none lost)", len(seen), n)
+	}
+	// Advancing peerRx narrows the replay to the suffix only.
+	before := len(carrier.recorded())
+	mux.GateAckForTest(g, 4)
+	_ = mux.GateFlushSinceForTest(g, 4)
+	after := carrier.recorded()[before:]
+	if len(after) != 2 {
+		t.Fatalf("suffix replay forwarded %d frames, want 2", len(after))
+	}
+}
+
+func TestGateVerifyRxHashDrift(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	carrier := &flakyCarrierForTest{}
+	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
+	payloads := []string{"alpha", "beta", "gamma"}
+	for _, p := range payloads {
+		mb := countedFrameBytesForTest(t, 7, mux.SessionStatusKeep, p)
+		if err := g.WriteMultiBuffer(mb); err != nil {
+			t.Fatalf("frame %q not absorbed: %v", p, err)
+		}
+	}
+	tipSeq, tip, _, _ := mux.GateHashStateForTest(g)
+	if tipSeq != 3 {
+		t.Fatalf("tip seq = %d, want 3", tipSeq)
+	}
+	// Exact tip: verifiable, no drift.
+	if ok, drift := mux.GateVerifyRxHashForTest(g, tipSeq, tip); !ok || drift {
+		t.Fatalf("exact tip must verify cleanly: ok=%v drift=%v", ok, drift)
+	}
+	// Tampered tip at a retained seq: drift, fail closed.
+	if ok, drift := mux.GateVerifyRxHashForTest(g, tipSeq, tip^1); !ok || !drift {
+		t.Fatalf("tampered tip must report drift: ok=%v drift=%v", ok, drift)
+	}
+	// Never-sent seq: outside window, never drift.
+	if ok, drift := mux.GateVerifyRxHashForTest(g, 999, 12345); ok || drift {
+		t.Fatalf("never-sent seq must be outside window: ok=%v drift=%v", ok, drift)
+	}
+	// Fully acked: base checkpoint still verifies the boundary.
+	mux.GateAckForTest(g, tipSeq)
+	_, _, baseSeq, base := mux.GateHashStateForTest(g)
+	if baseSeq != tipSeq {
+		t.Fatalf("base seq = %d, want %d after full ack", baseSeq, tipSeq)
+	}
+	if ok, drift := mux.GateVerifyRxHashForTest(g, baseSeq, base); !ok || drift {
+		t.Fatalf("base checkpoint must verify cleanly: ok=%v drift=%v", ok, drift)
 	}
 }

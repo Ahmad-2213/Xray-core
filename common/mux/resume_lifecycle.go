@@ -272,7 +272,8 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	// exact delivered set.
 	snapRx := m.rx.sealAndSnapshot()
 	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", myEpoch, " snapRx ", snapRx)
-	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: snapRx}
+	traceLogRecv("redial", snapRx)
+	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: snapRx, Hash: m.rxTip, HasHash: true}
 	meta := FrameMetadata{SessionStatus: SessionStatusResume}
 	meta.Option.Set(OptionData)
 	payload := encodeResume(resume)
