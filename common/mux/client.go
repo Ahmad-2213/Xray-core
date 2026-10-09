@@ -300,6 +300,7 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 		}
 		c.gate = newCarrierGate(stream.Writer, c.done.Wait(), policy)
 		c.gate.SetLabel(c.tokenString())
+		c.gate.dir = "up"
 	}
 	c.attachCarrier(stream.Writer, stream.Reader)
 
@@ -517,7 +518,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			if count {
 				m.rxTip = chainFP(m.rxTip, n, meta.SessionID, ln, crc)
 			}
-			traceAdmit(nil, n, meta.SessionID, mb)
+			traceAdmit(nil, n, meta.SessionID, mb, "down")
 			buf.ReleaseMulti(mb)
 			m.maybeSendAck()
 		} else {
@@ -557,7 +558,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		ln, crc := fpDigest(mb)
 		m.rxTip = chainFP(m.rxTip, n, meta.SessionID, ln, crc)
 	}
-	traceAdmit(s, n, meta.SessionID, mb)
+	traceAdmit(s, n, meta.SessionID, mb, "down")
 	if d := deliverDelay.Load(); d > 0 {
 		deliverInDelay.Add(1)
 		time.Sleep(time.Duration(d))
@@ -605,10 +606,10 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 	}
 	m.rxTip = chainFP(m.rxTip, n, meta.SessionID, 0, 0)
 	if s, found := m.sessionManager.Get(meta.SessionID); found {
-		traceAdmit(s, n, meta.SessionID, nil)
+		traceAdmit(s, n, meta.SessionID, nil, "down")
 		s.Close(false)
 	} else {
-		traceAdmit(nil, n, meta.SessionID, nil)
+		traceAdmit(nil, n, meta.SessionID, nil, "down")
 	}
 	m.maybeSendAck()
 	return nil
@@ -666,8 +667,8 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	// down via the read loop (fail closed, today's behavior).
 	if rp.HasHash {
 		if g := m.gate; g != nil {
-			if ok, drift := g.verifyRxHash(rp.RxCount, rp.Hash); drift {
-				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", m.tokenString(), " rx ", rp.RxCount)
+			if ok, drift, local := g.verifyRxHash(rp.RxCount, rp.Hash); drift {
+				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", m.tokenString(), " rx ", rp.RxCount, " peer ", rp.Hash, " local ", local)
 				return errors.New("resume content drift")
 			} else if !ok {
 				errors.LogInfo(context.Background(), "mux resume: hash outside retained window, skipping drift check")

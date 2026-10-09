@@ -369,7 +369,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 				ln, crc := fpDigest(mb)
 				w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
 			}
-			traceAdmit(existing, n, meta.SessionID, mb)
+			traceAdmit(existing, n, meta.SessionID, mb, "up")
 			werr := existing.output.WriteMultiBuffer(mb)
 			existing.unborn = false
 			w.maybeSendAck()
@@ -413,7 +413,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			if w.resumeHasToken && meta.Target.Network == net.Network_TCP {
 				w.rxTip = chainFP(w.rxTip, n, meta.SessionID, 0, 0)
 			}
-			traceAdmit(s, n, meta.SessionID, nil)
+			traceAdmit(s, n, meta.SessionID, nil, "up")
 			w.maybeSendAck()
 		}
 		return nil
@@ -456,7 +456,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		ln, crc := fpDigest(mb)
 		w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
 	}
-	traceAdmit(s, n, meta.SessionID, mb)
+	traceAdmit(s, n, meta.SessionID, mb, "up")
 	werr := s.output.WriteMultiBuffer(mb)
 	// Carrier delivered fully; a downstream write error is local, so the
 	// frame still counts (the sender counted it at store time) — already
@@ -525,7 +525,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			if count {
 				w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
 			}
-			traceAdmit(nil, n, meta.SessionID, mb)
+			traceAdmit(nil, n, meta.SessionID, mb, "up")
 			buf.ReleaseMulti(mb)
 			w.maybeSendAck()
 		} else {
@@ -546,7 +546,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		}
 		if err == nil && count {
 			if n, ok := w.rx.admit(true); ok {
-				traceAdmit(s, n, meta.SessionID, nil)
+				traceAdmit(s, n, meta.SessionID, nil, "up")
 				w.maybeSendAck()
 			}
 		}
@@ -563,7 +563,11 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		buf.ReleaseMulti(mb)
 		return nil
 	}
-	traceAdmit(s, n, meta.SessionID, mb)
+	if count {
+		ln, crc := fpDigest(mb)
+		w.rxTip = chainFP(w.rxTip, n, meta.SessionID, ln, crc)
+	}
+	traceAdmit(s, n, meta.SessionID, mb, "up")
 	werr := s.output.WriteMultiBuffer(mb)
 	w.maybeSendAck()
 
@@ -602,11 +606,12 @@ func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 		errors.LogInfo(context.Background(), "mux resume: dropped End while sealed sid ", meta.SessionID)
 		return nil
 	}
+	w.rxTip = chainFP(w.rxTip, n, meta.SessionID, 0, 0)
 	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
-		traceAdmit(s, n, meta.SessionID, nil)
+		traceAdmit(s, n, meta.SessionID, nil, "up")
 		s.Close(false)
 	} else {
-		traceAdmit(nil, n, meta.SessionID, nil)
+		traceAdmit(nil, n, meta.SessionID, nil, "up")
 	}
 	w.maybeSendAck()
 	return nil

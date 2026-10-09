@@ -426,7 +426,14 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 		t.Fatalf("kill landed after full echo (%d/%d): cut was not mid-flight", atKill, total)
 	}
 	if !bytes.Equal(final, sent) {
-		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(final), total)
+		off := -1
+		for i := range final {
+			if i >= len(sent) || final[i] != sent[i] {
+				off = i
+				break
+			}
+		}
+		t.Fatalf("byte-exact mismatch: got %d bytes, want %d, first diff at %d", len(final), total, off)
 	}
 }
 

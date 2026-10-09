@@ -103,8 +103,8 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 	// retained window the check is impossible — log and proceed.
 	if rp.HasHash {
 		if g := entry.gate; g != nil {
-			if ok, drift := g.verifyRxHash(rp.RxCount, rp.Hash); drift {
-				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", tokenString(rp.Token), " rx ", rp.RxCount)
+			if ok, drift, local := g.verifyRxHash(rp.RxCount, rp.Hash); drift {
+				errors.LogWarning(context.Background(), "mux resume: RESUME DRIFT token ", tokenString(rp.Token), " rx ", rp.RxCount, " peer ", rp.Hash, " local ", local)
 				closeEntry(entry)
 				return errors.New("resume content drift")
 			} else if !ok {
@@ -117,6 +117,7 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 	w.rxTip = entry.tipRx
 	traceLogRecv("adopt", entry.rx)
 	traceLogSendWindow("adopt", rp.RxCount)
+	traceDumpAdopt(`G:\Cache\Temp\opencode\adopt-tuples.log`, entry.rx, rp.RxCount)
 	w.rsMu.Lock()
 	if entry.gate != nil {
 		w.gate.Store(entry.gate)
@@ -133,6 +134,7 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 	liveRegPut(rp.Token, w)
 	if w.gate.Load() == nil {
 		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+		g.dir = "down"
 		if w.resumeDone != nil {
 			g.swapDone(w.resumeDone.wait())
 		}
@@ -252,6 +254,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 	liveRegPut(rp.Token, w)
 	if w.gate.Load() == nil {
 		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+		g.dir = "down"
 		if w.resumeDone == nil {
 			w.resumeDone = newTokenDone()
 		}

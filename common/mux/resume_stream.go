@@ -137,6 +137,10 @@ type carrierGate struct {
 	// label is the worker's short token for trace lines, set by the
 	// worker once known (gates outlive any single worker).
 	label atomic.Value // string
+	// dir marks the payload direction this gate carries ("up" for the
+	// client gate, "down" for the server gate), set once before traffic.
+	// Diagnostic only (muxtrace attribution).
+	dir string
 
 	ackCh      chan struct{}
 	resumeCh   chan struct{}
@@ -261,22 +265,23 @@ func (g *carrierGate) ack(n uint64) {
 // verifyRxHash checks a peer's (rx, hash) tip against sent history: an
 // exact hit on a retained frame or the base checkpoint. ok=false means
 // outside the window (check skipped, fail open); drift=true on mismatch
-// (fail closed: the streams have diverged).
-func (g *carrierGate) verifyRxHash(rx, h uint64) (ok bool, drift bool) {
+// (fail closed: the streams have diverged). local returns our hash at rx
+// (or 0 when outside the window) for the drift log.
+func (g *carrierGate) verifyRxHash(rx, h uint64) (ok bool, drift bool, local uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if rx == g.hashBaseSeq {
-		return true, h != g.hashBase
+		return true, h != g.hashBase, g.hashBase
 	}
 	for _, f := range g.frames {
 		if f.seq == rx {
-			return true, f.h != h
+			return true, f.h != h, f.h
 		}
 		if f.seq > rx {
 			break
 		}
 	}
-	return false, false
+	return false, false, 0
 }
 
 // unackedAge returns how long the oldest retained frame has waited for
@@ -342,7 +347,7 @@ func (g *carrierGate) writeCounted(mb buf.MultiBuffer) error {
 			return err
 		}
 		g.sendMu.Lock()
-		seq, retry, err := g.retain(mb, need, sid, metaLen)
+		seq, retry, err := g.retain(mb, need, sid)
 		if err != nil {
 			g.sendMu.Unlock()
 			return err
@@ -382,7 +387,9 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 		// No deadlock: flushes never take sendMu (held by our caller),
 		// and waits happen outside both mutexes.
 		g.flushMu.Lock()
+		println("DBG fwd got flushMu")
 		g.mu.Lock()
+		println("DBG fwd got mu")
 		if g.isDoneLocked() {
 			g.mu.Unlock()
 			g.flushMu.Unlock()
@@ -410,6 +417,7 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 		}
 		target := g.target
 		g.mu.Unlock()
+		println("DBG fwd writing target")
 		raw, ok := g.rawCopyOf(seq)
 		if !ok {
 			// Acknowledged meanwhile: peer has it.
@@ -466,7 +474,7 @@ func (g *carrierGate) reserve(need int64, sid uint16) error {
 // retain stores a private copy and assigns its seq, consuming mb.
 // Caller holds sendMu. Caps were reserved beforehand and are re-verified
 // here; on a lost race it returns retry=true with mb untouched.
-func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16, metaLen int) (seq uint64, retry bool, err error) {
+func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16) (seq uint64, retry bool, err error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.isDoneLocked() {
@@ -477,26 +485,31 @@ func (g *carrierGate) retain(mb buf.MultiBuffer, need int64, sid uint16, metaLen
 		return 0, true, nil
 	}
 	raw := make([]byte, 0, need)
-	for _, b := range mb {
-		raw = append(raw, b.Bytes()...)
+	// Digest the payload (every buffer after mb[0]) BEFORE release:
+	// mb[0] is metadata plus the u16 length prefix, which the peer's
+	// chunk reader strips, so chaining it would diverge. Reading after
+	// ReleaseMulti is use-after-recycle (nil deref or silent garbage).
+	var ln int
+	hh := crc32.NewIEEE()
+	for i, b := range mb {
+		by := b.Bytes()
+		raw = append(raw, by...)
+		if i > 0 {
+			ln += len(by)
+			hh.Write(by)
+		}
 	}
 	buf.ReleaseMulti(mb)
 	g.tx.mu.Lock()
 	g.tx.n++
 	seq = g.tx.n
 	g.tx.mu.Unlock()
-	// Chain the payload (post-metadata bytes, exactly what the peer's
-	// readFullFrame reassembly reproduces) into the cumulative hash.
-	pay := raw
-	if off := 2 + metaLen; off >= 0 && off <= len(raw) {
-		pay = raw[off:]
-	}
-	h := chainFP(g.hashTip, seq, sid, len(pay), crc32.ChecksumIEEE(pay))
+	h := chainFP(g.hashTip, seq, sid, ln, hh.Sum32())
 	g.hashTip, g.hashTipSeq = h, seq
 	g.frames = append(g.frames, storedFrame{seq: seq, sid: sid, raw: raw, storedAt: time.Now(), h: h})
 	g.storedByte += int64(len(raw))
 	g.streamBytes[sid] += int64(len(raw))
-	traceRetain(g, seq, sid, raw)
+	traceRetain(g, seq, sid, ln, hh.Sum32())
 	return seq, false, nil
 }
 

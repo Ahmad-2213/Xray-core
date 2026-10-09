@@ -11,6 +11,9 @@ package mux
 import (
 	"context"
 	"hash/crc32"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -18,13 +21,15 @@ import (
 )
 
 // fpTuple pins one counted frame: its cumulative number, session, the
-// session's byte offset before it, length and payload CRC.
+// session's byte offset before it, length, payload CRC and direction
+// ("up" client→server, "down" server→client).
 type fpTuple struct {
 	seq uint64
 	sid uint16
 	off uint64
 	ln  int
 	crc uint32
+	dir string
 }
 
 const fpRingCap = 2048
@@ -45,8 +50,10 @@ func fpAppendRing(ring []fpTuple, t fpTuple) []fpTuple {
 	return ring
 }
 
-// traceRetain records a sender-side counted frame at store time.
-func traceRetain(g *carrierGate, seq uint64, sid uint16, raw []byte) {
+// traceRetain records a sender-side counted frame at store time. ln/crc
+// cover the payload exactly as the production chain sees it (post-meta
+// bytes), so sender and receiver tuples are directly comparable.
+func traceRetain(g *carrierGate, seq uint64, sid uint16, ln int, crc uint32) {
 	traceMu.Lock()
 	defer traceMu.Unlock()
 	m := traceSendOff[g]
@@ -55,13 +62,14 @@ func traceRetain(g *carrierGate, seq uint64, sid uint16, raw []byte) {
 		traceSendOff[g] = m
 	}
 	off := m[sid]
-	m[sid] = off + uint64(len(raw))
-	traceSendRing = fpAppendRing(traceSendRing, fpTuple{seq, sid, off, len(raw), crc32.ChecksumIEEE(raw)})
+	m[sid] = off + uint64(ln)
+	traceSendRing = fpAppendRing(traceSendRing, fpTuple{seq, sid, off, ln, crc, g.dir})
 }
 
 // traceAdmit records a receiver-side counted frame at admit time. s may
 // be nil (unknown session); mb may be nil (already consumed, e.g. End).
-func traceAdmit(s *Session, n uint64, sid uint16, mb buf.MultiBuffer) {
+// dir is "down" on the client, "up" on the server.
+func traceAdmit(s *Session, n uint64, sid uint16, mb buf.MultiBuffer, dir string) {
 	ln, crc := 0, uint32(0)
 	if mb != nil {
 		h := crc32.NewIEEE()
@@ -79,22 +87,75 @@ func traceAdmit(s *Session, n uint64, sid uint16, mb buf.MultiBuffer) {
 		off = traceRecvOff[s]
 		traceRecvOff[s] = off + uint64(ln)
 	}
-	traceRecvRing = fpAppendRing(traceRecvRing, fpTuple{n, sid, off, ln, crc})
+	traceRecvRing = fpAppendRing(traceRecvRing, fpTuple{n, sid, off, ln, crc, dir})
 }
 
-// traceLogRecv dumps the last 16 admitted tuples with a prefix and the
-// snapshot value the worker sent (snapRx).
+// traceReset clears rings and offsets. Called from HsResetForTest so
+// each test starts with clean diagnostic state (rings are process-global
+// and would otherwise mix tuples across tests sharing counter values).
+func traceReset() {
+	traceMu.Lock()
+	defer traceMu.Unlock()
+	traceSendRing = nil
+	traceRecvRing = nil
+	traceSendOff = map[*carrierGate]map[uint16]uint64{}
+	traceRecvOff = map[*Session]uint64{}
+}
+
+// traceLogRecv dumps the admitted tuples with a prefix and the
+// snapshot value the worker sent (snapRx). Full dump (no 16-cap):
+// used to diff whole chains across a drift.
 func traceLogRecv(prefix string, snapRx uint64) {
 	traceMu.Lock()
 	defer traceMu.Unlock()
 	errors.LogInfo(context.Background(), "mux trace: ", prefix, " snapRx ", snapRx, " recvRing ", len(traceRecvRing))
-	start := 0
-	if len(traceRecvRing) > 16 {
-		start = len(traceRecvRing) - 16
+	for _, t := range traceRecvRing {
+		errors.LogInfo(context.Background(), "mux trace: ", prefix, " recv seq ", t.seq, " sid ", t.sid, " off ", t.off, " len ", t.ln, " crc ", t.crc, " dir ", t.dir)
 	}
-	for _, t := range traceRecvRing[start:] {
-		errors.LogInfo(context.Background(), "mux trace: ", prefix, " recv seq ", t.seq, " sid ", t.sid, " off ", t.off, " len ", t.ln, " crc ", t.crc)
+}
+
+// traceDumpAdopt appends both rings to a file (console wrapping mangles
+// long log lines, so file output is the only faithful channel). Append
+// mode: every adopt adds an episode block, so multi-episode runs keep
+// full history instead of overwriting.
+func traceDumpAdopt(path string, snapRx, peerRx uint64) {
+	traceMu.Lock()
+	defer traceMu.Unlock()
+	var sb strings.Builder
+	sb.WriteString("=== adopt snapRx ")
+	sb.WriteString(strconv.FormatUint(snapRx, 10))
+	sb.WriteString(" peerRx ")
+	sb.WriteString(strconv.FormatUint(peerRx, 10))
+	sb.WriteString("\n")
+	for _, t := range traceRecvRing {
+		sb.WriteString("R ")
+		writeTuple(&sb, t)
 	}
+	for _, t := range traceSendRing {
+		sb.WriteString("S ")
+		writeTuple(&sb, t)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(sb.String())
+}
+
+func writeTuple(sb *strings.Builder, t fpTuple) {
+	sb.WriteString(strconv.FormatUint(t.seq, 10))
+	sb.WriteByte(' ')
+	sb.WriteString(strconv.Itoa(int(t.sid)))
+	sb.WriteByte(' ')
+	sb.WriteString(strconv.FormatUint(t.off, 10))
+	sb.WriteByte(' ')
+	sb.WriteString(strconv.Itoa(t.ln))
+	sb.WriteByte(' ')
+	sb.WriteString(strconv.FormatUint(uint64(t.crc), 10))
+	sb.WriteByte(' ')
+	sb.WriteString(t.dir)
+	sb.WriteByte('\n')
 }
 
 // traceLogFlush records the first 8 seqs a flush actually wrote.
@@ -107,14 +168,13 @@ func traceLogFlush(id uint64, label string, seqs []uint64) {
 }
 
 // traceLogSendWindow dumps retained sender tuples around peerRx and is
-// called wherever a flush decision is made.
+// called wherever a flush decision is made. Full window (no ±8 filter)
+// for whole-chain diffs.
 func traceLogSendWindow(prefix string, peerRx uint64) {
 	traceMu.Lock()
 	defer traceMu.Unlock()
 	errors.LogInfo(context.Background(), "mux trace: ", prefix, " peerRx ", peerRx, " sendRing ", len(traceSendRing))
 	for _, t := range traceSendRing {
-		if t.seq+4 >= peerRx && t.seq <= peerRx+8 {
-			errors.LogInfo(context.Background(), "mux trace: ", prefix, " send seq ", t.seq, " sid ", t.sid, " off ", t.off, " len ", t.ln, " crc ", t.crc)
-		}
+		errors.LogInfo(context.Background(), "mux trace: ", prefix, " send seq ", t.seq, " sid ", t.sid, " off ", t.off, " len ", t.ln, " crc ", t.crc, " dir ", t.dir)
 	}
 }
