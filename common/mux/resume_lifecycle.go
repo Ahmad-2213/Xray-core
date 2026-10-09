@@ -266,7 +266,12 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	m.epoch.Add(1)
 	myEpoch := m.epoch.Load()
 	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", myEpoch)
-	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: m.rx.Value()}
+	// Seal here, not just at suspend: the reader may be blocked
+	// mid-delivery (admitted but not yet delivered), and Value() taken
+	// above that point would snapshot k-1 for a delivered frame k, which
+	// the peer then replays into a duplicate. The sealed snapshot is the
+	// exact delivered set.
+	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: m.rx.sealAndSnapshot()}
 	meta := FrameMetadata{SessionStatus: SessionStatusResume}
 	meta.Option.Set(OptionData)
 	payload := encodeResume(resume)
@@ -322,6 +327,9 @@ func (m *ClientWorker) attachCarrierSwap(upW buf.Writer, downR buf.Reader) {
 	if m.gate != nil {
 		m.gate.swapTarget(upW)
 	}
+	// The new downlink (and its Resume reply) is installed: reopen
+	// counting so the fresh carrier's frames admit again.
+	m.rx.unseal()
 }
 
 // enterSuspend parks forwarding once; records the deadline on first entry.
@@ -335,6 +343,9 @@ func (m *ClientWorker) enterSuspend() {
 		m.suspendEnd = time.Now().Add(timeout)
 	}
 	m.suspMu.Unlock()
+	// Seal first: the reader may be blocked mid-delivery, and any later
+	// admit must drop for replay instead of slipping past the snapshot.
+	m.rx.seal()
 	if m.gate != nil {
 		m.gate.setSuspended(true)
 	}

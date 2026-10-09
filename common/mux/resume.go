@@ -180,6 +180,71 @@ func CountedStatus(s SessionStatus) bool {
 	}
 }
 
+// rxState is the receive-side cumulative frame counter with a suspend
+// seal. admit must be called with a FULLY READ frame before delivery:
+// while unsealed it counts and returns true; once sealed (a suspend
+// snapshot was taken) it returns false and the caller drops the frame
+// uncounted — the peer will replay it after rebind. Counting before
+// delivery is safe because the whole frame is already in memory; delivery
+// can then only fail via session/worker close, which needs no replay.
+// Without the seal, a frame delivered-but-uncounted at kill time is
+// replayed and delivered twice (+8KB duplication), and a frame counted
+// past the snapshot desyncs the replay math.
+type rxState struct {
+	mu     sync.Mutex
+	n      uint64
+	sealed bool
+}
+
+func (r *rxState) admit(counted bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sealed {
+		return false
+	}
+	if counted {
+		r.n++
+	}
+	return true
+}
+
+// seal stops further counting; sealAndSnapshot seals and returns the
+// exact delivered set the peer must replay past. Idempotent.
+func (r *rxState) seal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sealed = true
+}
+
+func (r *rxState) sealAndSnapshot() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sealed = true
+	return r.n
+}
+
+// resume adopts another worker's baseline and reopens counting.
+func (r *rxState) resume(n uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.n = n
+	r.sealed = false
+}
+
+// unseal reopens counting at the current value. Must hold no other
+// assumption: unlike resume(Value()), it cannot lose a concurrent admit.
+func (r *rxState) unseal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sealed = false
+}
+
+func (r *rxState) Value() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.n
+}
+
 // Counter tracks one direction of the cumulative frame count.
 type Counter struct {
 	mu sync.Mutex

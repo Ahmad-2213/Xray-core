@@ -99,7 +99,7 @@ type ServerWorker struct {
 	done           *done.Instance
 	timer          *time.Ticker
 	tx             Counter
-	rx             Counter
+	rx             rxState
 	resumeToken    [16]byte
 	resumeHasToken bool
 	resumeUser     string
@@ -124,6 +124,10 @@ type ServerWorker struct {
 	// captured at construction (run/adopt run on one goroutine after).
 	localUser string
 	ackMu     ackState
+	// quiesced closes when this worker's run loop exits. A park hands it
+	// to the handover entry so the adopter can wait out late deliveries
+	// from the old carrier before replaying.
+	quiesced chan struct{}
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
@@ -132,6 +136,7 @@ func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 		link:       link,
 		done:       done.New(),
 		timer:      time.NewTicker(60 * time.Second),
+		quiesced:   make(chan struct{}),
 	}
 	worker.sessionManager.Store(NewSessionManager())
 	worker.localUser = boundIdentity(ctx)
@@ -345,9 +350,16 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			if rerr != nil {
 				return rerr
 			}
+			// Admit before delivery (see handleStatusKeep): a sealed
+			// replay cut drops here uncounted instead of duplicating
+			// past the park snapshot.
+			if !w.rx.admit(meta.Target.Network == net.Network_TCP) {
+				buf.ReleaseMulti(mb)
+				return nil
+			}
 			werr := existing.output.WriteMultiBuffer(mb)
 			existing.unborn = false
-			w.countRx(meta)
+			w.maybeSendAck()
 			if werr != nil {
 				existing.Close(false)
 				return buf.Copy(rr, buf.Discard)
@@ -384,7 +396,9 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	}
 	go handle(ctx, s, w.out())
 	if !meta.Option.Has(OptionData) {
-		w.countRx(meta)
+		if w.rx.admit(meta.Target.Network == net.Network_TCP) {
+			w.maybeSendAck()
+		}
 		return nil
 	}
 
@@ -412,11 +426,19 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		// park janitor reaps it.
 		return rerr
 	}
+	// Admit before delivery: a sealed first payload drops here uncounted
+	// (staying unborn for the idempotent replay branch) instead of
+	// duplicating past the park snapshot.
+	if !w.rx.admit(meta.Target.Network == net.Network_TCP) {
+		buf.ReleaseMulti(mb)
+		return nil
+	}
 	werr := s.output.WriteMultiBuffer(mb)
 	// Carrier delivered fully; a downstream write error is local, so the
-	// frame still counts (the sender counted it at store time).
+	// frame still counts (the sender counted it at store time) — already
+	// admitted above.
 	s.unborn = false
-	w.countRx(meta)
+	w.maybeSendAck()
 	if werr != nil {
 		s.Close(false)
 		return buf.Copy(rr, buf.Discard)
@@ -430,6 +452,9 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 	// Count only what was actually delivered (see client
 	// handleStatusKeep): a frame cut mid-payload must stay out of rx.
+	// Admit-before-delivery: the frame is fully read, so counting now is
+	// safe, and a seal (park snapshot) drops it for replay instead of
+	// letting it slip past the snapshot and duplicate on rebind.
 	count := meta.Target.Network != net.Network_UDP
 	s, found := w.sessionManager.Load().Get(meta.SessionID)
 	if !found {
@@ -455,8 +480,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return err
 		}
-		if count {
-			w.countRx(meta)
+		if w.rx.admit(count) {
+			w.maybeSendAck()
 		}
 		return nil
 	}
@@ -471,8 +496,8 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 			s.Close(false)
 			return buf.Copy(rr, buf.Discard)
 		}
-		if err == nil && count {
-			w.countRx(meta)
+		if err == nil && count && w.rx.admit(true) {
+			w.maybeSendAck()
 		}
 		return err
 	}
@@ -480,10 +505,13 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	if rerr != nil {
 		return rerr
 	}
-	werr := s.output.WriteMultiBuffer(mb)
-	if count {
-		w.countRx(meta)
+	// Sealed mid-park: drop uncounted; the peer replays it after rebind.
+	if !w.rx.admit(count) {
+		buf.ReleaseMulti(mb)
+		return nil
 	}
+	werr := s.output.WriteMultiBuffer(mb)
+	w.maybeSendAck()
 
 	if werr != nil {
 		errors.LogInfoInner(context.Background(), werr, "failed to write to downstream writer. closing session ", s.ID)
@@ -495,15 +523,33 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 }
 
 func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
-		s.Close(false)
+	if !w.resumeHasToken {
+		// Flag-off: original upstream close-first path.
+		if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
+			s.Close(false)
+		}
+		if meta.Option.Has(OptionData) {
+			if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
+	// Resume path: consume, then admit. A sealed End belongs to a park
+	// in progress: leave it uncounted (and the session open) so the
+	// rebind replays it.
 	if meta.Option.Has(OptionData) {
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return err
 		}
 	}
-	w.countRx(meta)
+	if !w.rx.admit(true) {
+		return nil
+	}
+	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {
+		s.Close(false)
+	}
+	w.maybeSendAck()
 	return nil
 }
 
@@ -545,6 +591,9 @@ func (w *ServerWorker) handleMeta(ctx context.Context, reader *buf.BufferedReade
 func (w *ServerWorker) run(ctx context.Context) {
 	parked := false
 	defer func() {
+		// The run loop is over: no more deliveries from the old
+		// carrier. Adopters waiting on quiesced may proceed.
+		close(w.quiesced)
 		if !parked {
 			common.Must(w.done.Close())
 		}
@@ -664,6 +713,12 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 	if !w.parkOnce.CompareAndSwap(false, true) {
 		return true
 	}
+	// Seal BEFORE the manager swap and snapshot the exact delivered set:
+	// any frame the old run loop admits after this point drops uncounted
+	// (replayed after rebind) instead of slipping past the snapshot and
+	// duplicating on replay. Sealing only after the abort checks above,
+	// so a refused park never stalls counting.
+	snap := w.rx.sealAndSnapshot()
 	user := w.resumeUser
 	if user == "" {
 		user = w.localUser
@@ -680,10 +735,13 @@ func (w *ServerWorker) parkForResume(ctx context.Context) bool {
 		manager: sm,
 		gate:    w.gate.Load(),
 		tx:      w.gateTx(),
-		rx:      w.rx.Value(),
+		rx:      snap,
 		epoch:   w.resumeEpoch,
 		user:    user,
 		done:    w.resumeDone,
+		// Closed by this worker's run loop defer when it exits; the
+		// adopter waits on it so late deliveries can't race the replay.
+		quiesced: w.quiesced,
 	})
 	w.sessionManager.Store(NewSessionManager())
 	common.Interrupt(w.link.Writer)

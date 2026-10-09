@@ -19,6 +19,9 @@ type suspendedWorker struct {
 	expires time.Time
 	born    time.Time
 	done    *tokenDone
+	// quiesced closes when the parking worker's run loop exits. Nil
+	// for test-built entries; adopters wait on it with a timeout.
+	quiesced <-chan struct{}
 }
 
 // tokenDone is the token-scoped lifetime channel. The gate adopted onto a

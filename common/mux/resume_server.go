@@ -10,34 +10,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/net"
 )
-
-// countRx applies the shared counting rule to received frames. New is
-// counted by the caller only after successful dispatch (a failed dispatch
-// kills the worker today; counting it would ack a never-created session and
-// hang the client stream on rebind instead of failing it).
-func (w *ServerWorker) countRx(meta *FrameMetadata) {
-	switch meta.SessionStatus {
-	case SessionStatusNew:
-		if meta.Target.Network == net.Network_TCP {
-			w.rx.Next()
-			w.maybeSendAck()
-		}
-	case SessionStatusKeep:
-		if !meta.Option.Has(OptionData) {
-			return
-		}
-		if meta.Target.Network == net.Network_UDP {
-			return
-		}
-		w.rx.Next()
-		w.maybeSendAck()
-	case SessionStatusEnd:
-		w.rx.Next()
-		w.maybeSendAck()
-	}
-}
 
 // maybeSendAck emits Ack{rxCount} throttled, via the gate once present.
 // A trailing ack is scheduled when rate-limited with unacked rx, so a
@@ -124,9 +97,18 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		return err
 	}
 	if found {
+		// The old run loop may still be delivering (it exits only when
+		// its carrier errors): wait for its quiesce before adopting, or
+		// its late deliveries land out of order with our replay.
+		if ch := entry.quiesced; ch != nil {
+			select {
+			case <-ch:
+			case <-time.After(2 * time.Second):
+			}
+		}
 		// Adopt the parked table, gate (with retain store) and rx baseline.
 		entry.manager.Reparent(w.sessionManager.Load())
-		w.rx.Set(entry.rx)
+		w.rx.resume(entry.rx)
 		w.rsMu.Lock()
 		if entry.gate != nil {
 			w.gate.Store(entry.gate)

@@ -214,7 +214,7 @@ type ClientWorker struct {
 	resume         ResumePolicy
 	token          [16]byte
 	epoch          atomic.Uint64
-	rx             Counter
+	rx             rxState
 	ackMu          ackState
 	// Phase 2 suspend/resume state. gate is nil unless resume is enabled.
 	gate        *carrierGate
@@ -258,6 +258,12 @@ var (
 	muxCoolAddress = net.DomainAddress("v1.mux.cool")
 	muxCoolPort    = net.Port(9527)
 )
+
+// deliverDelay injects latency between admitting a client downlink frame
+// and delivering it to the app (test-only hook, set via
+// DeliverDelayForTest). Lets a kill land deterministically inside the
+// admit/deliver window to prove mid-delivery cuts stay byte-exact.
+var deliverDelay atomic.Uint64 // nanoseconds
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
@@ -425,9 +431,21 @@ func (m *ClientWorker) handleStatueKeepAlive(meta *FrameMetadata, reader *buf.Bu
 }
 
 func (m *ClientWorker) handleStatusNew(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if meta.Option.Has(OptionData) {
-		return buf.Copy(NewStreamReader(reader), buf.Discard)
+	if !m.resume.Enabled {
+		// Flag-off: original upstream path (raw error fails fast).
+		if meta.Option.Has(OptionData) {
+			return buf.Copy(NewStreamReader(reader), buf.Discard)
+		}
+		return nil
 	}
+	if meta.Option.Has(OptionData) {
+		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+			return &frameReadError{err}
+		}
+	}
+	// New carries no rx slot on this side; the admit only honors a seal
+	// so a racing suspend still funnels the frame into the replay path.
+	m.rx.admit(false)
 	return nil
 }
 
@@ -440,6 +458,9 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	// time, so a frame cut mid-payload must stay out of rx or the sender
 	// will never replay it (silent loss). A downstream write error means
 	// the carrier delivered fully — still count. Mirrors the server.
+	// Admit-before-delivery: the frame is fully read, so counting now is
+	// safe, and a seal (suspend snapshot) drops it for replay instead of
+	// letting it slip past the snapshot and duplicate on rebind.
 	count := m.resume.Enabled && meta.Target.Network != net.Network_UDP
 	s, found := m.sessionManager.Get(meta.SessionID)
 	if !found {
@@ -464,8 +485,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return &frameReadError{err}
 		}
-		if count {
-			m.rx.Next()
+		if m.rx.admit(count) {
 			m.maybeSendAck()
 		}
 		return nil
@@ -490,11 +510,17 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		}
 		return &frameReadError{rerr}
 	}
-	werr := s.output.WriteMultiBuffer(mb)
-	if count {
-		m.rx.Next()
-		m.maybeSendAck()
+	// Sealed mid-suspend: drop uncounted; the peer replays it after
+	// rebind. Delivering past the snapshot would duplicate it.
+	if !m.rx.admit(count) {
+		buf.ReleaseMulti(mb)
+		return nil
 	}
+	if d := deliverDelay.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
+	werr := s.output.WriteMultiBuffer(mb)
+	m.maybeSendAck()
 	if werr != nil {
 		errors.LogInfoInner(context.Background(), werr, "failed to write to downstream. closing session ", s.ID)
 		s.Close(false)
@@ -508,19 +534,33 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 }
 
 func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.BufferedReader) error {
-	if s, found := m.sessionManager.Get(meta.SessionID); found {
-		s.Close(false)
+	if !m.resume.Enabled {
+		// Flag-off: original upstream close-first path.
+		if s, found := m.sessionManager.Get(meta.SessionID); found {
+			s.Close(false)
+		}
+		if meta.Option.Has(OptionData) {
+			if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
+				return &frameReadError{err}
+			}
+		}
+		return nil
 	}
-	count := m.resume.Enabled
+	// Resume path: consume the frame, then admit. A sealed End belongs
+	// to a suspend in progress: leave it uncounted (and the session
+	// open) so the rebind replays it.
 	if meta.Option.Has(OptionData) {
 		if err := buf.Copy(NewStreamReader(reader), buf.Discard); err != nil {
 			return &frameReadError{err}
 		}
 	}
-	if count {
-		m.rx.Next()
-		m.maybeSendAck()
+	if !m.rx.admit(true) {
+		return nil
 	}
+	if s, found := m.sessionManager.Get(meta.SessionID); found {
+		s.Close(false)
+	}
+	m.maybeSendAck()
 	return nil
 }
 
