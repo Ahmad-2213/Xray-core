@@ -266,7 +266,12 @@ var (
 // and delivering it to the app (test-only hook, set via
 // DeliverDelayForTest). Lets a kill land deterministically inside the
 // admit/deliver window to prove mid-delivery cuts stay byte-exact.
+// deliverInDelay counts frames currently inside the delay so the test
+// can kill exactly while one is blocked (time-based kills race frame
+// arrival and flake).
 var deliverDelay atomic.Uint64 // nanoseconds
+
+var deliverInDelay atomic.Int64
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
@@ -531,7 +536,9 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 		return nil
 	}
 	if d := deliverDelay.Load(); d > 0 {
+		deliverInDelay.Add(1)
 		time.Sleep(time.Duration(d))
+		deliverInDelay.Add(-1)
 	}
 	werr := s.output.WriteMultiBuffer(mb)
 	m.maybeSendAck()

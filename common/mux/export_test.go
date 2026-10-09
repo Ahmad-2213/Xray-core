@@ -19,6 +19,18 @@ func NewPayloadDelayForTest(d time.Duration) {
 	newPayloadDelay.Store(uint64(d.Nanoseconds()))
 }
 
+// DeliverDelayForTest sets the injected client downlink delivery delay.
+func DeliverDelayForTest(d time.Duration) {
+	deliverDelay.Store(uint64(d.Nanoseconds()))
+	deliverInDelay.Store(0)
+}
+
+// DeliverBlockedForTest reports how many frames are currently inside the
+// delivery delay.
+func DeliverBlockedForTest() int64 {
+	return deliverInDelay.Load()
+}
+
 func DecodeResumeForTest(p []byte) (ResumePayload, error) {
 	return decodeResume(p)
 }

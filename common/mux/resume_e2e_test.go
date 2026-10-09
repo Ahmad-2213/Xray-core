@@ -388,7 +388,22 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(50 * time.Millisecond)
+	// Kill when the receiver has real bytes (deterministic mid-flight
+	// cut with data in flight), not after a fixed sleep: under loaded
+	// or instrumented runtimes 50ms may land before the first byte.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		echoMu.Lock()
+		n := len(echoed)
+		echoMu.Unlock()
+		if n >= 256*1024 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("receiver stalled before kill threshold (%d/%d)", n, total)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	h.killCurrent()
 	echoMu.Lock()
 	atKill := len(echoed)
@@ -412,6 +427,61 @@ func TestResumeE2EMidPayloadByteExact(t *testing.T) {
 	}
 	if !bytes.Equal(final, sent) {
 		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(final), total)
+	}
+}
+
+// TestResumeE2EDelayedDeliveryByteExact kills while a fully-read frame
+// waits on slow delivery, then drains with a silence window. Pre-seal
+// code snapshots k-1 and replays the delivered frame (duplication, so
+// extra bytes arrive); sealed code admits before the delay, so the
+// snapshot covers it and the rebind skips it. Single small payload: the
+// only bytes that may ever arrive are the echo itself, so any surplus
+// byte is proof of duplication.
+func TestResumeE2EDelayedDeliveryByteExact(t *testing.T) {
+	mux.DeliverDelayForTest(1500 * time.Millisecond)
+	defer mux.DeliverDelayForTest(0)
+	h := &carrierHarness{disp: echoDispatcher{}}
+	fx := newE2EFixture(t, h, stubDialerOK{}, testResumePolicy())
+	defer fx.worker.Close()
+	defer h.closeAll()
+	defer mux.HsResetForTest()
+
+	payload := bytes.Repeat([]byte{0xCD}, 8*1024)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- fx.appUpW.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)})
+	}()
+	// Kill exactly while a frame is blocked inside delayed delivery (not
+	// after a fixed sleep, which races frame arrival and flakes).
+	deadline := time.Now().Add(15 * time.Second)
+	for mux.DeliverBlockedForTest() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no frame entered delayed delivery before kill window")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.killCurrent()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatal("app write failed:", err)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("app write stalled")
+	}
+	if got := readExactly(t, fx.appDnR, len(payload), 60*time.Second); !bytes.Equal(got, payload) {
+		t.Fatalf("byte-exact mismatch: got %d bytes, want %d", len(got), len(payload))
+	}
+	// Silence window: nothing else may ever arrive. A replayed duplicate
+	// lands here within ~2s (redial cadence); data means duplication.
+	mb, err := fx.appDnR.ReadMultiBufferTimeout(5 * time.Second)
+	if err == nil {
+		n := 0
+		for _, b := range mb {
+			n += len(b.Bytes())
+		}
+		buf.ReleaseMulti(mb)
+		t.Fatalf("surplus %d bytes after exact echo: duplicated replay", n)
 	}
 }
 
