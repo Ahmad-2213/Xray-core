@@ -612,9 +612,16 @@ func (w *ServerWorker) run(ctx context.Context) {
 		w.rsMu.Lock()
 		td := w.resumeDone
 		parkedOnce := w.parkOnce.Load()
+		token := w.resumeToken
+		hasToken := w.resumeHasToken
 		w.rsMu.Unlock()
 		if td != nil && !parked && !parkedOnce {
 			td.close()
+		}
+		if hasToken {
+			// Release the live mapping only if it still points here:
+			// a newer carrier adopting the same token must survive.
+			liveRegRemove(token, w)
 		}
 	}()
 

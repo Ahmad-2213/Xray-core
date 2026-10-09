@@ -66,6 +66,107 @@ func (w *ServerWorker) sendTrailingAck() {
 	}
 }
 
+// liveStaleFor reports whether a live worker under the same token is a
+// stale carrier for this Resume: strictly older epoch, same user binding.
+// Checked under the live worker's rsMu; the registry lock must NOT be
+// held here (see liveReg rules).
+func liveStaleFor(lw *ServerWorker, rp ResumePayload, user string) bool {
+	lw.rsMu.Lock()
+	defer lw.rsMu.Unlock()
+	if rp.Epoch <= lw.resumeEpoch {
+		return false
+	}
+	u := lw.resumeUser
+	if u == "" {
+		u = lw.localUser
+	}
+	return u == "" || user == "" || u == user
+}
+
+// adoptEntry rebinds a validated handover entry onto this worker: table,
+// gate, rx baseline, reply, and retained flush. Shared by the normal
+// adopt path and the force-park path.
+func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) error {
+	// The old run loop may still be delivering (it exits only when
+	// its carrier errors): wait for its quiesce before adopting, or
+	// its late deliveries land out of order with our replay.
+	if ch := entry.quiesced; ch != nil {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	// Adopt the parked table, gate (with retain store) and rx baseline.
+	entry.manager.Reparent(w.sessionManager.Load())
+	w.rx.resume(entry.rx)
+	w.rsMu.Lock()
+	if entry.gate != nil {
+		w.gate.Store(entry.gate)
+		entry.gate.swapTarget(w.link.Writer)
+		if entry.done != nil {
+			entry.gate.swapDone(entry.done.wait())
+		}
+	}
+	w.resumeToken = rp.Token
+	w.resumeEpoch = rp.Epoch
+	w.resumeHasToken = true
+	w.resumeUser = entry.user
+	w.resumeDone = entry.done
+	liveRegPut(rp.Token, w)
+	if w.gate.Load() == nil {
+		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
+		if w.resumeDone != nil {
+			g.swapDone(w.resumeDone.wait())
+		}
+		w.gate.Store(g)
+	}
+	w.rsMu.Unlock()
+	// Re-arm onto this worker: the adopted gate still points at the
+	// parking worker's park callback (a no-op on its empty manager),
+	// which would leave write errors spinning instead of parking.
+	if g := w.gate.Load(); g != nil {
+		g.setOnCarrierError(func() {
+			w.parkForResume(context.Background())
+		})
+		go w.watchHalfOpen()
+	}
+	// Reply with our rx so the client replays exactly what we
+	// missed, then flush our retained suffix past the client's rx,
+	// and only then unsuspend: live writes must never precede the
+	// replay, or the peer double-counts.
+	reply := FrameMetadata{SessionStatus: SessionStatusResume}
+	reply.Option.Set(OptionData)
+	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
+	if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
+		return err
+	}
+	replayed := 0
+	// Flush runs off the reader loop (bidirectional unacked data
+	// above the pipe buffers would deadlock two inline flushes).
+	// The carrier stays readable meanwhile.
+	go func() {
+		if g := w.gate.Load(); g != nil {
+			sent := g.TxCount()
+			if err := g.flushSince(rp.RxCount); err != nil {
+				errors.LogInfoInner(context.Background(), err, "mux resume: rebind flush failed")
+				return
+			}
+			// Free what the peer confirms and advance the ack
+			// clock: retention would otherwise pin memory and the
+			// half-open detector would re-trip right after rebind.
+			g.ack(rp.RxCount)
+			if sent > rp.RxCount {
+				replayed = int(sent - rp.RxCount)
+			}
+		}
+		if g := w.gate.Load(); g != nil {
+			g.setSuspended(false)
+		}
+		errors.LogInfo(context.Background(), "mux resume: adopted token ", tokenString(rp.Token), " epoch ", rp.Epoch, " replayed ", replayed, " frames")
+	}()
+	return nil
+}
+
 func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.BufferedReader) error {
 	if !meta.Option.Has(OptionData) {
 		return nil
@@ -97,95 +198,37 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		return err
 	}
 	if found {
-		// The old run loop may still be delivering (it exits only when
-		// its carrier errors): wait for its quiesce before adopting, or
-		// its late deliveries land out of order with our replay.
-		if ch := entry.quiesced; ch != nil {
-			select {
-			case <-ch:
-			case <-time.After(2 * time.Second):
-			}
-		}
-		// Adopt the parked table, gate (with retain store) and rx baseline.
-		entry.manager.Reparent(w.sessionManager.Load())
-		w.rx.resume(entry.rx)
-		w.rsMu.Lock()
-		if entry.gate != nil {
-			w.gate.Store(entry.gate)
-			entry.gate.swapTarget(w.link.Writer)
-			if entry.done != nil {
-				entry.gate.swapDone(entry.done.wait())
-			}
-		}
-		w.resumeToken = rp.Token
-		w.resumeEpoch = rp.Epoch
-		w.resumeHasToken = true
-		w.resumeUser = entry.user
-		w.resumeDone = entry.done
-		if w.gate.Load() == nil {
-			g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
-			if w.resumeDone != nil {
-				g.swapDone(w.resumeDone.wait())
-			}
-			w.gate.Store(g)
-		}
-		w.rsMu.Unlock()
-		// Re-arm onto this worker: the adopted gate still points at the
-		// parking worker's park callback (a no-op on its empty manager),
-		// which would leave write errors spinning instead of parking.
-		if g := w.gate.Load(); g != nil {
-			g.setOnCarrierError(func() {
-				w.parkForResume(context.Background())
-			})
-			go w.watchHalfOpen()
-		}
-		// Reply with our rx so the client replays exactly what we
-		// missed, then flush our retained suffix past the client's rx,
-		// and only then unsuspend: live writes must never precede the
-		// replay, or the peer double-counts.
-		reply := FrameMetadata{SessionStatus: SessionStatusResume}
-		reply.Option.Set(OptionData)
-		rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: rp.Epoch, RxCount: w.rx.Value()})
-		if err := writeMetaWithFrame(w.link.Writer, reply, buf.MultiBuffer{rpayload}); err != nil {
-			return err
-		}
-		replayed := 0
-		// Flush runs off the reader loop (bidirectional unacked data
-		// above the pipe buffers would deadlock two inline flushes).
-		// The carrier stays readable meanwhile.
-		go func() {
-			if g := w.gate.Load(); g != nil {
-				sent := g.TxCount()
-				if err := g.flushSince(rp.RxCount); err != nil {
-					errors.LogInfoInner(context.Background(), err, "mux resume: rebind flush failed")
-					return
-				}
-				// Free what the peer confirms and advance the ack
-				// clock: retention would otherwise pin memory and the
-				// half-open detector would re-trip right after rebind.
-				g.ack(rp.RxCount)
-				if sent > rp.RxCount {
-					replayed = int(sent - rp.RxCount)
-				}
-			}
-			if g := w.gate.Load(); g != nil {
-				g.setSuspended(false)
-			}
-			errors.LogInfo(context.Background(), "mux resume: adopted token ", tokenString(rp.Token), " epoch ", rp.Epoch, " replayed ", replayed, " frames")
-		}()
-		return nil
+		return w.adoptEntry(rp, entry)
 	}
 
 	// Unknown token: either a fresh announce, or a redial racing a park
-	// (half-open: the old carrier still looks alive server-side). Answer
-	// with epoch 0 ("nothing parked") instead of silence so the client
-	// retries on cadence instead of stalling one redial for 8s. The client
-	// ignores epoch-0 replies without resuming.
+	// (half-open: the old carrier still looks alive server-side). Check
+	// the live registry first: a live worker under the same token with an
+	// older epoch is the stale carrier — force-park it and adopt at once
+	// instead of answering epoch-0 and wasting a redial cycle.
+	if lw := liveRegFind(rp.Token); lw != nil && lw != w && liveStaleFor(lw, rp, w.localUser) {
+		lw.parkForResume(context.Background())
+		entry, found, err := hsAdopt(rp.Token, func(e *suspendedWorker) error {
+			return validateRebind(e.tx, e.epoch, e.user, rp, w.localUser)
+		})
+		if err != nil {
+			return err
+		}
+		if found {
+			errors.LogInfo(context.Background(), "mux resume: force-parked stale carrier for token ", tokenString(rp.Token), " epoch ", rp.Epoch)
+			return w.adoptEntry(rp, entry)
+		}
+	}
+	// Truly unknown: a fresh announce, or a redial the park hasn't
+	// reached yet. Answer with epoch 0 ("nothing parked") instead of
+	// silence so the client retries on cadence instead of stalling one
+	// redial for 8s. The client ignores epoch-0 replies without resuming.
 	w.rsMu.Lock()
 	w.resumeToken = rp.Token
 	w.resumeEpoch = rp.Epoch
 	w.resumeHasToken = true
 	w.resumeUser = w.localUser
+	liveRegPut(rp.Token, w)
 	if w.gate.Load() == nil {
 		g := newCarrierGate(w.link.Writer, w.done.Wait(), DefaultResumePolicy())
 		if w.resumeDone == nil {

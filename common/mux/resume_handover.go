@@ -240,6 +240,42 @@ func sweepExpired() {
 
 var janitorOnce sync.Once
 
+// liveReg tracks live server workers by resume token so a rebind racing
+// a park can force-park the stale carrier instead of taking an epoch-0
+// negative and waiting a full redial cycle: during a half-open stall the
+// client redials while the server still sees the old carrier as live, so
+// the first redial finds nothing parked. Force-park moves the sessions
+// into the handover table and the same redial adopts them at once.
+// Rule: never hold liveRegMu while acquiring a worker rsMu (register and
+// unregister take liveRegMu leaf-style; find snapshots the pointer and
+// releases before touching the worker).
+var (
+	liveRegMu sync.Mutex
+	liveReg   = make(map[[16]byte]*ServerWorker)
+)
+
+func liveRegPut(token [16]byte, w *ServerWorker) {
+	liveRegMu.Lock()
+	defer liveRegMu.Unlock()
+	liveReg[token] = w
+}
+
+func liveRegFind(token [16]byte) *ServerWorker {
+	liveRegMu.Lock()
+	defer liveRegMu.Unlock()
+	return liveReg[token]
+}
+
+// liveRegRemove unregisters only if the mapping still points at w: a
+// newer worker reusing the token must survive an older worker's exit.
+func liveRegRemove(token [16]byte, w *ServerWorker) {
+	liveRegMu.Lock()
+	defer liveRegMu.Unlock()
+	if liveReg[token] == w {
+		delete(liveReg, token)
+	}
+}
+
 // lazyJanitor starts the expiry sweeper on first park (no eager init, so
 // importing common/mux with resume disabled costs no goroutine). Expiry is
 // otherwise lazy (checked on take/peek), which alone could pin dead entries
