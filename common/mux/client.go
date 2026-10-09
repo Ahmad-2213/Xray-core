@@ -296,6 +296,7 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 			c.token = t
 		}
 		c.gate = newCarrierGate(stream.Writer, c.done.Wait(), policy)
+		c.gate.SetLabel(c.tokenString())
 	}
 	c.attachCarrier(stream.Writer, stream.Reader)
 
@@ -532,6 +533,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	// Sealed mid-suspend: drop uncounted; the peer replays it after
 	// rebind. Delivering past the snapshot would duplicate it.
 	if !m.rx.admit(count) {
+		errors.LogInfo(context.Background(), "mux resume: dropped Keep while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
 	}
@@ -576,6 +578,7 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 		}
 	}
 	if !m.rx.admit(true) {
+		errors.LogInfo(context.Background(), "mux resume: dropped End while sealed sid ", meta.SessionID)
 		return nil
 	}
 	if s, found := m.sessionManager.Get(meta.SessionID); found {

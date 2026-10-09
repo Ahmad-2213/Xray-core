@@ -265,13 +265,14 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 
 	m.epoch.Add(1)
 	myEpoch := m.epoch.Load()
-	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", myEpoch)
 	// Seal here, not just at suspend: the reader may be blocked
 	// mid-delivery (admitted but not yet delivered), and Value() taken
 	// above that point would snapshot k-1 for a delivered frame k, which
 	// the peer then replays into a duplicate. The sealed snapshot is the
 	// exact delivered set.
-	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: m.rx.sealAndSnapshot()}
+	snapRx := m.rx.sealAndSnapshot()
+	errors.LogInfo(context.Background(), "mux resume: redial token ", m.tokenString(), " epoch ", myEpoch, " snapRx ", snapRx)
+	resume := ResumePayload{Token: m.token, Epoch: myEpoch, RxCount: snapRx}
 	meta := FrameMetadata{SessionStatus: SessionStatusResume}
 	meta.Option.Set(OptionData)
 	payload := encodeResume(resume)

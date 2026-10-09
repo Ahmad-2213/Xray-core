@@ -121,6 +121,9 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 		w.gate.Store(g)
 	}
 	w.rsMu.Unlock()
+	if g := w.gate.Load(); g != nil {
+		g.SetLabel(tokenString(rp.Token))
+	}
 	// Re-arm onto this worker: the adopted gate still points at the
 	// parking worker's park callback (a no-op on its empty manager),
 	// which would leave write errors spinning instead of parking.
@@ -242,6 +245,9 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		go w.watchHalfOpen()
 	}
 	w.rsMu.Unlock()
+	if g := w.gate.Load(); g != nil {
+		g.SetLabel(tokenString(rp.Token))
+	}
 	reply := FrameMetadata{SessionStatus: SessionStatusResume}
 	reply.Option.Set(OptionData)
 	rpayload := encodeResume(ResumePayload{Token: rp.Token, Epoch: 0, RxCount: w.rx.Value()})

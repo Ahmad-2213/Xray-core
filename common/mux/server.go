@@ -357,6 +357,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			// replay cut drops here uncounted instead of duplicating
 			// past the park snapshot.
 			if !w.rx.admit(meta.Target.Network == net.Network_TCP) {
+				errors.LogInfo(context.Background(), "mux resume: dropped New while sealed sid ", meta.SessionID)
 				buf.ReleaseMulti(mb)
 				return nil
 			}
@@ -433,6 +434,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 	// (staying unborn for the idempotent replay branch) instead of
 	// duplicating past the park snapshot.
 	if !w.rx.admit(meta.Target.Network == net.Network_TCP) {
+		errors.LogInfo(context.Background(), "mux resume: dropped New while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
 	}
@@ -515,6 +517,7 @@ func (w *ServerWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 	}
 	// Sealed mid-park: drop uncounted; the peer replays it after rebind.
 	if !w.rx.admit(count) {
+		errors.LogInfo(context.Background(), "mux resume: dropped Keep while sealed sid ", meta.SessionID)
 		buf.ReleaseMulti(mb)
 		return nil
 	}
@@ -552,6 +555,7 @@ func (w *ServerWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 		}
 	}
 	if !w.rx.admit(true) {
+		errors.LogInfo(context.Background(), "mux resume: dropped End while sealed sid ", meta.SessionID)
 		return nil
 	}
 	if s, found := w.sessionManager.Load().Get(meta.SessionID); found {

@@ -20,12 +20,15 @@ package mux
 // UDP payloads are never retained.
 
 import (
+	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/bitmask"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 )
 
 // countedFrame reports whether a transmitted frame advances the cumulative
@@ -97,6 +100,24 @@ type carrierGate struct {
 	streamBytes    map[uint16]int64
 	flushSeq       uint64
 	onCarrierError func()
+
+	// flushMu serializes rebind flushes: overlapping adopts on one gate
+	// would double-forward the same suffix (frame-aligned duplication
+	// under churn). Live writers wait on activeFlush instead of racing
+	// the flush, and mark what they forward so a later flush skips it.
+	flushMu sync.Mutex
+	// targetEpoch bumps on every swapTarget. A flush aborts when its
+	// epoch goes stale so a still-blocked previous-episode goroutine
+	// can't write into the new target while the next flush runs.
+	targetEpoch atomic.Uint64
+	// activeFlush counts flushes currently executing (0 or 1 by the
+	// mutex; the WARN is a canary for future regressions).
+	activeFlush atomic.Int64
+	// flushID numbers flushes for trace correlation.
+	flushID atomic.Uint64
+	// label is the worker's short token for trace lines, set by the
+	// worker once known (gates outlive any single worker).
+	label atomic.Value // string
 
 	ackCh      chan struct{}
 	resumeCh   chan struct{}
@@ -170,11 +191,28 @@ func (g *carrierGate) setSuspended(s bool) {
 	}
 }
 
-// swapTarget repoints the carrier pipe (rebind/adopt).
+// swapTarget repoints the carrier pipe (rebind/adopt) and retires any
+// flush still aimed at the old target: it aborts on the epoch check.
 func (g *carrierGate) swapTarget(t buf.Writer) {
 	g.mu.Lock()
 	g.target = t
 	g.mu.Unlock()
+	g.targetEpoch.Add(1)
+}
+
+// gateLabel returns the worker token label for trace lines.
+func (g *carrierGate) gateLabel() string {
+	if v := g.label.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return "?"
+}
+
+// SetLabel tags the gate with the owning worker's short token.
+func (g *carrierGate) SetLabel(s string) {
+	g.label.Store(s)
 }
 
 // ack frees retained frames up to n (cumulative) and unblocks writers.
@@ -290,27 +328,61 @@ func (g *carrierGate) forwardRetained(seq uint64) error {
 			if err := g.waitResume(); err != nil {
 				return err
 			}
-			// Woke via resume: the rebind flush owns retransmission of
-			// everything it covered. Only forward what it missed
-			// (stored after its snapshot); otherwise we'd double-send.
-			if g.flushedThrough(seq) {
-				return nil
+			continue
+		}
+		g.mu.Unlock()
+		// Serialize the coverage check and the write against a
+		// concurrent rebind flush: otherwise both can cover the same
+		// seq (frame-aligned duplication under churn). The flush takes
+		// the same mutex, so check and write are atomic against it.
+		// No deadlock: flushes never take sendMu (held by our caller),
+		// and waits happen outside both mutexes.
+		g.flushMu.Lock()
+		g.mu.Lock()
+		if g.isDoneLocked() {
+			g.mu.Unlock()
+			g.flushMu.Unlock()
+			return io.ErrClosedPipe
+		}
+		if g.suspended {
+			g.mu.Unlock()
+			g.flushMu.Unlock()
+			if err := g.waitResume(); err != nil {
+				return err
 			}
 			continue
+		}
+		// Woke via resume: the rebind flush owns retransmission of
+		// everything it covered. Only forward what it missed
+		// (stored after its snapshot); otherwise we'd double-send.
+		// Inline flushSeq read: g.mu is held, and flushedThrough
+		// would self-deadlock on it.
+		if seq <= g.flushSeq {
+			g.mu.Unlock()
+			g.flushMu.Unlock()
+			return nil
 		}
 		target := g.target
 		g.mu.Unlock()
 		raw, ok := g.rawCopyOf(seq)
 		if !ok {
 			// Acknowledged meanwhile: peer has it.
+			g.flushMu.Unlock()
 			return nil
 		}
 		if err := target.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(raw)}); err != nil {
 			// Stored already; suspend will replay it. Spin until the
 			// detector parks us or the worker closes.
+			g.flushMu.Unlock()
 			g.requestSuspend()
 			continue
 		}
+		// Deliberately no coverage mark here: only flushes mark.
+		// A live-sent seq stays replayable, and the next flush's
+		// low-water max(peerRx, flushSeq) lets the peer's rx (truth)
+		// decide — marking live sends would suppress legitimate
+		// replays of frames the peer never received.
+		g.flushMu.Unlock()
 		return nil
 	}
 }
@@ -483,7 +555,19 @@ func (g *carrierGate) writeAck(rx uint64) {
 // flushSince writes pending Ack then retained frames with seq > peerRx.
 // Covers exactly the unacked suffix; records the high-water mark so live
 // writers waking from suspend don't re-forward what was just replayed.
+// Serialized: overlapping adopts on one gate must not double-forward.
+// Aborts (partial mark) when the target epoch moves underneath it, so a
+// still-blocked previous-episode flush can't write into the new target
+// while the next flush runs; the superseding flush re-covers the tail.
 func (g *carrierGate) flushSince(peerRx uint64) error {
+	g.flushMu.Lock()
+	defer g.flushMu.Unlock()
+	if n := g.activeFlush.Add(1); n > 1 {
+		errors.LogWarning(context.Background(), "mux resume: concurrent flush execution detected (canary)")
+	}
+	defer g.activeFlush.Add(-1)
+	id := g.flushID.Add(1)
+	epoch := g.targetEpoch.Load()
 	g.mu.Lock()
 	var ackToSend uint64
 	hasAck := g.hasPending
@@ -492,19 +576,26 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 		g.hasPending = false
 	}
 	target := g.target
+	low := peerRx
+	if g.flushSeq > low {
+		low = g.flushSeq
+	}
 	var frames [][]byte
-	maxSent := peerRx
+	var seqs []uint64
+	maxSent := low
 	for _, f := range g.frames {
-		if f.seq > peerRx {
+		if f.seq > low {
 			cp := make([]byte, len(f.raw))
 			copy(cp, f.raw)
 			frames = append(frames, cp)
+			seqs = append(seqs, f.seq)
 			if f.seq > maxSent {
 				maxSent = f.seq
 			}
 		}
 	}
 	g.mu.Unlock()
+	errors.LogInfo(context.Background(), "mux resume: flush#", id, " ", g.gateLabel(), " peerRx ", peerRx, " fromSeq ", low+1, " toSeq ", maxSent, " frames ", len(frames))
 	if hasAck {
 		meta := FrameMetadata{SessionStatus: SessionStatusAck}
 		meta.Option.Set(OptionData)
@@ -513,15 +604,28 @@ func (g *carrierGate) flushSince(peerRx uint64) error {
 			return err
 		}
 	}
-	for _, raw := range frames {
+	written := low
+	for i, raw := range frames {
+		if g.targetEpoch.Load() != epoch {
+			break
+		}
 		if err := target.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(raw)}); err != nil {
+			g.markFlushed(written)
 			return err
 		}
+		written = seqs[i]
 	}
+	g.markFlushed(written)
+	return nil
+}
+
+// markFlushed records the highest seq known written to the live target.
+// Live forwards advance it too (see forwardRetained): coverage truth
+// stays the peer's rx, this only skips known-sent ranges.
+func (g *carrierGate) markFlushed(seq uint64) {
 	g.mu.Lock()
-	if maxSent > g.flushSeq {
-		g.flushSeq = maxSent
+	if seq > g.flushSeq {
+		g.flushSeq = seq
 	}
 	g.mu.Unlock()
-	return nil
 }
