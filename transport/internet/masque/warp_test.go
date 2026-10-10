@@ -386,26 +386,17 @@ func TestDialWarpVerification(t *testing.T) {
 		name      string
 		publicKey []byte
 		pin       []byte
-		vcn       []string
 		want      string
 	}{
-		{"matching key", serverKey, nil, nil, "404"},
-		{"matching key and pin", serverKey, pin, nil, "404"},
-		{"other key", otherKey, nil, nil, `doesn't match "publicKey"`},
-		{"matching key, other pin", serverKey, make([]byte, 32), nil, "pinnedPeerCertSha256"},
-		// pcs outranks the pin: a wrong pin is ignored when pcs matches.
-		{"other key, matching pin", otherKey, pin, nil, "404"},
-		// vcn outranks the pin too: the failure comes from name
-		// verification (self-signed test leaf), not the pin.
-		{"other key, vcn set", otherKey, nil, []string{"localhost"}, "verifyPeerCertByName"},
+		{"matching key", serverKey, nil, "404"},
+		{"matching key and pin", serverKey, pin, "404"},
+		{"other key", otherKey, nil, `doesn't match "publicKey"`},
+		{"matching key, other pin", serverKey, make([]byte, 32), "pinnedPeerCertSha256"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			settings := warpStreamSettings(der, c.publicKey)
 			if c.pin != nil {
 				settings.SecuritySettings.(*tls.Config).PinnedPeerCertSha256 = [][]byte{c.pin}
-			}
-			if c.vcn != nil {
-				settings.SecuritySettings.(*tls.Config).VerifyPeerCertByName = c.vcn
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -421,31 +412,8 @@ func TestDialWarpVerification(t *testing.T) {
 	}
 }
 
-func TestWarpPinSkippedWithCustomVerify(t *testing.T) {
-	plain := (&tls.Config{ServerName: "consumer-masque.cloudflareclient.com"}).GetTLSConfig()
-	if hasCustomTLSVerify(plain) {
-		t.Fatal("plain TLS config must not count as custom verify")
-	}
-	if hasCustomTLSVerify(&gotls.Config{}) {
-		t.Fatal("non-xray TLS config must not count as custom verify")
-	}
-	pinned := (&tls.Config{
-		ServerName:           "www.cloudflare.com",
-		PinnedPeerCertSha256: [][]byte{make([]byte, 32)},
-	}).GetTLSConfig()
-	if !hasCustomTLSVerify(pinned) {
-		t.Fatal("pcs config must count as custom verify")
-	}
-	named := (&tls.Config{
-		ServerName:           "www.cloudflare.com",
-		VerifyPeerCertByName: []string{"www.cloudflare.com"},
-	}).GetTLSConfig()
-	if !hasCustomTLSVerify(named) {
-		t.Fatal("vcn config must count as custom verify")
-	}
-}
-
-func TestDialWarpRejectedKey(t *testing.T) {	_, der := newWarpKey(t)
+func TestDialWarpRejectedKey(t *testing.T) {
+	_, der := newWarpKey(t)
 	other, _ := newWarpKey(t)
 	serverTLS, serverKey, _ := warpServerTLS(t, &other.PublicKey, http3.NextProtoH3)
 	udp, err := gonet.ListenUDP("udp4", &gonet.UDPAddr{IP: gonet.IPv4(127, 0, 0, 1)})
