@@ -822,15 +822,9 @@ func (c *MasqueConfig) Build() (proto.Message, error) {
 		if err != nil {
 			return nil, errors.New(`invalid "privateKey" in "warp"`).Base(err)
 		}
-		// publicKey is optional: with a custom SNI the endpoint serves
-		// a rotating CDN leaf, so no fixed SPKI pin fits. Leave it empty
-		// and verify via CA and/or tlsSettings pinnedPeerCertSha256.
-		var publicKey []byte
-		if strings.TrimSpace(c.Warp.PublicKey) != "" {
-			publicKey, err = parseWarpPublicKey(c.Warp.PublicKey)
-			if err != nil {
-				return nil, errors.New(`invalid "publicKey" in "warp"`).Base(err)
-			}
+		publicKey, err := parseWarpPublicKey(c.Warp.PublicKey)
+		if err != nil {
+			return nil, errors.New(`invalid "publicKey" in "warp"`).Base(err)
 		}
 		address, err := parseWarpAddress(c.Warp.Address)
 		if err != nil {
