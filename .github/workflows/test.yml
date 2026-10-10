@@ -70,6 +70,8 @@ jobs:
         run: go run ./infra/vformat/main.go -mode check -pwd ./
       - name: Check muxtrace Build Tag
         run: go vet -tags muxtrace ./common/mux/
+      - name: Test muxtrace Build Tag
+        run: go test -tags muxtrace ./common/mux/ -run 'TestRxState|TestClientReadLoop|TestResumeE2EMidPayload|TestResumeE2EStaleReaderGen' -count=1
 
   test:
     needs: check-assets

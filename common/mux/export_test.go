@@ -125,6 +125,14 @@ func WorkerCurrentGenForTest(w *ClientWorker) uint64 {
 	return w.currentGen()
 }
 
+func WorkerCurrentDownReaderGenForTest(w *ClientWorker) (*buf.BufferedReader, uint64) {
+	return w.currentDownReaderGen()
+}
+
+func WorkerAttachCarrierSwapForTest(w *ClientWorker, upW buf.Writer, downR buf.Reader) {
+	w.attachCarrierSwap(upW, downR)
+}
+
 func WorkerRxValueForTest(w *ClientWorker) uint64 {
 	return w.rx.Value()
 }
