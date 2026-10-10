@@ -127,6 +127,8 @@ func (m *ClientWorker) IsSuspended() bool {
 }
 
 // attachCarrier records the live pipe ends and points the gate at them.
+// Initial pairing: no older reader exists, so the generation stays at
+// the rx initial value (paired here, not bumped).
 func (m *ClientWorker) attachCarrier(upW buf.Writer, downR buf.Reader) {
 	if m.gate != nil {
 		m.gate.swapTarget(upW)
@@ -135,6 +137,7 @@ func (m *ClientWorker) attachCarrier(upW buf.Writer, downR buf.Reader) {
 	m.upPipe = upW
 	m.downPipe = downR
 	m.downReader = &buf.BufferedReader{Reader: downR}
+	m.downGen = m.rx.generation()
 	m.pipeMu.Unlock()
 }
 
@@ -315,26 +318,27 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 }
 
 // attachCarrierSwap swaps pipes on rebind: interrupt the dead ends (stored
-// bytes make discards replayable), install the new ones, and bump the pipe
-// generation so waitRebind wakes for the new downlink.
+// bytes make discards replayable), install the new ones, and retire the
+// old reader generation so waitRebind wakes for the new downlink.
 func (m *ClientWorker) attachCarrierSwap(upW buf.Writer, downR buf.Reader) {
 	m.pipeMu.Lock()
 	oldUp, oldDown := m.upPipe, m.downPipe
 	m.upPipe = upW
 	m.downPipe = downR
 	m.downReader = &buf.BufferedReader{Reader: downR}
+	// Pair the new reader with a fresh generation atomically: the swap,
+	// the unseal and the retirement are one step, so no frame can admit
+	// against a half-installed carrier.
+	m.downGen = m.rx.newGeneration()
 	m.pipeMu.Unlock()
-	m.pipeGen.Add(1)
 	common.Interrupt(oldUp)
 	common.Interrupt(oldDown)
 	if m.gate != nil {
 		m.gate.swapTarget(upW)
 	}
-	// The new downlink (and its Resume reply) is installed: retire the
-	// old reader generation and reopen counting so the fresh carrier's
-	// frames admit again. Frames the stale reader already buffered can
-	// never admit again (generation mismatch) — the peer replays them.
-	m.rx.newGeneration()
+	// Frames the stale reader already buffered can never admit again
+	// (generation mismatch) — the peer replays them. See readLoop and
+	// admit.
 }
 
 // enterSuspend parks forwarding once; records the deadline on first entry.

@@ -15,6 +15,9 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/pipe"
 )
 
 func TestResumePolicyDefaults(t *testing.T) {
@@ -931,5 +934,72 @@ func TestRxStateAdmitGeneration(t *testing.T) {
 	}
 	if n, ok := mux.RxAdmitForTest(r, 1, true, 9, mb); !ok || n != 2 {
 		t.Fatalf("current-generation admit = (%d, %v), want (2, true)", n, ok)
+	}
+}
+
+
+func TestClientReadLoopExitsOnStaleGen(t *testing.T) {
+	downR, _ := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	_, upW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	worker, err := mux.NewClientWorkerWithResume(
+		transport.Link{Reader: downR, Writer: upW},
+		mux.ClientStrategy{MaxConcurrency: 8},
+		mux.DefaultResumePolicy(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	defer mux.HsResetForTest()
+	liveGen := mux.WorkerCurrentGenForTest(worker)
+	staleGen := liveGen + 1000
+	if staleGen == liveGen {
+		t.Fatal("stale generation must differ from live")
+	}
+	before := mux.WorkerRxValueForTest(worker)
+	// Isolated carrier with a complete Keep frame waiting: the stale
+	// reader must be dropped at the loop top without consuming
+	// anything — the fresh generation owns the carrier and the peer
+	// will replay this frame. Isolated from the worker's live pipe so
+	// the background fetchOutput cannot race the probe.
+	staleR, staleW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	const staleSID uint16 = 77
+	meta := mux.FrameMetadata{SessionID: staleSID, SessionStatus: mux.SessionStatusKeep, Option: mux.OptionData}
+	frame := buf.New()
+	if err := meta.WriteTo(frame); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("stale-probe")
+	if _, err := serial.WriteUint16(frame, uint16(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	pb := buf.New()
+	if _, err := pb.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := staleW.WriteMultiBuffer(buf.MultiBuffer{frame, pb}); err != nil {
+		t.Fatal(err)
+	}
+	// Close the writer: the frame stays buffered, and a reader that
+	// consumed it would see EOF on the next frame instead of hanging.
+	if err := staleW.Close(); err != nil {
+		t.Fatal(err)
+	}
+	staleReader := &buf.BufferedReader{Reader: staleR}
+	if mux.WorkerReadLoopForTest(worker, staleReader, staleGen) {
+		t.Fatal("stale-generation readLoop must return false, not done")
+	}
+	if got := mux.WorkerRxValueForTest(worker); got != before {
+		t.Fatalf("stale reader admitted %d frames, want none", got-before)
+	}
+	// The frame must still be intact: loop-top exit consumes nothing.
+	// If the stale reader had parsed past the guard, this meta would be
+	// gone (EOF, since the writer is closed) or desynced.
+	var gotMeta mux.FrameMetadata
+	if err := gotMeta.Unmarshal(staleReader, false); err != nil {
+		t.Fatalf("stale frame was consumed, want it preserved: %v", err)
+	}
+	if gotMeta.SessionID != staleSID || gotMeta.SessionStatus != mux.SessionStatusKeep {
+		t.Fatalf("preserved frame = sid %d status %d, want sid %d Keep", gotMeta.SessionID, gotMeta.SessionStatus, staleSID)
 	}
 }

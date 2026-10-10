@@ -227,11 +227,13 @@ type ClientWorker struct {
 
 	pipeMu     sync.Mutex
 	downReader *buf.BufferedReader
+	// downGen is the rx generation paired with downReader, stored
+	// together under pipeMu: it is newGeneration()'s return value, the
+	// single source for reader identity (a swap that installs a new
+	// reader always retires the old generation with it).
+	downGen    uint64
 	downPipe   buf.Reader
 	upPipe     buf.Writer
-	// pipeGen bumps on every carrier swap so waitRebind wakes for the new
-	// downlink (which carries the Resume reply that clears the suspend).
-	pipeGen atomic.Uint64
 	// banKey scopes the v2 fallback ban to this outbound tag + server.
 	banKey string
 	// suppressedEnds counts reactive Ends withheld for unknown sessions
@@ -793,12 +795,12 @@ func (m *ClientWorker) sendTrailingAck() {
 }
 
 // currentDownReaderGen returns the live downlink reader together with its
-// pipe generation, atomically: a swap between separate calls could hand
+// rx generation, atomically: a swap between separate calls could hand
 // fetchOutput a reader that no longer matches the generation it compares.
 func (m *ClientWorker) currentDownReaderGen() (*buf.BufferedReader, uint64) {
 	m.pipeMu.Lock()
 	defer m.pipeMu.Unlock()
-	return m.downReader, m.pipeGen.Load()
+	return m.downReader, m.downGen
 }
 
 func (m *ClientWorker) fetchOutput() {
@@ -818,7 +820,7 @@ func (m *ClientWorker) fetchOutput() {
 		// A swap landed while reading: the new downlink (and its Resume
 		// reply) is already installed — read it immediately instead of
 		// waiting out a poll with a stale generation baseline.
-		if m.pipeGen.Load() != gen {
+		if m.currentGen() != gen {
 			continue
 		}
 		// Suspended: park until rebind swaps in a fresh reader, the
@@ -838,15 +840,26 @@ type frameReadError struct{ err error }
 func (e *frameReadError) Error() string { return e.err.Error() }
 func (e *frameReadError) Unwrap() error { return e.err }
 
+// currentGen returns the live rx generation (the newest installed
+// downlink's). Called wherever fetchOutput compares against the
+// generation it read earlier.
+func (m *ClientWorker) currentGen() uint64 {
+	m.pipeMu.Lock()
+	defer m.pipeMu.Unlock()
+	return m.downGen
+}
+
 // readLoop processes frames until the carrier errors. True = worker done.
-// gen is the pipe generation this reader belongs to: if a swap landed
+// gen is the rx generation this reader belongs to: if a swap landed
 // (stale reader with buffered leftovers), stop at once so fetchOutput
 // switches to the new reader instead of parsing dead bytes the new
 // generation must replay.
 func (m *ClientWorker) readLoop(reader *buf.BufferedReader, gen uint64) bool {
 	var meta FrameMetadata
 	for {
-		_ = gen
+		if m.currentGen() != gen {
+			return false
+		}
 		err := meta.Unmarshal(reader, false)
 		if err != nil {
 			if errors.Cause(err) != io.EOF {
@@ -890,19 +903,19 @@ func (m *ClientWorker) readLoop(reader *buf.BufferedReader, gen uint64) bool {
 
 // waitRebind parks fetchOutput until a rebind swaps the reader, the worker
 // closes, or the suspend episode times out. False = give up. gen is the
-// pipe generation the caller just read: a swap between the caller's check
+// rx generation the caller just read: a swap between the caller's check
 // and this capture would otherwise miss one reply and cost that attempt.
-// The generation check is the point: attachCarrierSwap bumps pipeGen on
-// every rebind, so fetchOutput picks up the new downlink and reads the
-// server's Resume reply (which clears the suspend). Waiting on
-// !IsSuspended alone would deadlock, since only the reply reader can
+// The generation check is the point: attachCarrierSwap retires the old
+// generation on every rebind, so fetchOutput picks up the new downlink
+// and reads the server's Resume reply (which clears the suspend). Waiting
+// on !IsSuspended alone would deadlock, since only the reply reader can
 // clear it.
 func (m *ClientWorker) waitRebind(gen uint64) bool {
 	for {
 		if m.done.Done() {
 			return false
 		}
-		if !m.IsSuspended() || m.pipeGen.Load() != gen {
+		if !m.IsSuspended() || m.currentGen() != gen {
 			return true
 		}
 		if time.Now().After(m.suspendDeadline()) {

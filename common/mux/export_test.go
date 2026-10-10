@@ -117,6 +117,18 @@ func RxNewGenerationForTest(r *RxStateForTest) uint64 {
 	return r.newGeneration()
 }
 
+func WorkerReadLoopForTest(w *ClientWorker, r *buf.BufferedReader, gen uint64) bool {
+	return w.readLoop(r, gen)
+}
+
+func WorkerCurrentGenForTest(w *ClientWorker) uint64 {
+	return w.currentGen()
+}
+
+func WorkerRxValueForTest(w *ClientWorker) uint64 {
+	return w.rx.Value()
+}
+
 func HsLenForTest() int {
 	hsMu.Lock()
 	defer hsMu.Unlock()

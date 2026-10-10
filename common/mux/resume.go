@@ -273,12 +273,11 @@ func (r *rxState) newGeneration() uint64 {
 	return r.gen
 }
 
-// unseal reopens counting at the current value. Must hold no other
-// assumption: unlike resume(Value()), it cannot lose a concurrent admit.
-func (r *rxState) unseal() {
+// generation returns the current rx generation.
+func (r *rxState) generation() uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.sealed = false
+	return r.gen
 }
 
 func (r *rxState) Value() uint64 {

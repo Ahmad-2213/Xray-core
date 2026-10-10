@@ -68,6 +68,8 @@ jobs:
           cache: false
       - name: Check Format
         run: go run ./infra/vformat/main.go -mode check -pwd ./
+      - name: Check muxtrace Build Tag
+        run: go vet -tags muxtrace ./common/mux/
 
   test:
     needs: check-assets
