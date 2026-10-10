@@ -491,6 +491,7 @@ func runChurn(args []string) int {
 	target := fs.String("target", "127.0.0.1:9000", "")
 	dur := fs.Duration("dur", 120*time.Second, "")
 	rate := fs.Int("rate", 20, "new connections per second")
+	slow := fs.Duration("slow", 0, "sleep per 8KB chunk")
 	fs.Parse(args)
 	var ok, cerr, bad atomic.Int64
 	var wg sync.WaitGroup
@@ -526,6 +527,9 @@ func runChurn(args []string) int {
 					cerr.Add(1)
 					return
 				}
+				if *slow > 0 {
+					time.Sleep(*slow)
+				}
 				off += n
 			}
 			for off := uint64(0); off < uint64(down); {
@@ -533,6 +537,9 @@ func runChurn(args []string) int {
 				if _, err := io.ReadFull(c, b[:n]); err != nil {
 					cerr.Add(1)
 					return
+				}
+				if *slow > 0 {
+					time.Sleep(*slow)
 				}
 				if verify(b[:n], saltDown, off) >= 0 {
 					bad.Add(1)
