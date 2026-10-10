@@ -964,28 +964,26 @@ func TestClientReadLoopExitsAfterRealSwap(t *testing.T) {
 	if !worker.Dispatch(ctx, &transport.Link{Reader: appUpR, Writer: appDnW}) {
 		t.Fatal("dispatch rejected")
 	}
-
-	// Seal first: whatever the background fetchOutput is doing, a sealed
-	// admit drops uncounted. Removed: preloading the live reader races
-	// fetchOutput's fresh start (observed: it ate a frame mid-append),
-	// so detach first instead — see below. No seal needed: before the
-	// first swap nothing is buffered, after it every old-generation
-	// admit mismatches.
 	before := mux.WorkerRxValueForTest(worker)
 
-	oldReader, oldGen := mux.WorkerCurrentDownReaderGenForTest(worker)
+	// The genuine pre-swap generation of the live downlink.
+	_, oldGen := mux.WorkerCurrentDownReaderGenForTest(worker)
 
-	// Detach the old reader first with a real swap: from here on the
-	// background fetchOutput can only ever fetch the new reader, so the
-	// preload below races nobody. (Preloading the live reader directly
-	// is racy: a fetchOutput that first runs during the appends would
-	// consume them before any swap retires the generation.)
-	newDownR1, _ := pipe.New(pipe.WithSizeLimit(64 * 1024))
-	_, newUpW1 := pipe.New(pipe.WithSizeLimit(64 * 1024))
-	mux.WorkerAttachCarrierSwapForTest(worker, newUpW1, newDownR1)
-
-	// Preload the retired reader with complete Keep frames for the live
-	// session, as a mid-delivery cut would leave them buffered.
+	// Preload a dedicated stale reader with complete Keep frames for the
+	// live session, as a mid-delivery cut would leave them buffered in
+	// the retired reader. This is deliberately NOT the worker's live
+	// downReader: sharing its Buffer with the background fetchOutput is
+	// a proven race (a fetchOutput that first runs during the appends
+	// consumes them, and -race flags the Buffer header itself). The
+	// retired (reader, generation) pair below is still genuine, and the
+	// loop-top mechanism under test — check generation before the first
+	// Unmarshal — is identical. The closed pipe behind it only makes a
+	// drained reader report EOF instead of hanging.
+	staleDownR, staleDownW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	if err := staleDownW.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stale := &buf.BufferedReader{Reader: staleDownR}
 	const frames = 3
 	payload := []byte("swap-probe")
 	for i := 0; i < frames; i++ {
@@ -1001,19 +999,24 @@ func TestClientReadLoopExitsAfterRealSwap(t *testing.T) {
 		if _, err := pb.Write(payload); err != nil {
 			t.Fatal(err)
 		}
-		oldReader.Buffer = append(oldReader.Buffer, frame, pb)
+		stale.Buffer = append(stale.Buffer, frame, pb)
 	}
-	preloaded := oldReader.BufferedBytes()
+	preloaded := stale.BufferedBytes()
 
-	// The exercised transition: a second real swap retires the detached
-	// reader's generation ahead of the preloaded bytes; the peer replays
-	// these frames on the fresh carrier.
-	newDownR2, newDownW2 := pipe.New(pipe.WithSizeLimit(64 * 1024))
-	defer newDownW2.Close()
-	_, newUpW2 := pipe.New(pipe.WithSizeLimit(64 * 1024))
-	mux.WorkerAttachCarrierSwapForTest(worker, newUpW2, newDownR2)
+	// The real transition on the real worker: install a fresh carrier so
+	// oldGen genuinely retires; the peer would replay these frames there.
+	newDownR, newDownW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	defer newDownW.Close()
+	_, newUpW := pipe.New(pipe.WithSizeLimit(64 * 1024))
+	mux.WorkerAttachCarrierSwapForTest(worker, newUpW, newDownR)
+	if _, curGen := mux.WorkerCurrentDownReaderGenForTest(worker); curGen == oldGen {
+		t.Fatal("swap must retire the reader generation")
+	}
 
-	if mux.WorkerReadLoopForTest(worker, oldReader, oldGen) {
+	// A broken loop-top check would Unmarshal and consume these frames
+	// through the admit-drop path, so preservation catches it even
+	// though the gen-mismatched admit keeps rx flat either way.
+	if mux.WorkerReadLoopForTest(worker, stale, oldGen) {
 		t.Fatal("stale-reader readLoop must return false, not done")
 	}
 	if got := mux.WorkerRxValueForTest(worker); got != before {
@@ -1025,12 +1028,12 @@ func TestClientReadLoopExitsAfterRealSwap(t *testing.T) {
 		buf.ReleaseMulti(mb)
 		t.Fatalf("stale reader delivered %d bytes, want none", mb.Len())
 	}
-	// Frames remain unconsumed in the old reader.
-	if got := oldReader.BufferedBytes(); got != preloaded {
-		t.Fatalf("old reader holds %d bytes, want untouched %d", got, preloaded)
+	// Frames remain unconsumed in the stale reader.
+	if got := stale.BufferedBytes(); got != preloaded {
+		t.Fatalf("stale reader holds %d bytes, want untouched %d", got, preloaded)
 	}
 	var gotMeta mux.FrameMetadata
-	if err := gotMeta.Unmarshal(oldReader, false); err != nil {
+	if err := gotMeta.Unmarshal(stale, false); err != nil {
 		t.Fatalf("stale frame was consumed, want it preserved: %v", err)
 	}
 	if gotMeta.SessionID != 1 || gotMeta.SessionStatus != mux.SessionStatusKeep {

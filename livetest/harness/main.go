@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -95,7 +97,7 @@ func dump64(p []byte, salt, off uint64) string {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: live sink|relay|check [flags]")
+		fmt.Println("usage: live sink|relay|check|churn [flags]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -105,6 +107,8 @@ func main() {
 		runRelay(os.Args[2:])
 	case "check":
 		os.Exit(runCheck(os.Args[2:]))
+	case "churn":
+		os.Exit(runChurn(os.Args[2:]))
 	default:
 		os.Exit(2)
 	}
@@ -135,6 +139,10 @@ func sinkConn(c net.Conn, id int64) {
 	defer c.Close()
 	hdr := make([]byte, 1)
 	if _, err := io.ReadFull(c, hdr); err != nil {
+		return
+	}
+	if hdr[0] == 2 {
+		sinkFinite(c)
 		return
 	}
 	bulk := hdr[0] == 1
@@ -440,6 +448,104 @@ func runCheck(args []string) int {
 	}
 	wg.Wait()
 	if failed.Load() {
+		fmt.Println("RESULT FAIL")
+		return 1
+	}
+	fmt.Println("RESULT PASS")
+	return 0
+}
+
+// ---------- churn: many short finite connections, New/End/half-close ----------
+
+func sinkFinite(c net.Conn) {
+	var h [8]byte
+	if _, err := io.ReadFull(c, h[:]); err != nil {
+		return
+	}
+	up, down := uint64(binary.BigEndian.Uint32(h[:4])), uint64(binary.BigEndian.Uint32(h[4:]))
+	b := make([]byte, 8192)
+	for off := uint64(0); off < up; {
+		n := min(uint64(len(b)), up-off)
+		if _, err := io.ReadFull(c, b[:n]); err != nil {
+			return
+		}
+		if i := verify(b[:n], saltUp, off); i >= 0 {
+			fmt.Printf("%s SINK MISMATCH finite offset=%d\n", ts(), off+uint64(i))
+			return
+		}
+		off += n
+	}
+	for off := uint64(0); off < down; {
+		n := min(uint64(len(b)), down-off)
+		fill(b[:n], saltDown, off)
+		if _, err := c.Write(b[:n]); err != nil {
+			return
+		}
+		off += n
+	}
+}
+
+func runChurn(args []string) int {
+	fs := flag.NewFlagSet("churn", flag.ExitOnError)
+	socks := fs.String("socks", "127.0.0.1:10808", "")
+	target := fs.String("target", "127.0.0.1:9000", "")
+	dur := fs.Duration("dur", 120*time.Second, "")
+	rate := fs.Int("rate", 20, "new connections per second")
+	fs.Parse(args)
+	var ok, cerr, bad atomic.Int64
+	var wg sync.WaitGroup
+	rng := rand.New(rand.NewSource(1))
+	tick := time.NewTicker(time.Second / time.Duration(*rate))
+	defer tick.Stop()
+	for end := time.Now().Add(*dur); time.Now().Before(end); {
+		<-tick.C
+		up, down := uint32(100+rng.Intn(100000)), uint32(100+rng.Intn(200000))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := socksDial(*socks, *target)
+			if err != nil {
+				cerr.Add(1)
+				return
+			}
+			defer c.Close()
+			c.SetDeadline(time.Now().Add(60 * time.Second))
+			h := make([]byte, 9)
+			h[0] = 2
+			binary.BigEndian.PutUint32(h[1:], up)
+			binary.BigEndian.PutUint32(h[5:], down)
+			if _, err := c.Write(h); err != nil {
+				cerr.Add(1)
+				return
+			}
+			b := make([]byte, 8192)
+			for off := uint64(0); off < uint64(up); {
+				n := min(uint64(len(b)), uint64(up)-off)
+				fill(b[:n], saltUp, off)
+				if _, err := c.Write(b[:n]); err != nil {
+					cerr.Add(1)
+					return
+				}
+				off += n
+			}
+			for off := uint64(0); off < uint64(down); {
+				n := min(uint64(len(b)), uint64(down)-off)
+				if _, err := io.ReadFull(c, b[:n]); err != nil {
+					cerr.Add(1)
+					return
+				}
+				if verify(b[:n], saltDown, off) >= 0 {
+					bad.Add(1)
+					return
+				}
+				off += n
+			}
+			ok.Add(1)
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("%s churn ok=%d connErr=%d mismatch=%d\n", ts(), ok.Load(), cerr.Load(), bad.Load())
+	if bad.Load() > 0 || ok.Load() == 0 {
 		fmt.Println("RESULT FAIL")
 		return 1
 	}
