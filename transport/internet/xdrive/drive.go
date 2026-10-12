@@ -623,6 +623,12 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 			entries []Entry
 			at      time.Time
 		}{entries: entries, at: time.Now()}
+		for len(s.lists) > 256 {
+			for k := range s.lists {
+				delete(s.lists, k)
+				break
+			}
+		}
 		s.listMu.Unlock()
 	}
 	s.flightMu.Lock()
