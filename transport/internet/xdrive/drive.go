@@ -384,6 +384,25 @@ func (s *driveStorage) resolveID(ctx context.Context, flat string) (string, erro
 	return "", errNotFound
 }
 
+func (s *driveStorage) probe(ctx context.Context, name string) (Entry, error) {
+	flat := flatten(name)
+	found, err := s.query(ctx, "name = '"+quoteDriveValue(flat)+"'")
+	if err != nil {
+		return Entry{}, err
+	}
+	file, ok := found[flat]
+	if !ok {
+		return Entry{}, errNotFound
+	}
+	entry := Entry{Name: name[strings.LastIndexByte(name, '/')+1:]}
+	if file.description != "" {
+		if data, err := base64.StdEncoding.DecodeString(file.description); err == nil {
+			entry.Inline = data
+		}
+	}
+	return entry, nil
+}
+
 func (s *driveStorage) Put(ctx context.Context, name string, data []byte) error {
 	if len(data) <= driveInlineLimit {
 		return s.putInline(ctx, name, data)

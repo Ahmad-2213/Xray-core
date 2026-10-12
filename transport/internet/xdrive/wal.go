@@ -292,9 +292,21 @@ func (r *walReader) run() {
 }
 
 func (r *walReader) poll() (advanced, eof bool, err error) {
-	listed, err := r.storage.List(r.ctx, r.prefix)
-	if err != nil {
-		return false, false, err
+	var listed []Entry
+	if p, ok := r.storage.(interface {
+		probe(context.Context, string) (Entry, error)
+	}); ok {
+		if e, perr := p.probe(r.ctx, objectName(r.prefix, r.seq, segSuffix)); perr == nil {
+			listed = []Entry{e}
+		} else if perr != errNotFound {
+			return false, false, perr
+		}
+	}
+	if listed == nil {
+		listed, err = r.storage.List(r.ctx, r.prefix)
+		if err != nil {
+			return false, false, err
+		}
 	}
 	if len(listed) == 0 {
 		return false, false, nil
