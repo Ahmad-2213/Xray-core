@@ -22,21 +22,22 @@ const (
 )
 
 type Config struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	RemoteFolder      string                 `protobuf:"bytes,1,opt,name=remote_folder,json=remoteFolder,proto3" json:"remote_folder,omitempty"`
-	Service           string                 `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
-	Secrets           []string               `protobuf:"bytes,3,rep,name=secrets,proto3" json:"secrets,omitempty"`
-	SegmentBytes      uint32                 `protobuf:"varint,4,opt,name=segment_bytes,json=segmentBytes,proto3" json:"segment_bytes,omitempty"`
-	FlushIntervalMs   uint32                 `protobuf:"varint,5,opt,name=flush_interval_ms,json=flushIntervalMs,proto3" json:"flush_interval_ms,omitempty"`
-	PollIntervalMs    uint32                 `protobuf:"varint,6,opt,name=poll_interval_ms,json=pollIntervalMs,proto3" json:"poll_interval_ms,omitempty"`
-	MaxPollIntervalMs uint32                 `protobuf:"varint,7,opt,name=max_poll_interval_ms,json=maxPollIntervalMs,proto3" json:"max_poll_interval_ms,omitempty"`
-	SessionTtlSeconds uint32                 `protobuf:"varint,8,opt,name=session_ttl_seconds,json=sessionTtlSeconds,proto3" json:"session_ttl_seconds,omitempty"`
-	Concurrency       uint32                 `protobuf:"varint,9,opt,name=concurrency,proto3" json:"concurrency,omitempty"`
-	EagerWindowMs     uint32                 `protobuf:"varint,10,opt,name=eager_window_ms,json=eagerWindowMs,proto3" json:"eager_window_ms,omitempty"`
-	HoleTimeoutMs     uint32                 `protobuf:"varint,11,opt,name=hole_timeout_ms,json=holeTimeoutMs,proto3" json:"hole_timeout_ms,omitempty"`
-	Template          string                 `protobuf:"bytes,12,opt,name=template,proto3" json:"template,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	RemoteFolder        string                 `protobuf:"bytes,1,opt,name=remote_folder,json=remoteFolder,proto3" json:"remote_folder,omitempty"`
+	Service             string                 `protobuf:"bytes,2,opt,name=service,proto3" json:"service,omitempty"`
+	Secrets             []string               `protobuf:"bytes,3,rep,name=secrets,proto3" json:"secrets,omitempty"`
+	SegmentBytes        uint32                 `protobuf:"varint,4,opt,name=segment_bytes,json=segmentBytes,proto3" json:"segment_bytes,omitempty"`
+	FlushIntervalMs     uint32                 `protobuf:"varint,5,opt,name=flush_interval_ms,json=flushIntervalMs,proto3" json:"flush_interval_ms,omitempty"`
+	PollIntervalMs      uint32                 `protobuf:"varint,6,opt,name=poll_interval_ms,json=pollIntervalMs,proto3" json:"poll_interval_ms,omitempty"`
+	MaxPollIntervalMs   uint32                 `protobuf:"varint,7,opt,name=max_poll_interval_ms,json=maxPollIntervalMs,proto3" json:"max_poll_interval_ms,omitempty"`
+	SessionTtlSeconds   uint32                 `protobuf:"varint,8,opt,name=session_ttl_seconds,json=sessionTtlSeconds,proto3" json:"session_ttl_seconds,omitempty"`
+	Concurrency         uint32                 `protobuf:"varint,9,opt,name=concurrency,proto3" json:"concurrency,omitempty"`
+	EagerWindowMs       uint32                 `protobuf:"varint,10,opt,name=eager_window_ms,json=eagerWindowMs,proto3" json:"eager_window_ms,omitempty"`
+	HoleTimeoutMs       uint32                 `protobuf:"varint,11,opt,name=hole_timeout_ms,json=holeTimeoutMs,proto3" json:"hole_timeout_ms,omitempty"`
+	Template            string                 `protobuf:"bytes,12,opt,name=template,proto3" json:"template,omitempty"`
+	SegmentGrowthFactor float64                `protobuf:"fixed64,13,opt,name=segment_growth_factor,json=segmentGrowthFactor,proto3" json:"segment_growth_factor,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *Config) Reset() {
@@ -153,11 +154,18 @@ func (x *Config) GetTemplate() string {
 	return ""
 }
 
+func (x *Config) GetSegmentGrowthFactor() float64 {
+	if x != nil {
+		return x.SegmentGrowthFactor
+	}
+	return 0
+}
+
 var File_transport_internet_xdrive_config_proto protoreflect.FileDescriptor
 
 const file_transport_internet_xdrive_config_proto_rawDesc = "" +
 	"\n" +
-	"&transport/internet/xdrive/config.proto\x12\x1exray.transport.internet.xdrive\"\xcb\x03\n" +
+	"&transport/internet/xdrive/config.proto\x12\x1exray.transport.internet.xdrive\"\xff\x03\n" +
 	"\x06Config\x12#\n" +
 	"\rremote_folder\x18\x01 \x01(\tR\fremoteFolder\x12\x18\n" +
 	"\aservice\x18\x02 \x01(\tR\aservice\x12\x18\n" +
@@ -171,7 +179,7 @@ const file_transport_internet_xdrive_config_proto_rawDesc = "" +
 	"\x0feager_window_ms\x18\n" +
 	" \x01(\rR\reagerWindowMs\x12&\n" +
 	"\x0fhole_timeout_ms\x18\v \x01(\rR\rholeTimeoutMs\x12\x1a\n" +
-	"\btemplate\x18\f \x01(\tR\btemplateB5Z3github.com/xtls/xray-core/transport/internet/xdriveb\x06proto3"
+	"\btemplate\x18\f \x01(\tR\btemplate\x12\x32\n\x15segment_growth_factor\x18\r \x01(\x01R\x13segmentGrowthFactorB5Z3github.com/xtls/xray-core/transport/internet/xdriveb\x06proto3"
 
 var (
 	file_transport_internet_xdrive_config_proto_rawDescOnce sync.Once

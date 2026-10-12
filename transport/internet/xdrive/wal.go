@@ -155,9 +155,11 @@ func (w *walWriter) flushLocked() error {
 
 	if w.segBytes < 4*1024*1024 {
 		if d, ok := w.storage.(interface{ deleteAvg() time.Duration }); ok && d.deleteAvg() < 2*time.Second {
-			w.segBytes *= 2
-			if w.segBytes > 4*1024*1024 {
-				w.segBytes = 4 * 1024 * 1024
+			if n := int(float64(w.segBytes) * w.growth); n > w.segBytes {
+				w.segBytes = n
+				if w.segBytes > 4*1024*1024 {
+					w.segBytes = 4 * 1024 * 1024
+				}
 			}
 		}
 	}

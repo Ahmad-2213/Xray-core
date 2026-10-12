@@ -25,6 +25,7 @@ type params struct {
 	holeTimeout     time.Duration
 	sessionTTL      time.Duration
 	concurrency     int
+	growth          float64
 }
 
 func millis(value uint32, fallback time.Duration) time.Duration {
@@ -51,6 +52,13 @@ func capped(value uint32, fallback, limit int) int {
 	return int(value)
 }
 
+func growthOrDefault(value float64) float64 {
+	if value <= 0 {
+		return 2
+	}
+	return value
+}
+
 func paramsFromConfig(c *Config) params {
 	p := params{
 		segmentBytes:    capped(c.SegmentBytes, defaultSegmentBytes, maxSegmentBytes),
@@ -61,6 +69,7 @@ func paramsFromConfig(c *Config) params {
 		holeTimeout:     millis(c.HoleTimeoutMs, defaultHoleTimeout),
 		sessionTTL:      seconds(c.SessionTtlSeconds, defaultSessionTTL),
 		concurrency:     capped(c.Concurrency, defaultConcurrency, maxConcurrency),
+		growth:          growthOrDefault(c.SegmentGrowthFactor),
 	}
 	if p.maxPollInterval < p.minPollInterval {
 		p.maxPollInterval = p.minPollInterval
