@@ -150,13 +150,17 @@ func (w *walWriter) flushLocked() error {
 	w.lastSize = len(w.buf)
 	w.held = 0
 
+	w.wg.Add(1)
+	w.mu.Unlock()
 	select {
 	case w.sem <- struct{}{}:
 	case <-w.ctx.Done():
+		w.mu.Lock()
+		w.wg.Done()
 		return w.ctx.Err()
 	}
-	w.wg.Add(1)
 	go w.upload(seq, chunk)
+	w.mu.Lock()
 	return nil
 }
 
