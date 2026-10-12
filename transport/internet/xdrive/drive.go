@@ -542,7 +542,7 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 		return err
 	}
 
-	if !strings.Contains(flat, flatSeparator) {
+	if strings.HasSuffix(name, ".seg") || strings.HasSuffix(name, ".end") || strings.HasSuffix(name, ".err") {
 		return nil
 	}
 
