@@ -56,6 +56,12 @@ type driveStorage struct {
 
 	idMu sync.Mutex
 	ids  map[string]string
+
+	listMu sync.Mutex
+	lists  map[string]struct {
+		entries []Entry
+		at      time.Time
+	}
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -83,6 +89,10 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		backoff:      driveInitialBackoff,
 		inflight:     make(chan struct{}, driveMaxInflight),
 		ids:          make(map[string]string),
+		lists:        make(map[string]struct {
+			entries []Entry
+			at      time.Time
+		}),
 	}, nil
 }
 
@@ -522,6 +532,10 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 		return err
 	}
 
+	if strings.HasSuffix(name, ".seg") || strings.HasSuffix(name, ".end") || strings.HasSuffix(name, ".err") {
+		return nil
+	}
+
 	children, err := s.query(ctx, "name contains '"+quoteDriveValue(flat+flatSeparator)+"'")
 	if err != nil {
 		return err
@@ -536,6 +550,15 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 
 func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error) {
 	flat := flatten(prefix) + flatSeparator
+
+	s.listMu.Lock()
+	if c, ok := s.lists[flat]; ok && time.Since(c.at) < 40*time.Millisecond {
+		entries := make([]Entry, len(c.entries))
+		copy(entries, c.entries)
+		s.listMu.Unlock()
+		return entries, nil
+	}
+	s.listMu.Unlock()
 
 	found, err := s.query(ctx, "name contains '"+quoteDriveValue(flat)+"'")
 	if err != nil {
@@ -567,6 +590,12 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 		}
 		entries = append(entries, entry)
 	}
+	s.listMu.Lock()
+	s.lists[flat] = struct {
+		entries []Entry
+		at      time.Time
+	}{entries: entries, at: time.Now()}
+	s.listMu.Unlock()
 	return entries, nil
 }
 

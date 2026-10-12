@@ -150,6 +150,11 @@ func (w *walWriter) flushLocked() error {
 	w.lastSize = len(w.buf)
 	w.held = 0
 
+	select {
+	case w.sem <- struct{}{}:
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	}
 	w.wg.Add(1)
 	go w.upload(seq, chunk)
 	return nil
@@ -157,12 +162,6 @@ func (w *walWriter) flushLocked() error {
 
 func (w *walWriter) upload(seq int64, chunk []byte) {
 	defer w.wg.Done()
-
-	select {
-	case w.sem <- struct{}{}:
-	case <-w.ctx.Done():
-		return
-	}
 	defer func() { <-w.sem }()
 
 	if err := w.storage.Put(w.ctx, objectName(w.prefix, seq, segSuffix), chunk); err != nil {
