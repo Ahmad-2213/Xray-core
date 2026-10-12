@@ -114,9 +114,10 @@ func (w *walWriter) flushLoop() {
 
 func (w *walWriter) readyToFlush() bool {
 	grew := len(w.buf) > w.lastSize
+	fresh := w.lastSize == 0
 	w.lastSize = len(w.buf)
 
-	if grew && w.held < maxCoalescedTicks {
+	if grew && !fresh && w.held < maxCoalescedTicks {
 		w.held++
 		return false
 	}
