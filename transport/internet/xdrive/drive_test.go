@@ -37,6 +37,7 @@ type fakeDrive struct {
 	failBody   map[string]string
 	tokens     int
 	hosts      map[string]bool
+	addrs      map[string]bool
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -48,6 +49,7 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		failStatus: make(map[string]int),
 		failBody:   make(map[string]string),
 		hosts:      make(map[string]bool),
+		addrs:      make(map[string]bool),
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,6 +59,7 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		return func(w http.ResponseWriter, r *http.Request) {
 			drive.mu.Lock()
 			drive.hosts[r.Host] = true
+			drive.addrs[r.RemoteAddr] = true
 			drive.mu.Unlock()
 			next(w, r)
 		}
@@ -66,8 +69,6 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 	mux.HandleFunc("/files", record(drive.handleFiles))
 	mux.HandleFunc("/files/", record(drive.handleFile))
 	drive.server = httptest.NewServer(mux)
-
-	resetSharedStorage()
 
 	previous := []string{driveTokenURL, driveFilesURL, driveUploadURL}
 	previousBackoff := driveInitialBackoff
@@ -80,7 +81,6 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		driveTokenURL, driveFilesURL, driveUploadURL = previous[0], previous[1], previous[2]
 		driveInitialBackoff = previousBackoff
 		drive.server.Close()
-		resetSharedStorage()
 	})
 	return drive
 }
@@ -279,6 +279,16 @@ func (d *fakeDrive) seenHosts() []string {
 	out := make([]string, 0, len(d.hosts))
 	for h := range d.hosts {
 		out = append(out, h)
+	}
+	return out
+}
+
+func (d *fakeDrive) seenAddrs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]string, 0, len(d.addrs))
+	for a := range d.addrs {
+		out = append(out, a)
 	}
 	return out
 }
@@ -548,8 +558,8 @@ func TestDriveRetryRateLimit(t *testing.T) {
 	}
 }
 
-func TestDriveSharedClient(t *testing.T) {
-	newFakeDrive(t)
+func TestDriveSessionClients(t *testing.T) {
+	drive := newFakeDrive(t)
 
 	first, err := newStorage(driveSettings())
 	if err != nil {
@@ -559,8 +569,20 @@ func TestDriveSharedClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
-	if first != second {
-		t.Fatal("same settings did not share one storage")
+	if first == second {
+		t.Fatal("same settings shared one storage")
+	}
+
+	ctx := context.Background()
+	if err := first.Put(ctx, "streams/a/c2s/000000000.seg", []byte("x")); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+	if err := second.Put(ctx, "streams/b/c2s/000000000.seg", []byte("x")); err != nil {
+		t.Fatalf("second Put: %v", err)
+	}
+
+	if addrs := drive.seenAddrs(); len(addrs) != 2 {
+		t.Fatalf("fake drive saw %d client addresses, want 2", len(addrs))
 	}
 }
 

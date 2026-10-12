@@ -441,5 +441,6 @@ func (s *templateStorage) List(ctx context.Context, prefix string) ([]Entry, err
 }
 
 func (s *templateStorage) Close() error {
+	s.client.CloseIdleConnections()
 	return nil
 }

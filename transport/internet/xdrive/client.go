@@ -26,6 +26,15 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.plain.RoundTrip(r)
 }
 
+func (t *serviceTransport) CloseIdleConnections() {
+	if c, ok := t.plain.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+	if c, ok := t.secure.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
 func newServiceClient(streamSettings *internet.MemoryStreamConfig, timeout time.Duration, maxConns int) *http.Client {
 	var (
 		tlsConfig     *tls.Config

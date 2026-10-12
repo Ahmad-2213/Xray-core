@@ -98,11 +98,11 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		backoff:      driveInitialBackoff,
 		inflight:     make(chan struct{}, driveMaxInflight),
 		ids:          make(map[string]string),
-		lists:        make(map[string]struct {
+		lists: make(map[string]struct {
 			entries []Entry
 			at      time.Time
 		}),
-		flights:      make(map[string]*listFlight),
+		flights: make(map[string]*listFlight),
 	}, nil
 }
 
@@ -644,5 +644,6 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 }
 
 func (s *driveStorage) Close() error {
+	s.client.CloseIdleConnections()
 	return nil
 }

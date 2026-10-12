@@ -70,6 +70,9 @@ func downlinkPrefix(session string) string {
 }
 
 func streamConfig(streamSettings *internet.MemoryStreamConfig) (*Config, error) {
+	if streamSettings == nil {
+		return nil, errors.New("invalid protocol settings")
+	}
 	config, ok := streamSettings.ProtocolSettings.(*Config)
 	if !ok || config == nil {
 		return nil, errors.New("invalid protocol settings")
@@ -108,10 +111,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 }
 
 type Listener struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	storage Storage
-	addConn internet.ConnHandler
+	ctx            context.Context
+	cancel         context.CancelFunc
+	storage        Storage
+	streamSettings *internet.MemoryStreamConfig
+	addConn        internet.ConnHandler
 	params
 
 	mu        sync.Mutex
@@ -133,14 +137,15 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 
 	listenerCtx, cancel := context.WithCancel(context.Background())
 	listener := &Listener{
-		ctx:       listenerCtx,
-		cancel:    cancel,
-		storage:   storage,
-		addConn:   addConn,
-		params:    paramsFromConfig(config),
-		active:    make(map[string]bool),
-		handled:   make(map[string]time.Time),
-		idleSince: make(map[string]time.Time),
+		ctx:            listenerCtx,
+		cancel:         cancel,
+		storage:        storage,
+		streamSettings: streamSettings,
+		addConn:        addConn,
+		params:         paramsFromConfig(config),
+		active:         make(map[string]bool),
+		handled:        make(map[string]time.Time),
+		idleSince:      make(map[string]time.Time),
 	}
 
 	go listener.acceptLoop(ctx)
@@ -228,8 +233,15 @@ func (l *Listener) claim(session string) bool {
 }
 
 func (l *Listener) newSessionConn(session string) *Conn {
-	return newConn(l.ctx, l.storage,
+	storage := l.storage
+	if s, err := newStorage(l.streamSettings); err == nil {
+		storage = s
+	}
+	return newConn(l.ctx, storage,
 		downlinkPrefix(session), uplinkPrefix(session), l.params, func() {
+			if storage != l.storage {
+				storage.Close()
+			}
 			l.mu.Lock()
 			delete(l.active, session)
 			l.mu.Unlock()
