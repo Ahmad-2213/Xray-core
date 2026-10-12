@@ -52,6 +52,7 @@ type walWriter struct {
 	mu       sync.Mutex
 	buf      []byte
 	seq      int64
+	segBytes int
 	lastSize int
 	held     int
 	closed   bool
@@ -60,11 +61,12 @@ type walWriter struct {
 
 func newWALWriter(ctx context.Context, storage Storage, prefix string, p params) *walWriter {
 	w := &walWriter{
-		ctx:     ctx,
-		storage: storage,
-		prefix:  prefix,
-		params:  p,
-		sem:     make(chan struct{}, p.concurrency),
+		ctx:      ctx,
+		storage:  storage,
+		prefix:   prefix,
+		params:   p,
+		segBytes: p.segmentBytes,
+		sem:      make(chan struct{}, p.concurrency),
 	}
 	go w.flushLoop()
 	return w
@@ -82,7 +84,7 @@ func (w *walWriter) Write(p []byte) (int, error) {
 	}
 
 	w.buf = append(w.buf, p...)
-	for len(w.buf) >= w.segmentBytes {
+	for len(w.buf) >= w.segBytes {
 		if err := w.flushLocked(); err != nil {
 			return 0, err
 		}
@@ -134,8 +136,8 @@ func (w *walWriter) flushLocked() error {
 	}
 
 	n := len(w.buf)
-	if n > w.segmentBytes {
-		n = w.segmentBytes
+	if n > w.segBytes {
+		n = w.segBytes
 	}
 
 	chunk := make([]byte, n)
@@ -150,6 +152,15 @@ func (w *walWriter) flushLocked() error {
 	}
 	w.lastSize = len(w.buf)
 	w.held = 0
+
+	if w.segBytes < 4*1024*1024 {
+		if d, ok := w.storage.(interface{ deleteAvg() time.Duration }); ok && d.deleteAvg() < 2*time.Second {
+			w.segBytes *= 2
+			if w.segBytes > 4*1024*1024 {
+				w.segBytes = 4 * 1024 * 1024
+			}
+		}
+	}
 
 	w.wg.Add(1)
 	w.mu.Unlock()

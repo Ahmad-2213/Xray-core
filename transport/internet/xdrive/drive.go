@@ -65,6 +65,9 @@ type driveStorage struct {
 
 	flightMu sync.Mutex
 	flights  map[string]*listFlight
+
+	delMu  sync.Mutex
+	delAvg time.Duration
 }
 
 type listFlight struct {
@@ -536,6 +539,12 @@ func (s *driveStorage) getInline(ctx context.Context, id string) ([]byte, error)
 }
 
 func (s *driveStorage) deleteID(ctx context.Context, flat, id string) error {
+	start := time.Now()
+	defer func() {
+		s.delMu.Lock()
+		s.delAvg = (s.delAvg + time.Since(start)) / 2
+		s.delMu.Unlock()
+	}()
 	status, payload, err := s.do(ctx, http.MethodDelete,
 		s.filesURL+"/"+url.PathEscape(id)+"?supportsAllDrives=true", "", nil)
 	if err != nil {
@@ -548,6 +557,12 @@ func (s *driveStorage) deleteID(ctx context.Context, flat, id string) error {
 	default:
 		return errors.New("Drive deletion of ", flat, " answered ", status, ": ", string(payload))
 	}
+}
+
+func (s *driveStorage) deleteAvg() time.Duration {
+	s.delMu.Lock()
+	defer s.delMu.Unlock()
+	return s.delAvg
 }
 
 func (s *driveStorage) Delete(ctx context.Context, name string) error {
