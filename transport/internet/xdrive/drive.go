@@ -64,10 +64,11 @@ type driveStorage struct {
 	}
 
 	flightMu sync.Mutex
-	flights  map[string]chan listResult
+	flights  map[string]*listFlight
 }
 
-type listResult struct {
+type listFlight struct {
+	done    chan struct{}
 	entries []Entry
 	err     error
 }
@@ -101,7 +102,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			entries []Entry
 			at      time.Time
 		}),
-		flights:      make(map[string]chan listResult),
+		flights:      make(map[string]*listFlight),
 	}, nil
 }
 
@@ -561,18 +562,18 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 	flat := flatten(prefix) + flatSeparator
 
 	s.flightMu.Lock()
-	if ch, ok := s.flights[flat]; ok {
+	if f, ok := s.flights[flat]; ok {
 		s.flightMu.Unlock()
-		r := <-ch
-		if r.err != nil {
-			return nil, r.err
+		<-f.done
+		if f.err != nil {
+			return nil, f.err
 		}
-		entries := make([]Entry, len(r.entries))
-		copy(entries, r.entries)
+		entries := make([]Entry, len(f.entries))
+		copy(entries, f.entries)
 		return entries, nil
 	}
-	ch := make(chan listResult, 1)
-	s.flights[flat] = ch
+	f := &listFlight{done: make(chan struct{})}
+	s.flights[flat] = f
 	s.flightMu.Unlock()
 
 	s.listMu.Lock()
@@ -581,10 +582,10 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 		copy(entries, c.entries)
 		s.listMu.Unlock()
 		s.flightMu.Lock()
+		f.entries = entries
 		delete(s.flights, flat)
+		close(f.done)
 		s.flightMu.Unlock()
-		ch <- listResult{entries: entries}
-		close(ch)
 		return entries, nil
 	}
 	s.listMu.Unlock()
@@ -625,10 +626,11 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 		s.listMu.Unlock()
 	}
 	s.flightMu.Lock()
+	f.entries = entries
+	f.err = err
 	delete(s.flights, flat)
+	close(f.done)
 	s.flightMu.Unlock()
-	ch <- listResult{entries: entries, err: err}
-	close(ch)
 	if err != nil {
 		return nil, err
 	}
