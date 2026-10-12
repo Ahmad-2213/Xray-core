@@ -338,24 +338,17 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			return advanced, false, nil
 		}
 
-		chunks, err := r.fetch(batch)
+		eof, err := r.fetch(batch)
 		if err != nil {
 			if err == errNotFound {
 				return advanced, false, nil
 			}
 			return advanced, false, err
 		}
-
-		for i, chunk := range chunks {
-			select {
-			case r.ch <- chunk:
-			case <-r.ctx.Done():
-				return advanced, true, nil
-			}
-			r.seq++
-			advanced = true
-			r.discard(r.prefix + "/" + batch[i].Name)
+		if eof {
+			return true, true, nil
 		}
+		advanced = true
 	}
 }
 
@@ -377,30 +370,40 @@ func (r *walReader) nextBatch(pending map[int64]Entry) (batch []Entry, done bool
 	return batch, false
 }
 
-func (r *walReader) fetch(batch []Entry) ([][]byte, error) {
+func (r *walReader) fetch(batch []Entry) (bool, error) {
 	chunks := make([][]byte, len(batch))
 	failures := make([]error, len(batch))
+	ready := make([]chan struct{}, len(batch))
+	for i := range ready {
+		ready[i] = make(chan struct{})
+	}
 
-	var wg sync.WaitGroup
 	for i, entry := range batch {
 		if entry.Inline != nil {
 			chunks[i] = entry.Inline
+			close(ready[i])
 			continue
 		}
-		wg.Add(1)
 		go func(i int, name string) {
-			defer wg.Done()
+			defer close(ready[i])
 			chunks[i], failures[i] = r.storage.Get(r.ctx, r.prefix+"/"+name)
 		}(i, entry.Name)
 	}
-	wg.Wait()
 
 	for i := range batch {
+		<-ready[i]
 		if failures[i] != nil {
-			return nil, failures[i]
+			return false, failures[i]
 		}
+		select {
+		case r.ch <- chunks[i]:
+		case <-r.ctx.Done():
+			return true, nil
+		}
+		r.seq++
+		r.discard(r.prefix + "/" + batch[i].Name)
 	}
-	return chunks, nil
+	return false, nil
 }
 
 func (r *walReader) discard(name string) {
