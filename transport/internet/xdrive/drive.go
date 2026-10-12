@@ -62,6 +62,14 @@ type driveStorage struct {
 		entries []Entry
 		at      time.Time
 	}
+
+	flightMu sync.Mutex
+	flights  map[string]chan listResult
+}
+
+type listResult struct {
+	entries []Entry
+	err     error
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -93,6 +101,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			entries []Entry
 			at      time.Time
 		}),
+		flights:      make(map[string]chan listResult),
 	}, nil
 }
 
@@ -551,51 +560,78 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error) {
 	flat := flatten(prefix) + flatSeparator
 
+	s.flightMu.Lock()
+	if ch, ok := s.flights[flat]; ok {
+		s.flightMu.Unlock()
+		r := <-ch
+		if r.err != nil {
+			return nil, r.err
+		}
+		entries := make([]Entry, len(r.entries))
+		copy(entries, r.entries)
+		return entries, nil
+	}
+	ch := make(chan listResult, 1)
+	s.flights[flat] = ch
+	s.flightMu.Unlock()
+
 	s.listMu.Lock()
 	if c, ok := s.lists[flat]; ok && time.Since(c.at) < 40*time.Millisecond {
 		entries := make([]Entry, len(c.entries))
 		copy(entries, c.entries)
 		s.listMu.Unlock()
+		s.flightMu.Lock()
+		delete(s.flights, flat)
+		s.flightMu.Unlock()
+		ch <- listResult{entries: entries}
+		close(ch)
 		return entries, nil
 	}
 	s.listMu.Unlock()
 
 	found, err := s.query(ctx, "name contains '"+quoteDriveValue(flat)+"'")
+	var entries []Entry
+	if err == nil {
+		seen := make(map[string]bool, len(found))
+		entries = make([]Entry, 0, len(found))
+		for name, file := range found {
+			rest := strings.TrimPrefix(name, flat)
+			if rest == "" {
+				continue
+			}
+			direct := true
+			if cut := strings.Index(rest, flatSeparator); cut >= 0 {
+				rest = rest[:cut]
+				direct = false
+			}
+			if seen[rest] {
+				continue
+			}
+			seen[rest] = true
+
+			entry := Entry{Name: rest}
+			if direct && file.description != "" {
+				if data, err := base64.StdEncoding.DecodeString(file.description); err == nil {
+					entry.Inline = data
+				}
+			}
+			entries = append(entries, entry)
+		}
+		s.listMu.Lock()
+		s.lists[flat] = struct {
+			entries []Entry
+			at      time.Time
+		}{entries: entries, at: time.Now()}
+		s.listMu.Unlock()
+	}
+	s.flightMu.Lock()
+	delete(s.flights, flat)
+	s.flightMu.Unlock()
+	ch <- listResult{entries: entries, err: err}
+	close(ch)
 	if err != nil {
 		return nil, err
 	}
-
-	seen := make(map[string]bool, len(found))
-	entries := make([]Entry, 0, len(found))
-	for name, file := range found {
-		rest := strings.TrimPrefix(name, flat)
-		if rest == "" {
-			continue
-		}
-		direct := true
-		if cut := strings.Index(rest, flatSeparator); cut >= 0 {
-			rest = rest[:cut]
-			direct = false
-		}
-		if seen[rest] {
-			continue
-		}
-		seen[rest] = true
-
-		entry := Entry{Name: rest}
-		if direct && file.description != "" {
-			if data, err := base64.StdEncoding.DecodeString(file.description); err == nil {
-				entry.Inline = data
-			}
-		}
-		entries = append(entries, entry)
-	}
-	s.listMu.Lock()
-	s.lists[flat] = struct {
-		entries []Entry
-		at      time.Time
-	}{entries: entries, at: time.Now()}
-	s.listMu.Unlock()
 	return entries, nil
 }
 
