@@ -22,7 +22,7 @@ const (
 	maxAdaptiveSegmentBytes = 4 * 1024 * 1024
 
 	probeSafetyNetInterval = time.Second
-	lookaheadMinGap        = 100 * time.Millisecond
+	lookaheadMinGap        = listCacheTTL * 2
 )
 
 func objectName(prefix string, seq int64, suffix string) string {

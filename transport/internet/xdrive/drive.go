@@ -31,6 +31,8 @@ const (
 	minDeleteSamples = 3
 	deleteLatencyNum = 3
 	deleteLatencyDen = 2
+
+	listCacheTTL = 40 * time.Millisecond
 )
 
 var (
@@ -646,7 +648,7 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 	s.flightMu.Unlock()
 
 	s.listMu.Lock()
-	if c, ok := s.lists[flat]; ok && time.Since(c.at) < 40*time.Millisecond {
+	if c, ok := s.lists[flat]; ok && time.Since(c.at) < listCacheTTL {
 		entries := make([]Entry, len(c.entries))
 		copy(entries, c.entries)
 		s.listMu.Unlock()
