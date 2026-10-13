@@ -22,6 +22,7 @@ const (
 	maxAdaptiveSegmentBytes = 4 * 1024 * 1024
 
 	probeSafetyNetInterval = time.Second
+	lookaheadMinGap        = 100 * time.Millisecond
 )
 
 func objectName(prefix string, seq int64, suffix string) string {
@@ -378,6 +379,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		listed []Entry
 		err    error
 	}
+	var lookTimer <-chan time.Time
 	for {
 		if e, ok := pending[r.seq]; ok {
 			if strings.HasSuffix(e.Name, errSuffix) {
@@ -426,7 +428,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		if len(outstanding) == 0 && look == nil {
 			return advanced, false, nil
 		}
-		if look == nil {
+		if look == nil && lookTimer == nil {
 			ch := make(chan struct {
 				listed []Entry
 				err    error
@@ -483,6 +485,13 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 					delete(pending, seq)
 				}
 			}
+			gap := r.minPollInterval
+			if gap < lookaheadMinGap {
+				gap = lookaheadMinGap
+			}
+			lookTimer = time.After(gap)
+		case <-lookTimer:
+			lookTimer = nil
 		case <-r.ctx.Done():
 			return advanced, false, r.ctx.Err()
 		}

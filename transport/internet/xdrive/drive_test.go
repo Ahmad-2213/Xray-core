@@ -40,6 +40,7 @@ type fakeDrive struct {
 	addrs         map[string]bool
 	orLists       int
 	containsLists int
+	lastQuery     string
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -199,6 +200,7 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	}{}
 
 	d.mu.Lock()
+	d.lastQuery = query
 	if len(or) > 0 {
 		d.orLists++
 	} else if prefix != "" {

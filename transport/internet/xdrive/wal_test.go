@@ -245,7 +245,17 @@ func TestProbeIdleIssuesOneQuery(t *testing.T) {
 	storage := newDriveBackend(t)
 	r := manualReader(storage, "streams/idle", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
 
-	for i := 0; i < 20; i++ {
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	drive.mu.Lock()
+	probeQuery := drive.lastQuery
+	drive.mu.Unlock()
+	if !strings.Contains(probeQuery, "' in parents and trashed = false and (name = '") {
+		t.Fatalf("probe query missing parenthesised group: %q", probeQuery)
+	}
+
+	for i := 0; i < 19; i++ {
 		if _, _, err := r.poll(); err != nil {
 			t.Fatalf("poll: %v", err)
 		}
@@ -729,7 +739,12 @@ func TestWindowOverlapTiming(t *testing.T) {
 	if got := drainReader(t, r); len(got) != 8 {
 		t.Fatalf("delivered %d chunks, want 8", len(got))
 	}
-	starts, ends, _, _, _ := s.snapshot()
+	starts, ends, _, _, listCalls := s.snapshot()
+	t.Logf("listCalls=%d elapsed=%v", listCalls, elapsed)
+	gap := lookaheadMinGap
+	if maxListCalls := int(elapsed/gap) + 2; listCalls > maxListCalls {
+		t.Fatalf("listCalls=%d exceeds elapsed/gap+2=%d", listCalls, maxListCalls)
+	}
 	for _, i := range []int{4, 5, 6} {
 		if !starts[full[i]].Before(ends[full[3]]) {
 			t.Fatalf("GET(%d) started at %v, not before GET(3) finished at %v",
