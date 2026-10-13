@@ -282,6 +282,47 @@ func TestProbeIdleIssuesOneQuery(t *testing.T) {
 	}
 }
 
+func TestProbeHotMissesSkipSafetyNet(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/hot", 0, segSuffix), []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	r := manualReader(storage, "streams/hot", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	baseOr, baseContains := driveCounts(drive)
+
+	for i := 0; i < 20; i++ {
+		if _, _, err := r.poll(); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+	}
+	orLists, containsLists := driveCounts(drive)
+	if orLists-baseOr != 20 || containsLists != baseContains {
+		t.Fatalf("hot gap issued %d probes and %d full lists, want 20 and %d",
+			orLists-baseOr, containsLists-baseContains, baseContains)
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	orLists, containsLists = driveCounts(drive)
+	if orLists-baseOr != 22 || containsLists != baseContains+1 {
+		t.Fatalf("cold gap issued %d probes and %d full lists, want 22 and %d",
+			orLists-baseOr, containsLists-baseContains, baseContains+1)
+	}
+}
+
 func TestProbeSeesEnd(t *testing.T) {
 	_ = newFakeDrive(t)
 	storage := newDriveBackend(t)

@@ -22,6 +22,7 @@ const (
 	maxAdaptiveSegmentBytes = 4 * 1024 * 1024
 
 	probeSafetyNetInterval = time.Second
+	probeHotWindow         = 2 * time.Second
 	lookaheadMinGap        = listCacheTTL * 2
 )
 
@@ -237,6 +238,7 @@ type walReader struct {
 	wake      chan struct{}
 	holeSince time.Time
 	missSince time.Time
+	lastHit   time.Time
 
 	errMu sync.Mutex
 	err   error
@@ -325,8 +327,11 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		listed, perr = p.probe(r.ctx, r.prefix, r.seq)
 		if perr == nil {
 			r.missSince = time.Time{}
+			r.lastHit = time.Now()
 		} else if perr != errNotFound {
 			return false, false, perr
+		} else if time.Since(r.lastHit) < probeHotWindow {
+			return false, false, nil
 		} else if r.missSince.IsZero() {
 			r.missSince = time.Now()
 		} else if time.Since(r.missSince) >= probeSafetyNetInterval {
