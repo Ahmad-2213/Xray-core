@@ -18,6 +18,8 @@ const (
 	segSuffix = ".seg"
 	endSuffix = ".end"
 	errSuffix = ".err"
+
+	maxAdaptiveSegmentBytes = 4 * 1024 * 1024
 )
 
 func objectName(prefix string, seq int64, suffix string) string {
@@ -153,12 +155,16 @@ func (w *walWriter) flushLocked() error {
 	w.lastSize = len(w.buf)
 	w.held = 0
 
-	if w.segBytes < 4*1024*1024 {
-		if d, ok := w.storage.(interface{ deleteAvg() time.Duration }); ok && d.deleteAvg() < 2*time.Second {
-			if n := int(float64(w.segBytes) * w.growth); n > w.segBytes {
-				w.segBytes = n
-				if w.segBytes > 4*1024*1024 {
-					w.segBytes = 4 * 1024 * 1024
+	limit := maxAdaptiveSegmentBytes
+	if maxSegmentBytes < limit {
+		limit = maxSegmentBytes
+	}
+	if n == w.segBytes && w.segBytes < limit {
+		if g, ok := w.storage.(interface{ shouldGrow() bool }); ok && g.shouldGrow() {
+			if m := int(float64(w.segBytes) * w.growth); m > w.segBytes {
+				w.segBytes = m
+				if w.segBytes > limit {
+					w.segBytes = limit
 				}
 			}
 		}

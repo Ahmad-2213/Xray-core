@@ -27,6 +27,10 @@ const (
 	driveMaxInflight = 32
 	driveInlineLimit = 12000
 	driveTimeout     = 60 * time.Second
+
+	minDeleteSamples = 3
+	deleteLatencyNum = 3
+	deleteLatencyDen = 2
 )
 
 var (
@@ -66,8 +70,10 @@ type driveStorage struct {
 	flightMu sync.Mutex
 	flights  map[string]*listFlight
 
-	delMu  sync.Mutex
-	delAvg time.Duration
+	delMu   sync.Mutex
+	delAvg  time.Duration
+	delBase time.Duration
+	delN    int
 }
 
 type listFlight struct {
@@ -540,11 +546,6 @@ func (s *driveStorage) getInline(ctx context.Context, id string) ([]byte, error)
 
 func (s *driveStorage) deleteID(ctx context.Context, flat, id string) error {
 	start := time.Now()
-	defer func() {
-		s.delMu.Lock()
-		s.delAvg = (s.delAvg + time.Since(start)) / 2
-		s.delMu.Unlock()
-	}()
 	status, payload, err := s.do(ctx, http.MethodDelete,
 		s.filesURL+"/"+url.PathEscape(id)+"?supportsAllDrives=true", "", nil)
 	if err != nil {
@@ -552,17 +553,36 @@ func (s *driveStorage) deleteID(ctx context.Context, flat, id string) error {
 	}
 	s.forgetID(flat)
 	switch status {
-	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
+	case http.StatusOK, http.StatusNoContent:
+		s.noteDelete(time.Since(start))
+		return nil
+	case http.StatusNotFound:
 		return nil
 	default:
 		return errors.New("Drive deletion of ", flat, " answered ", status, ": ", string(payload))
 	}
 }
 
-func (s *driveStorage) deleteAvg() time.Duration {
+func (s *driveStorage) noteDelete(d time.Duration) {
 	s.delMu.Lock()
 	defer s.delMu.Unlock()
-	return s.delAvg
+	if s.delN == 0 {
+		s.delAvg = d
+	} else {
+		s.delAvg = (s.delAvg + d) / 2
+	}
+	s.delN++
+	if s.delN == minDeleteSamples {
+		s.delBase = s.delAvg
+	} else if s.delN > minDeleteSamples && s.delAvg < s.delBase {
+		s.delBase = s.delAvg
+	}
+}
+
+func (s *driveStorage) shouldGrow() bool {
+	s.delMu.Lock()
+	defer s.delMu.Unlock()
+	return s.delN >= minDeleteSamples && s.delAvg*deleteLatencyDen <= s.delBase*deleteLatencyNum
 }
 
 func (s *driveStorage) Delete(ctx context.Context, name string) error {
