@@ -358,6 +358,36 @@ func TestProbeSeesErr(t *testing.T) {
 	}
 }
 
+func TestProbeWindow(t *testing.T) {
+	_ = newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		if err := storage.Put(ctx, objectName("streams/w", int64(i), segSuffix), []byte{byte(i)}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	entries, err := storage.probe(ctx, "streams/w", 0)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(entries) != n {
+		t.Fatalf("probe returned %d entries, want %d", len(entries), n)
+	}
+	for i, entry := range entries {
+		if want := objectName("streams/w", int64(i), segSuffix)[len("streams/w/"):]; entry.Name != want {
+			t.Fatalf("entry %d = %q, want %q", i, entry.Name, want)
+		}
+	}
+
+	if _, err := storage.probe(ctx, "streams/empty", 0); err != errNotFound {
+		t.Fatalf("probe returned %v, want errNotFound", err)
+	}
+}
+
 func TestHoleDetectionStillFires(t *testing.T) {
 	drive := newFakeDrive(t)
 	storage := newDriveBackend(t)
@@ -374,18 +404,16 @@ func TestHoleDetectionStillFires(t *testing.T) {
 		t.Fatalf("poll: %v", err)
 	}
 	if _, containsLists := driveCounts(drive); containsLists != 0 {
-		t.Fatalf("first idle poll ran a full list")
+		t.Fatalf("hole discovery ran a full list")
 	}
 
-	time.Sleep(1200 * time.Millisecond)
-	if _, _, err := r.poll(); err != nil {
-		t.Fatalf("poll: %v", err)
-	}
-
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	_, _, err := r.poll()
 	if err == nil || !strings.Contains(err.Error(), "never arrived") {
 		t.Fatalf("poll returned %v, want hole error", err)
+	}
+	if _, containsLists := driveCounts(drive); containsLists != 0 {
+		t.Fatalf("hole detection needed a full list")
 	}
 }
 
@@ -829,8 +857,8 @@ func TestWindowBacklogDrainsPipelined(t *testing.T) {
 			t.Fatalf("chunk %d corrupted or out of order", i)
 		}
 	}
-	orLists, _ := driveCounts(drive)
-	if orLists != 1 {
-		t.Fatalf("backlog drain issued %d probes, want exactly the initial 1", orLists)
+	orLists, containsLists := driveCounts(drive)
+	if orLists < 2 || orLists > 4 || containsLists != 0 {
+		t.Fatalf("backlog drain issued %d probes and %d full lists, want 2-4 probes and 0 full lists", orLists, containsLists)
 	}
 }

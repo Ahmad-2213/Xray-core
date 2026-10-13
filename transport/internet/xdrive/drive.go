@@ -25,7 +25,7 @@ const (
 	drivePageSize    = 1000
 	driveMaxAttempts = 8
 	driveMaxInflight = 32
-	driveInlineLimit = 12000
+	driveInlineLimit = 64000
 	driveTimeout     = 60 * time.Second
 
 	minDeleteSamples = 3
@@ -33,6 +33,8 @@ const (
 	deleteLatencyDen = 2
 
 	listCacheTTL = 40 * time.Millisecond
+
+	probeWindowWidth = 64
 )
 
 var (
@@ -396,11 +398,11 @@ func (s *driveStorage) resolveID(ctx context.Context, flat string) (string, erro
 }
 
 func (s *driveStorage) probe(ctx context.Context, prefix string, seq int64) ([]Entry, error) {
-	names := []string{
-		objectName(prefix, seq, segSuffix),
-		objectName(prefix, seq, endSuffix),
-		objectName(prefix, seq, errSuffix),
+	names := make([]string, 0, probeWindowWidth+2)
+	for i := int64(0); i < probeWindowWidth; i++ {
+		names = append(names, objectName(prefix, seq+i, segSuffix))
 	}
+	names = append(names, objectName(prefix, seq, endSuffix), objectName(prefix, seq, errSuffix))
 	quoted := make([]string, 0, len(names))
 	for _, name := range names {
 		quoted = append(quoted, "name = '"+quoteDriveValue(flatten(name))+"'")
@@ -431,7 +433,9 @@ func (s *driveStorage) probe(ctx context.Context, prefix string, seq int64) ([]E
 
 func (s *driveStorage) Put(ctx context.Context, name string, data []byte) error {
 	if len(data) <= driveInlineLimit {
-		return s.putInline(ctx, name, data)
+		if err := s.putInline(ctx, name, data); err == nil {
+			return nil
+		}
 	}
 	return s.putMedia(ctx, name, data)
 }

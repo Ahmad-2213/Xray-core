@@ -434,12 +434,23 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			return advanced, false, nil
 		}
 		if look == nil && lookTimer == nil {
+			fetch := func() ([]Entry, error) {
+				return r.storage.List(r.ctx, r.prefix)
+			}
+			if p, ok := r.storage.(interface {
+				probe(context.Context, string, int64) ([]Entry, error)
+			}); ok {
+				seq := r.seq
+				fetch = func() ([]Entry, error) {
+					return p.probe(r.ctx, r.prefix, seq)
+				}
+			}
 			ch := make(chan struct {
 				listed []Entry
 				err    error
 			}, 1)
 			go func() {
-				listed, err := r.storage.List(r.ctx, r.prefix)
+				listed, err := fetch()
 				ch <- struct {
 					listed []Entry
 					err    error
@@ -475,7 +486,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			r.discard(r.prefix + "/" + name)
 		case res := <-look:
 			look = nil
-			if res.err != nil {
+			if res.err != nil && res.err != errNotFound {
 				return false, false, res.err
 			}
 			fresh := false

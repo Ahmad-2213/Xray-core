@@ -699,6 +699,36 @@ func TestDriveInlineGet(t *testing.T) {
 	}
 }
 
+func TestDriveMidInline(t *testing.T) {
+	newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	payload := make([]byte, 20000)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if err := storage.Put(ctx, "streams/abc/c2s/000000000.seg", payload); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	entries, err := storage.List(ctx, "streams/abc/c2s")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 || string(entries[0].Inline) != string(payload) {
+		t.Fatalf("listing did not carry the 20KB payload inline")
+	}
+
+	got, err := storage.Get(ctx, "streams/abc/c2s/000000000.seg")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("Get returned %d bytes, want %d", len(got), len(payload))
+	}
+}
+
 func TestDriveFronting(t *testing.T) {
 	drive := newFakeDrive(t)
 
