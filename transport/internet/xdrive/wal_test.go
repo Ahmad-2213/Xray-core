@@ -2,6 +2,7 @@ package xdrive
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -217,5 +218,121 @@ func TestGrowthFactorOneDisables(t *testing.T) {
 	}
 	if w.segBytes != 1024 {
 		t.Fatalf("factor 1 grew to %d", w.segBytes)
+	}
+}
+
+func manualReader(storage Storage, prefix string, p params) *walReader {
+	return &walReader{
+		ctx:      context.Background(),
+		storage:  storage,
+		prefix:   prefix,
+		params:   p,
+		ch:       make(chan []byte, 64),
+		discards: make(chan string, 64),
+		wake:     make(chan struct{}, 1),
+	}
+}
+
+func driveCounts(d *fakeDrive) (orLists, containsLists int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.orLists, d.containsLists
+}
+
+func TestProbeIdleIssuesOneQuery(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	r := manualReader(storage, "streams/idle", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
+
+	for i := 0; i < 20; i++ {
+		if _, _, err := r.poll(); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+	}
+	if orLists, containsLists := driveCounts(drive); orLists != 20 || containsLists != 0 {
+		t.Fatalf("idle polls issued %d probes and %d full lists, want 20 and 0", orLists, containsLists)
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if orLists, containsLists := driveCounts(drive); orLists != 21 || containsLists != 1 {
+		t.Fatalf("after 1s got %d probes and %d full lists, want 21 and 1", orLists, containsLists)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, _, err := r.poll(); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+	}
+	if orLists, containsLists := driveCounts(drive); orLists != 26 || containsLists != 1 {
+		t.Fatalf("safety window reset failed: %d probes and %d full lists, want 26 and 1", orLists, containsLists)
+	}
+}
+
+func TestProbeSeesEnd(t *testing.T) {
+	_ = newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/e", 0, endSuffix), nil); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	r := manualReader(storage, "streams/e", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
+	advanced, eof, err := r.poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if !eof || advanced {
+		t.Fatalf("poll returned advanced=%v eof=%v, want false true", advanced, eof)
+	}
+}
+
+func TestProbeSeesErr(t *testing.T) {
+	_ = newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/f", 0, errSuffix), nil); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	r := manualReader(storage, "streams/f", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
+	_, _, err := r.poll()
+	if err == nil || !strings.Contains(err.Error(), "could not store") {
+		t.Fatalf("poll returned %v, want peer-store error", err)
+	}
+}
+
+func TestHoleDetectionStillFires(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	for _, seq := range []int64{1, 2, 3} {
+		if err := storage.Put(ctx, objectName("streams/h", seq, segSuffix), []byte("x")); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	r := manualReader(storage, "streams/h", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if _, containsLists := driveCounts(drive); containsLists != 0 {
+		t.Fatalf("first idle poll ran a full list")
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	time.Sleep(1200 * time.Millisecond)
+	_, _, err := r.poll()
+	if err == nil || !strings.Contains(err.Error(), "never arrived") {
+		t.Fatalf("poll returned %v, want hole error", err)
 	}
 }

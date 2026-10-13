@@ -29,15 +29,17 @@ type fakeFile struct {
 type fakeDrive struct {
 	server *httptest.Server
 
-	mu         sync.Mutex
-	files      map[string]*fakeFile
-	nextID     int
-	failOnce   map[string]bool
-	failStatus map[string]int
-	failBody   map[string]string
-	tokens     int
-	hosts      map[string]bool
-	addrs      map[string]bool
+	mu            sync.Mutex
+	files         map[string]*fakeFile
+	nextID        int
+	failOnce      map[string]bool
+	failStatus    map[string]int
+	failBody      map[string]string
+	tokens        int
+	hosts         map[string]bool
+	addrs         map[string]bool
+	orLists       int
+	containsLists int
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -185,6 +187,7 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query().Get("q")
 	exact, prefix := parseFakeQuery(query)
+	or := parseFakeOr(query)
 
 	type entry struct {
 		ID          string `json:"id"`
@@ -196,9 +199,21 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	}{}
 
 	d.mu.Lock()
+	if len(or) > 0 {
+		d.orLists++
+	} else if prefix != "" {
+		d.containsLists++
+	}
 	for _, file := range d.files {
 		match := false
 		switch {
+		case len(or) > 0:
+			for _, name := range or {
+				if file.name == name {
+					match = true
+					break
+				}
+			}
 		case exact != "":
 			match = file.name == exact
 		case prefix != "":
@@ -307,6 +322,19 @@ func parseFakeQuery(query string) (exact, prefix string) {
 		return "", value
 	}
 	return "", ""
+}
+
+func parseFakeOr(query string) []string {
+	if !strings.Contains(query, " or ") {
+		return nil
+	}
+	var names []string
+	for _, part := range strings.Split(query, " or ") {
+		if value, ok := cutQuoted(part, "name = '"); ok {
+			names = append(names, value)
+		}
+	}
+	return names
 }
 
 func cutQuoted(query, marker string) (string, bool) {

@@ -393,23 +393,38 @@ func (s *driveStorage) resolveID(ctx context.Context, flat string) (string, erro
 	return "", errNotFound
 }
 
-func (s *driveStorage) probe(ctx context.Context, name string) (Entry, error) {
-	flat := flatten(name)
-	found, err := s.query(ctx, "name = '"+quoteDriveValue(flat)+"'")
+func (s *driveStorage) probe(ctx context.Context, prefix string, seq int64) ([]Entry, error) {
+	names := []string{
+		objectName(prefix, seq, segSuffix),
+		objectName(prefix, seq, endSuffix),
+		objectName(prefix, seq, errSuffix),
+	}
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, "name = '"+quoteDriveValue(flatten(name))+"'")
+	}
+	found, err := s.query(ctx, "("+strings.Join(quoted, " or ")+")")
 	if err != nil {
-		return Entry{}, err
+		return nil, err
 	}
-	file, ok := found[flat]
-	if !ok {
-		return Entry{}, errNotFound
-	}
-	entry := Entry{Name: name[strings.LastIndexByte(name, '/')+1:]}
-	if file.description != "" {
-		if data, err := base64.StdEncoding.DecodeString(file.description); err == nil {
-			entry.Inline = data
+	entries := make([]Entry, 0, len(names))
+	for _, name := range names {
+		file, ok := found[flatten(name)]
+		if !ok {
+			continue
 		}
+		entry := Entry{Name: name[strings.LastIndexByte(name, '/')+1:]}
+		if file.description != "" {
+			if data, err := base64.StdEncoding.DecodeString(file.description); err == nil {
+				entry.Inline = data
+			}
+		}
+		entries = append(entries, entry)
 	}
-	return entry, nil
+	if len(entries) == 0 {
+		return nil, errNotFound
+	}
+	return entries, nil
 }
 
 func (s *driveStorage) Put(ctx context.Context, name string, data []byte) error {

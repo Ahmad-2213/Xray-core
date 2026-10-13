@@ -20,6 +20,8 @@ const (
 	errSuffix = ".err"
 
 	maxAdaptiveSegmentBytes = 4 * 1024 * 1024
+
+	probeSafetyNetInterval = time.Second
 )
 
 func objectName(prefix string, seq int64, suffix string) string {
@@ -233,6 +235,7 @@ type walReader struct {
 	discards  chan string
 	wake      chan struct{}
 	holeSince time.Time
+	missSince time.Time
 
 	errMu sync.Mutex
 	err   error
@@ -312,16 +315,28 @@ func (r *walReader) run() {
 
 func (r *walReader) poll() (advanced, eof bool, err error) {
 	var listed []Entry
+	probed := false
 	if p, ok := r.storage.(interface {
-		probe(context.Context, string) (Entry, error)
+		probe(context.Context, string, int64) ([]Entry, error)
 	}); ok {
-		if e, perr := p.probe(r.ctx, objectName(r.prefix, r.seq, segSuffix)); perr == nil {
-			listed = []Entry{e}
+		probed = true
+		var perr error
+		listed, perr = p.probe(r.ctx, r.prefix, r.seq)
+		if perr == nil {
+			r.missSince = time.Time{}
 		} else if perr != errNotFound {
 			return false, false, perr
+		} else if r.missSince.IsZero() {
+			r.missSince = time.Now()
+		} else if time.Since(r.missSince) >= probeSafetyNetInterval {
+			r.missSince = time.Now()
+			listed, err = r.storage.List(r.ctx, r.prefix)
+			if err != nil {
+				return false, false, err
+			}
 		}
 	}
-	if listed == nil {
+	if !probed {
 		listed, err = r.storage.List(r.ctx, r.prefix)
 		if err != nil {
 			return false, false, err
