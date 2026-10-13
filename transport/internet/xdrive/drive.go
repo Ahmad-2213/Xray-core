@@ -28,6 +28,9 @@ const (
 	driveInlineLimit = 16 * 1024
 	driveTimeout     = 60 * time.Second
 
+	driveMetaTimeout = 15 * time.Second
+	driveCooldown    = 2 * time.Second
+
 	minDeleteSamples = 3
 	deleteLatencyNum = 3
 	deleteLatencyDen = 2
@@ -65,6 +68,9 @@ type driveStorage struct {
 	tokenExpiry time.Time
 
 	inflight chan struct{}
+
+	coolMu    sync.Mutex
+	coolUntil time.Time
 
 	idMu sync.Mutex
 	ids  map[string]string
@@ -229,6 +235,17 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	fastLeft := driveFastRetries
 	lastTransport := false
 
+	s.coolMu.Lock()
+	until := s.coolUntil
+	s.coolMu.Unlock()
+	if d := time.Until(until); d > 0 {
+		select {
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		case <-time.After(d):
+		}
+	}
+
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
 			wait := jitter(backoff)
@@ -315,12 +332,21 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
+			s.coolMu.Lock()
+			s.coolUntil = time.Now().Add(jitter(driveCooldown))
+			s.coolMu.Unlock()
 			continue
 		}
 		return resp.StatusCode, payload, nil
 	}
 
 	return 0, nil, lastErr
+}
+
+func (s *driveStorage) doMeta(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+	metaCtx, cancel := context.WithTimeout(ctx, driveMetaTimeout)
+	defer cancel()
+	return s.do(metaCtx, method, target, contentType, body)
 }
 
 func (s *driveStorage) invalidateToken() {
@@ -369,7 +395,7 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 			params.Set("pageToken", pageToken)
 		}
 
-		status, payload, err := s.do(ctx, http.MethodGet, s.filesURL+"?"+params.Encode(), "", nil)
+		status, payload, err := s.doMeta(ctx, http.MethodGet, s.filesURL+"?"+params.Encode(), "", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -470,7 +496,7 @@ func (s *driveStorage) putInline(ctx context.Context, name string, data []byte) 
 		return errors.New("failed to build the inline metadata").Base(err)
 	}
 
-	status, payload, err := s.do(ctx, http.MethodPost, s.filesURL+"?fields=id",
+	status, payload, err := s.doMeta(ctx, http.MethodPost, s.filesURL+"?fields=id",
 		"application/json; charset=UTF-8", body)
 	if err != nil {
 		return err
@@ -558,7 +584,7 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 }
 
 func (s *driveStorage) getInline(ctx context.Context, id string) ([]byte, error) {
-	status, payload, err := s.do(ctx, http.MethodGet,
+	status, payload, err := s.doMeta(ctx, http.MethodGet,
 		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
 	if err != nil {
 		return nil, err

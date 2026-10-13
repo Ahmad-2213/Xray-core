@@ -480,11 +480,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		case res := <-head:
 			delete(outstanding, r.seq)
 			if res.err != nil {
-				if res.err == errNotFound {
-					if _, ok := pending[r.seq]; ok {
-						delete(pending, r.seq)
-					}
-				} else {
+				if res.err != errNotFound {
 					return advanced, false, res.err
 				}
 			} else {
