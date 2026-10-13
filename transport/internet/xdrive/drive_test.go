@@ -704,7 +704,7 @@ func TestDriveMidInline(t *testing.T) {
 	storage := newDriveBackend(t)
 	ctx := context.Background()
 
-	payload := make([]byte, 20000)
+	payload := make([]byte, 15000)
 	for i := range payload {
 		payload[i] = byte(i)
 	}
@@ -717,7 +717,7 @@ func TestDriveMidInline(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 	if len(entries) != 1 || string(entries[0].Inline) != string(payload) {
-		t.Fatalf("listing did not carry the 20KB payload inline")
+		t.Fatalf("listing did not carry the 15KB payload inline")
 	}
 
 	got, err := storage.Get(ctx, "streams/abc/c2s/000000000.seg")

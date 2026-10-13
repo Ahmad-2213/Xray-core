@@ -25,7 +25,7 @@ const (
 	drivePageSize    = 1000
 	driveMaxAttempts = 8
 	driveMaxInflight = 32
-	driveInlineLimit = 64000
+	driveInlineLimit = 16 * 1024
 	driveTimeout     = 60 * time.Second
 
 	minDeleteSamples = 3
