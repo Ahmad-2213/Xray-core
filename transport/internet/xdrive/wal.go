@@ -349,6 +349,10 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		r.holeSince = time.Time{}
 	}
 
+	var look chan struct {
+		listed []Entry
+		err    error
+	}
 	for {
 		if entry, ok := pending[r.seq]; ok && strings.HasSuffix(entry.Name, errSuffix) {
 			r.discard(r.prefix + "/" + entry.Name)
@@ -360,7 +364,44 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			return advanced, true, nil
 		}
 		if len(batch) == 0 {
-			return advanced, false, nil
+			if look == nil {
+				return advanced, false, nil
+			}
+			res := <-look
+			look = nil
+			if res.err != nil {
+				return false, false, res.err
+			}
+			fresh := false
+			for _, entry := range res.listed {
+				if seq, ok := parseEntry(entry.Name); ok && seq >= r.seq {
+					pending[seq] = entry
+					fresh = true
+				}
+			}
+			for seq := range pending {
+				if seq < r.seq {
+					delete(pending, seq)
+				}
+			}
+			if !fresh {
+				return advanced, false, nil
+			}
+			continue
+		}
+
+		if look == nil {
+			look = make(chan struct {
+				listed []Entry
+				err    error
+			}, 1)
+			go func() {
+				listed, err := r.storage.List(r.ctx, r.prefix)
+				look <- struct {
+					listed []Entry
+					err    error
+				}{listed, err}
+			}()
 		}
 
 		eof, err := r.fetch(batch)
