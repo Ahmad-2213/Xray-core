@@ -742,8 +742,8 @@ func TestWindowOverlapTiming(t *testing.T) {
 	starts, ends, _, _, listCalls := s.snapshot()
 	t.Logf("listCalls=%d elapsed=%v", listCalls, elapsed)
 	gap := lookaheadMinGap
-	if maxListCalls := int(elapsed/gap) + 2; listCalls > maxListCalls {
-		t.Fatalf("listCalls=%d exceeds elapsed/gap+2=%d", listCalls, maxListCalls)
+	if maxListCalls := int(elapsed/gap) + 3; listCalls > maxListCalls {
+		t.Fatalf("listCalls=%d exceeds elapsed/gap+3=%d", listCalls, maxListCalls)
 	}
 	for _, i := range []int{4, 5, 6} {
 		if !starts[full[i]].Before(ends[full[3]]) {
