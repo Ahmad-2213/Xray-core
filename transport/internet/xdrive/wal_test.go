@@ -3,6 +3,7 @@ package xdrive
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -334,5 +335,446 @@ func TestHoleDetectionStillFires(t *testing.T) {
 	_, _, err := r.poll()
 	if err == nil || !strings.Contains(err.Error(), "never arrived") {
 		t.Fatalf("poll returned %v, want hole error", err)
+	}
+}
+
+type stubStorage struct {
+	mu          sync.Mutex
+	data        map[string][]byte
+	lists       [][]string
+	listCalls   int
+	fail        map[string]error
+	delay       map[string]time.Duration
+	defDelay    time.Duration
+	starts      map[string]time.Time
+	ends        map[string]time.Time
+	inflight    int
+	maxInflight int
+	startedGets int
+}
+
+func (s *stubStorage) Put(_ context.Context, name string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	s.data[name] = cp
+	return nil
+}
+
+func (s *stubStorage) Get(ctx context.Context, name string) ([]byte, error) {
+	s.mu.Lock()
+	if s.starts == nil {
+		s.starts = make(map[string]time.Time)
+		s.ends = make(map[string]time.Time)
+	}
+	s.starts[name] = time.Now()
+	s.inflight++
+	if s.inflight > s.maxInflight {
+		s.maxInflight = s.inflight
+	}
+	s.startedGets++
+	d := s.defDelay
+	if v, ok := s.delay[name]; ok {
+		d = v
+	}
+	err := s.fail[name]
+	s.mu.Unlock()
+
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+		s.mu.Lock()
+		s.inflight--
+		s.ends[name] = time.Now()
+		s.mu.Unlock()
+		return nil, ctx.Err()
+	}
+
+	s.mu.Lock()
+	s.inflight--
+	s.ends[name] = time.Now()
+	cp := append([]byte(nil), s.data[name]...)
+	s.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
+func (s *stubStorage) Delete(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *stubStorage) List(_ context.Context, _ string) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listCalls++
+	names := s.lists[len(s.lists)-1]
+	if s.listCalls <= len(s.lists) {
+		names = s.lists[s.listCalls-1]
+	}
+	entries := make([]Entry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, Entry{Name: name})
+	}
+	return entries, nil
+}
+
+func (s *stubStorage) Close() error {
+	return nil
+}
+
+func (s *stubStorage) snapshot() (starts, ends map[string]time.Time, maxInflight, startedGets int, listCalls int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	starts = make(map[string]time.Time, len(s.starts))
+	for k, v := range s.starts {
+		starts[k] = v
+	}
+	ends = make(map[string]time.Time, len(s.ends))
+	for k, v := range s.ends {
+		ends[k] = v
+	}
+	return starts, ends, s.maxInflight, s.startedGets, s.listCalls
+}
+
+func (s *stubStorage) inflightNow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inflight
+}
+
+func stubNames(prefix string, n int) (full []string, rel []string) {
+	for i := 0; i < n; i++ {
+		rel = append(rel, objectName("", int64(i), segSuffix)[1:])
+		full = append(full, prefix+"/"+rel[i])
+	}
+	return full, rel
+}
+
+func drainDiscards(r *walReader) []string {
+	var out []string
+	for {
+		select {
+		case name := <-r.discards:
+			out = append(out, name)
+		default:
+			return out
+		}
+	}
+}
+
+func drainReader(t *testing.T, r *walReader) [][]byte {
+	t.Helper()
+	var out [][]byte
+	for {
+		select {
+		case chunk := <-r.ch:
+			out = append(out, chunk)
+		default:
+			return out
+		}
+	}
+}
+
+func TestWindowDeliversInOrder(t *testing.T) {
+	const n = 16
+	prefix := "streams/window"
+	full, rel := stubNames(prefix, n)
+	s := &stubStorage{data: make(map[string][]byte), delay: make(map[string]time.Duration), defDelay: 5 * time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+		s.delay[name] = time.Duration(n-i) * 5 * time.Millisecond
+	}
+	s.lists = [][]string{rel}
+	r := manualReader(s, prefix, params{concurrency: 4, holeTimeout: time.Second})
+
+	advanced, eof, err := r.poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if eof || !advanced {
+		t.Fatalf("poll returned advanced=%v eof=%v", advanced, eof)
+	}
+	got := drainReader(t, r)
+	if len(got) != n {
+		t.Fatalf("delivered %d chunks, want %d", len(got), n)
+	}
+	for i, chunk := range got {
+		if len(chunk) != 1 || chunk[0] != byte(i) {
+			t.Fatalf("chunk %d out of order: %v", i, chunk)
+		}
+	}
+	_, _, maxInflight, _, _ := s.snapshot()
+	if maxInflight > 4 {
+		t.Fatalf("max in-flight GETs = %d, want <= 4", maxInflight)
+	}
+	discarded := drainDiscards(r)
+	if len(discarded) != n {
+		t.Fatalf("discarded %d segments, want %d", len(discarded), n)
+	}
+	for i, name := range discarded {
+		if name != full[i] {
+			t.Fatalf("discard %d = %q, want %q (discard must follow delivery order)", i, name, full[i])
+		}
+	}
+}
+
+func TestWindowErrorStopsAtHead(t *testing.T) {
+	const n = 8
+	prefix := "streams/errhead"
+	full, rel := stubNames(prefix, n)
+	s := &stubStorage{data: make(map[string][]byte), defDelay: 5 * time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+	}
+	boom := errTestBoom
+	s.setFail(full[5], boom)
+	s.lists = [][]string{rel}
+	r := manualReader(s, prefix, params{concurrency: 4, holeTimeout: time.Second})
+
+	_, _, err := r.poll()
+	if err != boom {
+		t.Fatalf("poll returned %v, want the injected failure", err)
+	}
+	if r.seq != 5 {
+		t.Fatalf("seq = %d, want 5 (failed segment must not advance)", r.seq)
+	}
+	got := drainReader(t, r)
+	if len(got) != 5 {
+		t.Fatalf("delivered %d chunks before failure, want 5", len(got))
+	}
+	discarded := drainDiscards(r)
+	if len(discarded) != 5 {
+		t.Fatalf("discarded %d segments, want exactly the 5 delivered ones", len(discarded))
+	}
+	for i, name := range discarded {
+		if name != full[i] {
+			t.Fatalf("discard %d = %q, want %q", i, name, full[i])
+		}
+	}
+}
+
+var errTestBoom testError = "injected Get failure"
+
+type testError string
+
+func (e testError) Error() string {
+	return string(e)
+}
+
+func (s *stubStorage) setFail(name string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail == nil {
+		s.fail = make(map[string]error)
+	}
+	s.fail[name] = err
+}
+
+func (s *stubStorage) clearFail(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.fail, name)
+}
+
+func TestWindowNotFoundDropsWithoutLoss(t *testing.T) {
+	const n = 4
+	prefix := "streams/missing"
+	full, rel := stubNames(prefix, n)
+	s := &stubStorage{data: make(map[string][]byte), fail: make(map[string]error), defDelay: time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+	}
+	s.fail[full[0]] = errNotFound
+	s.lists = [][]string{rel}
+	r := manualReader(s, prefix, params{concurrency: 4, holeTimeout: time.Second})
+
+	advanced, eof, err := r.poll()
+	if err != nil || eof || advanced {
+		t.Fatalf("poll returned advanced=%v eof=%v err=%v, want clean retry", advanced, eof, err)
+	}
+	if r.seq != 0 {
+		t.Fatalf("seq = %d, want 0", r.seq)
+	}
+	if got := drainReader(t, r); len(got) != 0 {
+		t.Fatalf("delivered %d chunks, want none", len(got))
+	}
+
+	s.clearFail(full[0])
+	advanced, eof, err = r.poll()
+	if err != nil || eof || !advanced {
+		t.Fatalf("second poll returned advanced=%v eof=%v err=%v", advanced, eof, err)
+	}
+	if got := drainReader(t, r); len(got) != n {
+		t.Fatalf("redelivered %d chunks, want %d", len(got), n)
+	}
+}
+
+func TestWindowRespectsConcurrency(t *testing.T) {
+	const n = 20
+	prefix := "streams/cap"
+	full, rel := stubNames(prefix, n)
+	s := &stubStorage{data: make(map[string][]byte), defDelay: 30 * time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+	}
+	s.lists = [][]string{rel}
+	r := manualReader(s, prefix, params{concurrency: 4, holeTimeout: time.Second})
+
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	_, _, maxInflight, _, _ := s.snapshot()
+	if maxInflight > 4 {
+		t.Fatalf("max in-flight GETs = %d, want <= 4", maxInflight)
+	}
+	if got := drainReader(t, r); len(got) != n {
+		t.Fatalf("delivered %d chunks, want %d", len(got), n)
+	}
+}
+
+func TestWindowBackpressureBounds(t *testing.T) {
+	const n = 8
+	prefix := "streams/pressure"
+	full, rel := stubNames(prefix, n)
+	s := &stubStorage{data: make(map[string][]byte), defDelay: 30 * time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+	}
+	s.lists = [][]string{rel}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &walReader{
+		ctx:      ctx,
+		storage:  s,
+		prefix:   prefix,
+		params:   params{concurrency: 4, holeTimeout: time.Second},
+		ch:       make(chan []byte),
+		discards: make(chan string, 64),
+		wake:     make(chan struct{}, 1),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = r.poll()
+	}()
+	time.Sleep(300 * time.Millisecond)
+	_, _, _, startedGets, _ := s.snapshot()
+	if startedGets != 4 {
+		t.Fatalf("started %d GETs with no consumer, want exactly the 4 window slots", startedGets)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("poll did not return after cancel")
+	}
+}
+
+func TestWindowCtxLeavesNoGoroutine(t *testing.T) {
+	const n = 8
+	prefix := "streams/noleak"
+	full, rel := stubNames(prefix, n)
+	s := &stubStorage{data: make(map[string][]byte), defDelay: 500 * time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+	}
+	s.lists = [][]string{rel}
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &walReader{
+		ctx:      ctx,
+		storage:  s,
+		prefix:   prefix,
+		params:   params{concurrency: 4, holeTimeout: time.Second},
+		ch:       make(chan []byte, 64),
+		discards: make(chan string, 64),
+		wake:     make(chan struct{}, 1),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = r.poll()
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("poll did not return after cancel")
+	}
+	waitFor(t, "in-flight GETs to finish", func() bool {
+		return s.inflightNow() == 0
+	})
+}
+
+func TestWindowOverlapTiming(t *testing.T) {
+	prefix := "streams/overlap"
+	full, rel := stubNames(prefix, 8)
+	s := &stubStorage{data: make(map[string][]byte), delay: make(map[string]time.Duration), defDelay: 20 * time.Millisecond}
+	for i, name := range full {
+		s.data[name] = []byte{byte(i)}
+	}
+	s.delay[full[3]] = 400 * time.Millisecond
+	s.lists = [][]string{rel[:4], rel}
+	r := manualReader(s, prefix, params{concurrency: 4, holeTimeout: time.Second})
+
+	start := time.Now()
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	elapsed := time.Since(start)
+	if got := drainReader(t, r); len(got) != 8 {
+		t.Fatalf("delivered %d chunks, want 8", len(got))
+	}
+	starts, ends, _, _, _ := s.snapshot()
+	for _, i := range []int{4, 5, 6} {
+		if !starts[full[i]].Before(ends[full[3]]) {
+			t.Fatalf("GET(%d) started at %v, not before GET(3) finished at %v",
+				i, starts[full[i]], ends[full[3]])
+		}
+	}
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("8 segments took %v, want well under 800ms", elapsed)
+	}
+}
+
+func TestWindowBacklogDrainsPipelined(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	const n = 20
+	prefix := "streams/backlog"
+	for i := 0; i < n; i++ {
+		payload := make([]byte, driveInlineLimit+1)
+		payload[0] = byte(i)
+		if err := storage.Put(ctx, objectName(prefix, int64(i), segSuffix), payload); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	r := manualReader(storage, prefix, params{concurrency: 8, holeTimeout: time.Second})
+	advanced, eof, err := r.poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if eof || !advanced {
+		t.Fatalf("poll returned advanced=%v eof=%v", advanced, eof)
+	}
+	got := drainReader(t, r)
+	if len(got) != n {
+		t.Fatalf("delivered %d chunks, want %d", len(got), n)
+	}
+	for i, chunk := range got {
+		if len(chunk) != driveInlineLimit+1 || chunk[0] != byte(i) {
+			t.Fatalf("chunk %d corrupted or out of order", i)
+		}
+	}
+	orLists, _ := driveCounts(drive)
+	if orLists != 1 {
+		t.Fatalf("backlog drain issued %d probes, want exactly the initial 1", orLists)
 	}
 }

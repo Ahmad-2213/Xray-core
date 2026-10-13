@@ -370,34 +370,112 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		r.holeSince = time.Time{}
 	}
 
+	outstanding := make(map[int64]chan struct {
+		chunk []byte
+		err   error
+	})
 	var look chan struct {
 		listed []Entry
 		err    error
 	}
 	for {
-		if entry, ok := pending[r.seq]; ok && strings.HasSuffix(entry.Name, errSuffix) {
-			r.discard(r.prefix + "/" + entry.Name)
-			return advanced, false, errors.New("the peer could not store segment ", r.seq)
+		if e, ok := pending[r.seq]; ok {
+			if strings.HasSuffix(e.Name, errSuffix) {
+				r.discard(r.prefix + "/" + e.Name)
+				return advanced, false, errors.New("the peer could not store segment ", r.seq)
+			}
+			if strings.HasSuffix(e.Name, endSuffix) && len(outstanding) == 0 {
+				r.discard(r.prefix + "/" + e.Name)
+				return advanced, true, nil
+			}
 		}
 
-		batch, done := r.nextBatch(pending)
-		if done {
-			return advanced, true, nil
-		}
-		if len(batch) == 0 {
-			if look == nil {
-				return advanced, false, nil
+		for i := 0; len(outstanding) < r.concurrency; i++ {
+			seq := r.seq + int64(i)
+			e, ok := pending[seq]
+			if !ok || !strings.HasSuffix(e.Name, segSuffix) {
+				break
 			}
-			res := <-look
+			if _, ok := outstanding[seq]; ok {
+				continue
+			}
+			ch := make(chan struct {
+				chunk []byte
+				err   error
+			}, 1)
+			outstanding[seq] = ch
+			if e.Inline != nil {
+				ch <- struct {
+					chunk []byte
+					err   error
+				}{e.Inline, nil}
+				continue
+			}
+			go func(name string, ch chan struct {
+				chunk []byte
+				err   error
+			}) {
+				chunk, err := r.storage.Get(r.ctx, r.prefix+"/"+name)
+				ch <- struct {
+					chunk []byte
+					err   error
+				}{chunk, err}
+			}(e.Name, ch)
+		}
+
+		if len(outstanding) == 0 && look == nil {
+			return advanced, false, nil
+		}
+		if look == nil {
+			ch := make(chan struct {
+				listed []Entry
+				err    error
+			}, 1)
+			go func() {
+				listed, err := r.storage.List(r.ctx, r.prefix)
+				ch <- struct {
+					listed []Entry
+					err    error
+				}{listed, err}
+			}()
+			look = ch
+		}
+
+		var head chan struct {
+			chunk []byte
+			err   error
+		}
+		if ch, ok := outstanding[r.seq]; ok {
+			head = ch
+		}
+		select {
+		case res := <-head:
+			delete(outstanding, r.seq)
+			if res.err != nil {
+				if res.err == errNotFound {
+					return advanced, false, nil
+				}
+				return advanced, false, res.err
+			}
+			name := pending[r.seq].Name
+			select {
+			case r.ch <- res.chunk:
+			case <-r.ctx.Done():
+				return true, true, nil
+			}
+			r.seq++
+			advanced = true
+			r.discard(r.prefix + "/" + name)
+		case res := <-look:
 			look = nil
 			if res.err != nil {
 				return false, false, res.err
 			}
-			fresh := false
 			for _, entry := range res.listed {
 				if seq, ok := parseEntry(entry.Name); ok && seq >= r.seq {
-					pending[seq] = entry
-					fresh = true
+					if _, ok := pending[seq]; !ok {
+						pending[seq] = entry
+					}
 				}
 			}
 			for seq := range pending {
@@ -405,92 +483,10 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 					delete(pending, seq)
 				}
 			}
-			if !fresh {
-				return advanced, false, nil
-			}
-			continue
-		}
-
-		if look == nil {
-			look = make(chan struct {
-				listed []Entry
-				err    error
-			}, 1)
-			go func() {
-				listed, err := r.storage.List(r.ctx, r.prefix)
-				look <- struct {
-					listed []Entry
-					err    error
-				}{listed, err}
-			}()
-		}
-
-		eof, err := r.fetch(batch)
-		if err != nil {
-			if err == errNotFound {
-				return advanced, false, nil
-			}
-			return advanced, false, err
-		}
-		if eof {
-			return true, true, nil
-		}
-		advanced = true
-	}
-}
-
-func (r *walReader) nextBatch(pending map[int64]Entry) (batch []Entry, done bool) {
-	for i := 0; i < r.concurrency; i++ {
-		entry, ok := pending[r.seq+int64(i)]
-		if !ok {
-			break
-		}
-		if !strings.HasSuffix(entry.Name, segSuffix) {
-			if i == 0 && strings.HasSuffix(entry.Name, endSuffix) {
-				r.discard(r.prefix + "/" + entry.Name)
-				return nil, true
-			}
-			break
-		}
-		batch = append(batch, entry)
-	}
-	return batch, false
-}
-
-func (r *walReader) fetch(batch []Entry) (bool, error) {
-	chunks := make([][]byte, len(batch))
-	failures := make([]error, len(batch))
-	ready := make([]chan struct{}, len(batch))
-	for i := range ready {
-		ready[i] = make(chan struct{})
-	}
-
-	for i, entry := range batch {
-		if entry.Inline != nil {
-			chunks[i] = entry.Inline
-			close(ready[i])
-			continue
-		}
-		go func(i int, name string) {
-			defer close(ready[i])
-			chunks[i], failures[i] = r.storage.Get(r.ctx, r.prefix+"/"+name)
-		}(i, entry.Name)
-	}
-
-	for i := range batch {
-		<-ready[i]
-		if failures[i] != nil {
-			return false, failures[i]
-		}
-		select {
-		case r.ch <- chunks[i]:
 		case <-r.ctx.Done():
-			return true, nil
+			return advanced, false, r.ctx.Err()
 		}
-		r.seq++
-		r.discard(r.prefix + "/" + batch[i].Name)
 	}
-	return false, nil
 }
 
 func (r *walReader) discard(name string) {
