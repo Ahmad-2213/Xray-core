@@ -43,6 +43,10 @@ var (
 	driveFilesURL       = "https://www.googleapis.com/drive/v3/files"
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
 	driveInitialBackoff = 200 * time.Millisecond
+
+	driveAttemptTimeout = 30 * time.Second
+	driveFastRetries    = 2
+	driveFastRetryWait  = 200 * time.Millisecond
 )
 
 type driveStorage struct {
@@ -222,23 +226,32 @@ func retryableStatus(status int) bool {
 func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
 	backoff := s.backoff
 	var lastErr error
+	fastLeft := driveFastRetries
+	lastTransport := false
 
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
+			wait := jitter(backoff)
+			if lastTransport && fastLeft > 0 {
+				fastLeft--
+				wait = jitter(driveFastRetryWait)
+			} else {
+				backoff *= 2
+				if backoff > driveMaxBackoff {
+					backoff = driveMaxBackoff
+				}
+			}
 			select {
 			case <-ctx.Done():
 				return 0, nil, ctx.Err()
-			case <-time.After(jitter(backoff)):
-			}
-			backoff *= 2
-			if backoff > driveMaxBackoff {
-				backoff = driveMaxBackoff
+			case <-time.After(wait):
 			}
 		}
 
 		token, err := s.accessToken(ctx)
 		if err != nil {
 			lastErr = err
+			lastTransport = false
 			continue
 		}
 
@@ -252,7 +265,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if body != nil {
 			reader = bytes.NewReader(body)
 		}
-		req, err := http.NewRequestWithContext(ctx, method, target, reader)
+		attemptCtx, cancel := context.WithTimeout(ctx, driveAttemptTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
 		if err != nil {
 			return 0, nil, errors.New("failed to build a Drive request").Base(err)
 		}
@@ -268,6 +283,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				return 0, nil, ctx.Err()
 			}
 			lastErr = errors.New("Drive request failed").Base(err)
+			lastTransport = true
 			errors.LogWarningInner(ctx, err, "retrying a failed Drive request, attempt ",
 				attempt+1, " of ", driveMaxAttempts)
 			continue
@@ -279,8 +295,10 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				return 0, nil, ctx.Err()
 			}
 			lastErr = errors.New("failed to read the Drive response").Base(err)
+			lastTransport = true
 			continue
 		}
+		lastTransport = false
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken()

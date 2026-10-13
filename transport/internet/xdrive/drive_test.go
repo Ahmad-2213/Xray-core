@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	stdnet "net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -613,6 +614,123 @@ func TestDriveSessionClients(t *testing.T) {
 
 	if addrs := drive.seenAddrs(); len(addrs) != 2 {
 		t.Fatalf("fake drive saw %d client addresses, want 2", len(addrs))
+	}
+}
+
+func TestDriveAttemptTimeoutFailsFast(t *testing.T) {
+	newFakeDrive(t)
+
+	ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				time.Sleep(5 * time.Second)
+				c.Close()
+			}()
+		}
+	}()
+
+	previousFilesURL := driveFilesURL
+	previousTimeout := driveAttemptTimeout
+	previousFastWait := driveFastRetryWait
+	driveFilesURL = "http://" + ln.Addr().String()
+	driveAttemptTimeout = 50 * time.Millisecond
+	driveFastRetryWait = 5 * time.Millisecond
+	t.Cleanup(func() {
+		driveFilesURL = previousFilesURL
+		driveAttemptTimeout = previousTimeout
+		driveFastRetryWait = previousFastWait
+	})
+
+	storage := newDriveBackend(t)
+	start := time.Now()
+	_, _, err = storage.do(context.Background(), http.MethodPost, storage.filesURL+"?fields=id",
+		"application/json; charset=UTF-8", []byte(`{"name":"hung"}`))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("do() to a hung endpoint succeeded")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("hung do() took %v, want fast failure", elapsed)
+	}
+}
+
+func TestDriveFastRetryRecoversImmediately(t *testing.T) {
+	drive := newFakeDrive(t)
+
+	fakeAddr := strings.TrimPrefix(drive.server.URL, "http://")
+	ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	var mu sync.Mutex
+	conns := 0
+	go func() {
+		for {
+			downstream, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns++
+			first := conns == 1
+			mu.Unlock()
+			if first {
+				downstream.Close()
+				continue
+			}
+			upstream, err := stdnet.Dial("tcp", fakeAddr)
+			if err != nil {
+				downstream.Close()
+				continue
+			}
+			go func() {
+				io.Copy(upstream, downstream)
+				upstream.Close()
+				downstream.Close()
+			}()
+			go func() {
+				io.Copy(downstream, upstream)
+				upstream.Close()
+				downstream.Close()
+			}()
+		}
+	}()
+
+	previousFilesURL := driveFilesURL
+	previousBackoff := driveInitialBackoff
+	previousMaxBackoff := driveMaxBackoff
+	previousFastWait := driveFastRetryWait
+	previousFastRetries := driveFastRetries
+	driveFilesURL = "http://" + ln.Addr().String()
+	driveInitialBackoff = 2 * time.Second
+	driveMaxBackoff = 2 * time.Second
+	driveFastRetryWait = 5 * time.Millisecond
+	driveFastRetries = 2
+	t.Cleanup(func() {
+		driveFilesURL = previousFilesURL
+		driveInitialBackoff = previousBackoff
+		driveMaxBackoff = previousMaxBackoff
+		driveFastRetryWait = previousFastWait
+		driveFastRetries = previousFastRetries
+	})
+
+	storage := newDriveBackend(t)
+	start := time.Now()
+	if err := storage.Put(context.Background(), "streams/flaky/000000000.seg", []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("recovery after one transport failure took %v, want fast retry", elapsed)
 	}
 }
 
