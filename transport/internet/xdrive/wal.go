@@ -385,6 +385,11 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		err    error
 	}
 	var lookTimer <-chan time.Time
+	spinBound := r.eagerWindow
+	if spinBound <= 0 {
+		spinBound = r.holeTimeout
+	}
+	progressAt := time.Now()
 	for {
 		if e, ok := pending[r.seq]; ok {
 			if strings.HasSuffix(e.Name, errSuffix) {
@@ -430,8 +435,13 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			}(e.Name, ch)
 		}
 
-		if len(outstanding) == 0 && look == nil {
+		if spinBound > 0 && time.Since(progressAt) >= spinBound && (advanced || len(outstanding) > 0 || look != nil || lookTimer != nil) {
 			return advanced, false, nil
+		}
+		if len(outstanding) == 0 && look == nil && lookTimer == nil {
+			if !advanced || r.eagerWindow <= 0 {
+				return advanced, false, nil
+			}
 		}
 		if look == nil && lookTimer == nil {
 			fetch := func() ([]Entry, error) {
@@ -471,19 +481,24 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			delete(outstanding, r.seq)
 			if res.err != nil {
 				if res.err == errNotFound {
-					return advanced, false, nil
+					if _, ok := pending[r.seq]; ok {
+						delete(pending, r.seq)
+					}
+				} else {
+					return advanced, false, res.err
 				}
-				return advanced, false, res.err
+			} else {
+				name := pending[r.seq].Name
+				select {
+				case r.ch <- res.chunk:
+				case <-r.ctx.Done():
+					return true, true, nil
+				}
+				r.seq++
+				advanced = true
+				progressAt = time.Now()
+				r.discard(r.prefix + "/" + name)
 			}
-			name := pending[r.seq].Name
-			select {
-			case r.ch <- res.chunk:
-			case <-r.ctx.Done():
-				return true, true, nil
-			}
-			r.seq++
-			advanced = true
-			r.discard(r.prefix + "/" + name)
 		case res := <-look:
 			look = nil
 			if res.err != nil && res.err != errNotFound {
