@@ -489,12 +489,10 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			if res.err != nil && res.err != errNotFound {
 				return false, false, res.err
 			}
-			fresh := false
 			for _, entry := range res.listed {
 				if seq, ok := parseEntry(entry.Name); ok && seq >= r.seq {
 					if _, ok := pending[seq]; !ok {
 						pending[seq] = entry
-						fresh = true
 					}
 				}
 			}
@@ -503,13 +501,11 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 					delete(pending, seq)
 				}
 			}
-			if !fresh {
-				gap := r.minPollInterval
-				if gap < lookaheadMinGap {
-					gap = lookaheadMinGap
-				}
-				lookTimer = time.After(gap)
+			gap := r.minPollInterval
+			if gap < lookaheadMinGap {
+				gap = lookaheadMinGap
 			}
+			lookTimer = time.After(gap)
 		case <-lookTimer:
 			lookTimer = nil
 		case <-r.ctx.Done():
