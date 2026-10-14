@@ -351,6 +351,36 @@ func TestProbeHotWindowFollowsEagerWindow(t *testing.T) {
 	}
 }
 
+func TestProbeHedgeBeatsSlowQuery(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/hedge", 0, segSuffix), []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	drive.mu.Lock()
+	drive.listDelay = 1500 * time.Millisecond
+	drive.mu.Unlock()
+
+	start := time.Now()
+	entries, err := storage.probe(ctx, "streams/hedge", 0)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("probe returned %d entries, want 1", len(entries))
+	}
+	if d := time.Since(start); d >= 1300*time.Millisecond {
+		t.Fatalf("probe took %v, want under 1.3s", d)
+	}
+	waitFor(t, "hedged query to land", func() bool {
+		orLists, _ := driveCounts(drive)
+		return orLists == 2
+	})
+}
+
 func TestProbeSeesEnd(t *testing.T) {
 	_ = newFakeDrive(t)
 	storage := newDriveBackend(t)

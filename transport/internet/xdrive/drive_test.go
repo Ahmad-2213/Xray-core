@@ -42,6 +42,7 @@ type fakeDrive struct {
 	orLists       int
 	containsLists int
 	lastQuery     string
+	listDelay     time.Duration
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -191,6 +192,24 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	exact, prefix := parseFakeQuery(query)
 	or := parseFakeOr(query)
 
+	d.mu.Lock()
+	d.lastQuery = query
+	if len(or) > 0 {
+		d.orLists++
+	} else if prefix != "" {
+		d.containsLists++
+	}
+	delay := d.listDelay
+	d.listDelay = 0
+	d.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+	}
+
 	type entry struct {
 		ID          string `json:"id"`
 		Name        string `json:"name"`
@@ -201,12 +220,6 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	}{}
 
 	d.mu.Lock()
-	d.lastQuery = query
-	if len(or) > 0 {
-		d.orLists++
-	} else if prefix != "" {
-		d.containsLists++
-	}
 	for _, file := range d.files {
 		match := false
 		switch {

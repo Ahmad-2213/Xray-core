@@ -38,6 +38,7 @@ const (
 	listCacheTTL = 40 * time.Millisecond
 
 	probeWindowWidth = 64
+	probeHedgeDelay  = time.Second
 )
 
 var (
@@ -404,6 +405,38 @@ type driveFile struct {
 	description string
 }
 
+func (s *driveStorage) hedgedQuery(ctx context.Context, cond string) (map[string]driveFile, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type outcome struct {
+		found map[string]driveFile
+		err   error
+	}
+	ch := make(chan outcome, 2)
+	ask := func() {
+		found, err := s.query(ctx, cond)
+		select {
+		case ch <- outcome{found, err}:
+		case <-ctx.Done():
+		}
+	}
+	go ask()
+	timer := time.NewTimer(probeHedgeDelay)
+	defer timer.Stop()
+	var out outcome
+	select {
+	case out = <-ch:
+	case <-timer.C:
+		go ask()
+		select {
+		case out = <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return out.found, out.err
+}
+
 func (s *driveStorage) query(ctx context.Context, condition string) (map[string]driveFile, error) {
 	found := make(map[string]driveFile)
 	pageToken := ""
@@ -476,7 +509,7 @@ func (s *driveStorage) probe(ctx context.Context, prefix string, seq int64) ([]E
 	for _, name := range names {
 		quoted = append(quoted, "name = '"+quoteDriveValue(flatten(name))+"'")
 	}
-	found, err := s.query(ctx, "("+strings.Join(quoted, " or ")+")")
+	found, err := s.hedgedQuery(ctx, "("+strings.Join(quoted, " or ")+")")
 	if err != nil {
 		return nil, err
 	}
