@@ -390,6 +390,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		spinBound = r.holeTimeout
 	}
 	progressAt := time.Now()
+	var missAt time.Time
 	for {
 		if e, ok := pending[r.seq]; ok {
 			if strings.HasSuffix(e.Name, errSuffix) {
@@ -435,7 +436,10 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			}(e.Name, ch)
 		}
 
-		if spinBound > 0 && time.Since(progressAt) >= spinBound && (advanced || len(outstanding) > 0 || look != nil || lookTimer != nil) {
+		if spinBound > 0 && time.Since(progressAt) >= spinBound && len(outstanding) == 0 {
+			return advanced, false, nil
+		}
+		if spinBound > 0 && !missAt.IsZero() && time.Since(missAt) >= spinBound {
 			return advanced, false, nil
 		}
 		if len(outstanding) == 0 && look == nil && lookTimer == nil {
@@ -483,6 +487,9 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 				if res.err != errNotFound {
 					return advanced, false, res.err
 				}
+				if missAt.IsZero() {
+					missAt = time.Now()
+				}
 			} else {
 				name := pending[r.seq].Name
 				select {
@@ -493,6 +500,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 				r.seq++
 				advanced = true
 				progressAt = time.Now()
+				missAt = time.Time{}
 				r.discard(r.prefix + "/" + name)
 			}
 		case res := <-look:
