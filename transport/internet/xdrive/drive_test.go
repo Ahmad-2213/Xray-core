@@ -888,3 +888,46 @@ func TestDriveFronting(t *testing.T) {
 		}
 	}
 }
+
+func TestNoCooldownAfterServerError(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	drive.failOnceWith("upload", http.StatusInternalServerError, "boom")
+	done := make(chan error, 1)
+	go func() {
+		done <- storage.Put(ctx, "sessions/abc", []byte("x"))
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	start := time.Now()
+	if _, err := storage.List(ctx, "sessions"); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Fatalf("List after a 500 took %v, want under 100ms", d)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+}
+
+func TestCooldownAfterRateLimit(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	drive.failNext("upload")
+	if err := storage.Put(ctx, "sessions/abc", nil); err != nil {
+		t.Fatalf("Put did not survive a 429: %v", err)
+	}
+
+	start := time.Now()
+	if _, err := storage.List(ctx, "sessions"); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if d := time.Since(start); d < driveCooldown/2 {
+		t.Fatalf("request after a 429 took %v, want at least %v", d, driveCooldown/2)
+	}
+}
