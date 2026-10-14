@@ -889,6 +889,33 @@ func TestDriveFronting(t *testing.T) {
 	}
 }
 
+func TestDriveWarmupFetchesToken(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+
+	waitFor(t, "warmup token fetch", func() bool {
+		drive.mu.Lock()
+		defer drive.mu.Unlock()
+		return drive.tokens == 1
+	})
+	time.Sleep(200 * time.Millisecond)
+	drive.mu.Lock()
+	tokens := drive.tokens
+	drive.mu.Unlock()
+	if tokens != 1 {
+		t.Fatalf("fake saw %d token requests, want exactly 1", tokens)
+	}
+	if err := storage.Put(context.Background(), "sessions/warm", []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	drive.mu.Lock()
+	tokens = drive.tokens
+	drive.mu.Unlock()
+	if tokens != 1 {
+		t.Fatalf("fake saw %d token requests after Put, want still 1", tokens)
+	}
+}
+
 func TestNoCooldownAfterServerError(t *testing.T) {
 	drive := newFakeDrive(t)
 	storage := newDriveBackend(t)

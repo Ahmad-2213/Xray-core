@@ -109,7 +109,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		}
 	}
 
-	return &driveStorage{
+	s := &driveStorage{
 		folder:       config.RemoteFolder,
 		clientID:     config.Secrets[0],
 		clientSecret: config.Secrets[1],
@@ -126,7 +126,27 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			at      time.Time
 		}),
 		flights: make(map[string]*listFlight),
-	}, nil
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), driveMetaTimeout)
+		defer cancel()
+		token, err := s.accessToken(ctx)
+		if err != nil {
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.filesURL+"/"+s.folder+"?fields=id&supportsAllDrives=true", nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+	}()
+	return s, nil
 }
 
 func flatten(name string) string {
