@@ -15,6 +15,8 @@ import (
 const (
 	maxCoalescedTicks = 8
 
+	maxPartialInflight = 4
+
 	segSuffix = ".seg"
 	endSuffix = ".end"
 	errSuffix = ".err"
@@ -109,7 +111,9 @@ func (w *walWriter) flushLoop() {
 		case <-ticker.C:
 			w.mu.Lock()
 			if !w.closed && w.err == nil && len(w.buf) > 0 && w.readyToFlush() {
-				w.flushLocked()
+				if len(w.buf) >= w.segBytes || len(w.sem) < maxPartialInflight {
+					w.flushLocked()
+				}
 			}
 			done := w.closed || w.err != nil
 			w.mu.Unlock()
