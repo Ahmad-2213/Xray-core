@@ -43,6 +43,7 @@ type fakeDrive struct {
 	containsLists int
 	lastQuery     string
 	listDelay     time.Duration
+	listDelayNext time.Duration
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -183,11 +184,6 @@ func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
-	if d.shouldFail("list") {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
-
 	query := r.URL.Query().Get("q")
 	exact, prefix := parseFakeQuery(query)
 	or := parseFakeOr(query)
@@ -201,6 +197,10 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	delay := d.listDelay
 	d.listDelay = 0
+	if delay == 0 {
+		delay = d.listDelayNext
+		d.listDelayNext = 0
+	}
 	d.mu.Unlock()
 	if delay > 0 {
 		select {
@@ -208,6 +208,15 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+	if d.shouldFail("list") {
+		if status, body := d.failure("list"); status != 0 {
+			w.WriteHeader(status)
+			w.Write([]byte(body))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
 	}
 
 	type entry struct {
@@ -927,6 +936,70 @@ func TestDriveWarmupFetchesToken(t *testing.T) {
 	if tokens != 1 {
 		t.Fatalf("fake saw %d token requests after Put, want still 1", tokens)
 	}
+}
+
+func TestProbeHedgeCapped(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/hedgecap", 0, segSuffix), []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	drive.mu.Lock()
+	drive.listDelay = 1500 * time.Millisecond
+	drive.mu.Unlock()
+	start := time.Now()
+	if _, err := storage.probe(ctx, "streams/hedgecap", 0); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if d := time.Since(start); d >= 1300*time.Millisecond {
+		t.Fatalf("first probe took %v, want under 1.3s", d)
+	}
+
+	drive.mu.Lock()
+	drive.listDelay = 1500 * time.Millisecond
+	drive.mu.Unlock()
+	start = time.Now()
+	if _, err := storage.probe(ctx, "streams/hedgecap", 0); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if d := time.Since(start); d < 1300*time.Millisecond {
+		t.Fatalf("second probe took %v, want at least 1.3s without a hedge", d)
+	}
+	waitFor(t, "slow queries to land", func() bool {
+		orLists, _ := driveCounts(drive)
+		return orLists == 3
+	})
+}
+
+func TestProbeHedgeRecovers(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/hedgeerr", 0, segSuffix), []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	drive.mu.Lock()
+	drive.listDelay = 1200 * time.Millisecond
+	drive.listDelayNext = 300 * time.Millisecond
+	drive.mu.Unlock()
+	drive.failOnceWith("list", http.StatusNotFound, "gone")
+
+	entries, err := storage.probe(ctx, "streams/hedgeerr", 0)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("probe returned %d entries, want 1", len(entries))
+	}
+	waitFor(t, "hedged query to land", func() bool {
+		orLists, _ := driveCounts(drive)
+		return orLists == 2
+	})
 }
 
 func TestNoCooldownAfterServerError(t *testing.T) {

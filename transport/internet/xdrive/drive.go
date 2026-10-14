@@ -39,6 +39,7 @@ const (
 
 	probeWindowWidth = 64
 	probeHedgeDelay  = time.Second
+	probeHedgeGap    = 5 * time.Second
 )
 
 var (
@@ -72,6 +73,9 @@ type driveStorage struct {
 
 	coolMu    sync.Mutex
 	coolUntil time.Time
+
+	hedgeMu sync.Mutex
+	hedgeAt time.Time
 
 	idMu sync.Mutex
 	ids  map[string]string
@@ -420,21 +424,48 @@ func (s *driveStorage) hedgedQuery(ctx context.Context, cond string) (map[string
 		case <-ctx.Done():
 		}
 	}
+	now := time.Now()
+	s.hedgeMu.Lock()
+	hedge := now.Sub(s.hedgeAt) >= probeHedgeGap
+	if hedge {
+		s.hedgeAt = now
+	}
+	s.hedgeMu.Unlock()
 	go ask()
-	timer := time.NewTimer(probeHedgeDelay)
-	defer timer.Stop()
-	var out outcome
-	select {
-	case out = <-ch:
-	case <-timer.C:
-		go ask()
+	if !hedge {
 		select {
-		case out = <-ch:
+		case out := <-ch:
+			return out.found, out.err
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
 	}
-	return out.found, out.err
+	timer := time.NewTimer(probeHedgeDelay)
+	defer timer.Stop()
+	pending := 1
+	var firstErr error
+	for {
+		select {
+		case out := <-ch:
+			pending--
+			if out.err == nil {
+				return out.found, nil
+			}
+			if firstErr == nil {
+				firstErr = out.err
+			}
+			if pending == 0 {
+				return nil, firstErr
+			}
+		case <-timer.C:
+			if pending == 1 {
+				pending = 2
+				go ask()
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 func (s *driveStorage) query(ctx context.Context, condition string) (map[string]driveFile, error) {
