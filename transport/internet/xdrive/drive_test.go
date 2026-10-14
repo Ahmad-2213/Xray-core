@@ -45,6 +45,7 @@ type fakeDrive struct {
 	lastQuery     string
 	listDelay     time.Duration
 	listDelayNext time.Duration
+	uploadDelay   time.Duration
 	createStatus  int
 	mediaUploads  int
 }
@@ -161,6 +162,17 @@ func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	delay := d.uploadDelay
+	d.uploadDelay = 0
+	d.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+	}
 	d.mu.Lock()
 	status := d.createStatus
 	d.mu.Unlock()
@@ -1149,5 +1161,28 @@ func TestCooldownAfterRateLimit(t *testing.T) {
 	}
 	if d := time.Since(start); d < driveCooldown/2 {
 		t.Fatalf("request after a 429 took %v, want at least %v", d, driveCooldown/2)
+	}
+}
+
+func TestMetaWriteSurvivesSlowAttempt(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	previousAttempt := driveMetaAttemptTimeout
+	driveMetaAttemptTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { driveMetaAttemptTimeout = previousAttempt })
+
+	drive.mu.Lock()
+	drive.uploadDelay = 250 * time.Millisecond
+	drive.mu.Unlock()
+	drive.failOnceWith("upload", http.StatusInternalServerError, "boom")
+
+	start := time.Now()
+	if err := storage.Put(ctx, "sessions/slowwrite", []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if d := time.Since(start); d <= 150*time.Millisecond {
+		t.Fatalf("Put took %v, want more than the scaled 15s budget", d)
 	}
 }

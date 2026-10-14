@@ -52,6 +52,9 @@ var (
 	driveAttemptTimeout = 30 * time.Second
 	driveFastRetries    = 2
 	driveFastRetryWait  = 200 * time.Millisecond
+
+	driveMetaAttemptTimeout = 10 * time.Second
+	driveMetaTotalTimeout   = 60 * time.Second
 )
 
 type driveStorage struct {
@@ -255,10 +258,28 @@ func retryableStatus(status int) bool {
 }
 
 func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+	return s.doBudget(ctx, method, target, contentType, body, driveAttemptTimeout, 0)
+}
+
+func (s *driveStorage) doMeta(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+	return s.doBudget(ctx, method, target, contentType, body, driveAttemptTimeout, driveMetaTimeout)
+}
+
+func (s *driveStorage) doMetaWrite(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+	return s.doBudget(ctx, method, target, contentType, body, driveMetaAttemptTimeout, driveMetaTotalTimeout)
+}
+
+func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType string, body []byte, attemptTimeout, totalTimeout time.Duration) (int, []byte, error) {
 	backoff := s.backoff
 	var lastErr error
 	fastLeft := driveFastRetries
 	lastTransport := false
+
+	if totalTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, totalTimeout)
+		defer cancel()
+	}
 
 	s.coolMu.Lock()
 	until := s.coolUntil
@@ -307,7 +328,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if body != nil {
 			reader = bytes.NewReader(body)
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, driveAttemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		defer cancel()
 		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
 		if err != nil {
@@ -371,12 +392,6 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	}
 
 	return 0, nil, lastErr
-}
-
-func (s *driveStorage) doMeta(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
-	metaCtx, cancel := context.WithTimeout(ctx, driveMetaTimeout)
-	defer cancel()
-	return s.do(metaCtx, method, target, contentType, body)
 }
 
 func (s *driveStorage) invalidateToken() {
@@ -583,7 +598,7 @@ func (s *driveStorage) putInline(ctx context.Context, name string, data []byte) 
 		return errors.New("failed to build the inline metadata").Base(err)
 	}
 
-	status, payload, err := s.doMeta(ctx, http.MethodPost, s.filesURL+"?fields=id",
+	status, payload, err := s.doMetaWrite(ctx, http.MethodPost, s.filesURL+"?fields=id",
 		"application/json; charset=UTF-8", body)
 	if err != nil {
 		return err
