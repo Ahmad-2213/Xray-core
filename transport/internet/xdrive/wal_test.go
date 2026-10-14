@@ -937,8 +937,8 @@ func TestPartialCapBoundsFlushes(t *testing.T) {
 
 	putsCapped, gotCapped := run()
 	check(gotCapped)
-	if putsCapped > 12 {
-		t.Fatalf("capped run issued %d Puts, want <= 12", putsCapped)
+	if putsCapped > 14 {
+		t.Fatalf("capped run issued %d Puts, want <= 14", putsCapped)
 	}
 
 	oldCap := maxPartialInflight
@@ -948,6 +948,59 @@ func TestPartialCapBoundsFlushes(t *testing.T) {
 	check(gotHuge)
 
 	t.Logf("puts with cap=%d: %d, without cap: %d", oldCap, putsCapped, putsHuge)
+}
+
+type growStub struct {
+	*stubStorage
+}
+
+func (g *growStub) shouldGrow() bool {
+	return true
+}
+
+func TestGrowingFullSegmentsBypassCap(t *testing.T) {
+	const prefix = "streams/growfull"
+	interval := 20 * time.Millisecond
+	base := &stubStorage{data: make(map[string][]byte)}
+	s := &growStub{base}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newWALWriter(ctx, s, prefix, params{
+		segmentBytes:  1024,
+		flushInterval: interval,
+		concurrency:   8,
+		growth:        2,
+	})
+	if _, err := w.Write(make([]byte, 1024+2048+4096+8192)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := w.Write([]byte{0xBB}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	start := time.Now()
+	trail := objectName(prefix, 4, segSuffix)
+	for {
+		starts, _ := base.putStats()
+		if ts, ok := starts[trail]; ok {
+			if d := ts.Sub(start); d > 2*interval {
+				t.Fatalf("trailing Put started after %v, want within %v", d, 2*interval)
+			}
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("trailing Put never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	w.mu.Lock()
+	partial := w.partial
+	w.mu.Unlock()
+	if partial != 0 {
+		t.Fatalf("w.partial = %d, want 0 after Close", partial)
+	}
 }
 
 func TestPartialCapSkipsFullSegments(t *testing.T) {

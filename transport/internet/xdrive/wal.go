@@ -150,6 +150,7 @@ func (w *walWriter) flushLocked() error {
 	if n > w.segBytes {
 		n = w.segBytes
 	}
+	part := n < w.segBytes
 
 	chunk := make([]byte, n)
 	copy(chunk, w.buf[:n])
@@ -179,7 +180,6 @@ func (w *walWriter) flushLocked() error {
 		}
 	}
 
-	part := n < w.segBytes
 	if part {
 		w.partial++
 	}
