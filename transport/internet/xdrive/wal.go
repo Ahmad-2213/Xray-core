@@ -25,7 +25,7 @@ const (
 
 	probeSafetyNetInterval = time.Second
 	probeHotWindow         = 2 * time.Second
-	lookaheadMinGap        = probeSafetyNetInterval / 2
+	lookaheadMinGap        = 100 * time.Millisecond
 )
 
 func objectName(prefix string, seq int64, suffix string) string {
