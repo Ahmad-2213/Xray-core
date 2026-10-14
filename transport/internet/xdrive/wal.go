@@ -28,6 +28,11 @@ const (
 
 var maxPartialInflight = 4
 
+var errPeerStore = errors.New("the peer could not store the segment")
+var errHoleTimeout = errors.New("a segment never arrived while later ones did")
+
+var readerErrorGracePeriod = 30 * time.Second
+
 func objectName(prefix string, seq int64, suffix string) string {
 	return fmt.Sprintf("%s/%09d%s", prefix, seq, suffix)
 }
@@ -66,16 +71,19 @@ type walWriter struct {
 	partial  int
 	closed   bool
 	err      error
+
+	maxBufSize int // maximum buffer size before forced flush
 }
 
 func newWALWriter(ctx context.Context, storage Storage, prefix string, p params) *walWriter {
 	w := &walWriter{
-		ctx:      ctx,
-		storage:  storage,
-		prefix:   prefix,
-		params:   p,
-		segBytes: p.segmentBytes,
-		sem:      make(chan struct{}, p.concurrency),
+		ctx:        ctx,
+		storage:    storage,
+		prefix:     prefix,
+		params:     p,
+		segBytes:   p.segmentBytes,
+		sem:        make(chan struct{}, p.concurrency),
+		maxBufSize: p.concurrency * p.segmentBytes, // force flush after enough data
 	}
 	go w.flushLoop()
 	return w
@@ -126,6 +134,7 @@ func (w *walWriter) flushLoop() {
 }
 
 func (w *walWriter) readyToFlush() bool {
+	// This function must be called with w.mu held.
 	grew := len(w.buf) > w.lastSize
 	fresh := w.lastSize == 0
 	w.lastSize = len(w.buf)
@@ -291,12 +300,30 @@ func (r *walReader) run() {
 
 	delay := r.minPollInterval
 	active := time.Now()
+	var failSince time.Time
 	for {
 		polled := time.Now()
 		advanced, eof, err := r.poll()
 		if err != nil {
-			r.setErr(err)
-			return
+			if r.ctx.Err() != nil {
+				r.setErr(err)
+				return
+			}
+			switch errors.Cause(err) {
+			case errPeerStore, errHoleTimeout:
+				r.setErr(err)
+				return
+			}
+			if failSince.IsZero() {
+				failSince = time.Now()
+				errors.LogWarning(r.ctx, "transient WAL read error, retrying: ", err)
+			} else if time.Since(failSince) >= readerErrorGracePeriod {
+				r.setErr(err)
+				return
+			}
+			advanced = false
+		} else {
+			failSince = time.Time{}
 		}
 		if eof {
 			return
@@ -390,7 +417,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			r.holeSince = time.Now()
 		} else if time.Since(r.holeSince) >= r.holeTimeout {
 			return false, false, errors.New("segment ", r.seq,
-				" never arrived while later ones did, the peer lost it")
+				" never arrived while later ones did, the peer lost it").Base(errHoleTimeout)
 		}
 	} else {
 		r.holeSince = time.Time{}
@@ -415,7 +442,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		if e, ok := pending[r.seq]; ok {
 			if strings.HasSuffix(e.Name, errSuffix) {
 				r.discard(r.prefix + "/" + e.Name)
-				return advanced, false, errors.New("the peer could not store segment ", r.seq)
+				return advanced, false, errors.New("the peer could not store segment ", r.seq).Base(errPeerStore)
 			}
 			if strings.HasSuffix(e.Name, endSuffix) && len(outstanding) == 0 {
 				r.discard(r.prefix + "/" + e.Name)

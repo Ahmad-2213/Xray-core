@@ -1,7 +1,9 @@
 package xdrive
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -721,6 +723,8 @@ func TestWindowErrorStopsAtHead(t *testing.T) {
 
 var errTestBoom testError = "injected Get failure"
 
+var errProbeBoom testError = "injected probe failure"
+
 type testError string
 
 func (e testError) Error() string {
@@ -1101,5 +1105,121 @@ func TestPartialCapSkipsFullSegments(t *testing.T) {
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+type probeFlapStorage struct {
+	mu        sync.Mutex
+	failUntil time.Time
+	failErr   error
+	entries   []Entry
+	data      map[string][]byte
+}
+
+func (s *probeFlapStorage) probe(_ context.Context, _ string, _ int64) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Now().Before(s.failUntil) {
+		return nil, s.failErr
+	}
+	return s.entries, nil
+}
+
+func (s *probeFlapStorage) Put(_ context.Context, name string, data []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	s.data[name] = cp
+	return nil
+}
+
+func (s *probeFlapStorage) Get(_ context.Context, name string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cp, ok := s.data[name]; ok {
+		return append([]byte(nil), cp...), nil
+	}
+	return nil, errNotFound
+}
+
+func (s *probeFlapStorage) Delete(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s *probeFlapStorage) List(_ context.Context, _ string) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.entries, nil
+}
+
+func (s *probeFlapStorage) Close() error {
+	return nil
+}
+
+func TestReaderRidesOutTransientProbeFailure(t *testing.T) {
+	prefix := "streams/flap"
+	_, rel := stubNames(prefix, 4)
+	var entries []Entry
+	var want []byte
+	for i, name := range rel {
+		chunk := []byte{byte(i), byte(i + 1)}
+		want = append(want, chunk...)
+		entries = append(entries, Entry{Name: name, Inline: chunk})
+	}
+	entries = append(entries, Entry{Name: objectName("", 4, endSuffix)[1:]})
+	s := &probeFlapStorage{
+		failUntil: time.Now().Add(3 * time.Second),
+		failErr:   errProbeBoom,
+		entries:   entries,
+		data:      make(map[string][]byte),
+	}
+	p := params{concurrency: 4, minPollInterval: 5 * time.Millisecond, maxPollInterval: 20 * time.Millisecond, eagerWindow: time.Second, holeTimeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	r := newWALReader(ctx, s, prefix, p)
+	var got []byte
+	for chunk := range r.ch {
+		got = append(got, chunk...)
+	}
+	if d := time.Since(start); d < 2500*time.Millisecond {
+		t.Fatalf("reader finished in %v, want it to ride out the 3s outage", d)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("delivered %v, want %v", got, want)
+	}
+	if err := r.Err(); err != io.EOF {
+		t.Fatalf("Err returned %v, want EOF", err)
+	}
+}
+
+func TestReaderGivesUpAfterGracePeriod(t *testing.T) {
+	previousGrace := readerErrorGracePeriod
+	readerErrorGracePeriod = 300 * time.Millisecond
+	defer func() { readerErrorGracePeriod = previousGrace }()
+
+	s := &probeFlapStorage{
+		failUntil: time.Now().Add(time.Hour),
+		failErr:   errProbeBoom,
+		data:      make(map[string][]byte),
+	}
+	p := params{concurrency: 4, minPollInterval: 5 * time.Millisecond, maxPollInterval: 20 * time.Millisecond, eagerWindow: time.Second, holeTimeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	r := newWALReader(ctx, s, "streams/grace", p)
+	n := 0
+	for range r.ch {
+		n++
+	}
+	if n != 0 {
+		t.Fatalf("delivered %d chunks during a persistent outage", n)
+	}
+	if err := r.Err(); err != errProbeBoom {
+		t.Fatalf("Err returned %v, want the probe failure", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("reader took %v to give up", d)
 	}
 }
