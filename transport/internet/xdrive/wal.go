@@ -403,6 +403,12 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			}
 		}
 
+		if spinBound > 0 && !missAt.IsZero() && time.Since(missAt) >= spinBound {
+			if _, ok := outstanding[r.seq]; !ok {
+				return advanced, false, nil
+			}
+		}
+
 		for i := 0; len(outstanding) < r.concurrency; i++ {
 			seq := r.seq + int64(i)
 			e, ok := pending[seq]
@@ -437,9 +443,6 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		}
 
 		if spinBound > 0 && time.Since(progressAt) >= spinBound && len(outstanding) == 0 {
-			return advanced, false, nil
-		}
-		if spinBound > 0 && !missAt.IsZero() && time.Since(missAt) >= spinBound {
 			return advanced, false, nil
 		}
 		if len(outstanding) == 0 && look == nil && lookTimer == nil {
