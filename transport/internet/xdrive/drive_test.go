@@ -1002,6 +1002,37 @@ func TestProbeHedgeRecovers(t *testing.T) {
 	})
 }
 
+func TestProbeHedgeAfterFastProbes(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/hedgefast", 0, segSuffix), []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	for i := 0; i < 20; i++ {
+		if _, err := storage.probe(ctx, "streams/hedgefast", 0); err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+	}
+
+	drive.mu.Lock()
+	drive.listDelay = 1500 * time.Millisecond
+	drive.mu.Unlock()
+	start := time.Now()
+	if _, err := storage.probe(ctx, "streams/hedgefast", 0); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if d := time.Since(start); d >= 1300*time.Millisecond {
+		t.Fatalf("slow probe took %v, want under 1.3s", d)
+	}
+	waitFor(t, "hedged query to land", func() bool {
+		orLists, _ := driveCounts(drive)
+		return orLists == 22
+	})
+}
+
 func TestNoCooldownAfterServerError(t *testing.T) {
 	drive := newFakeDrive(t)
 	storage := newDriveBackend(t)

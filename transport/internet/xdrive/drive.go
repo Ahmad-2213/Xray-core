@@ -424,22 +424,7 @@ func (s *driveStorage) hedgedQuery(ctx context.Context, cond string) (map[string
 		case <-ctx.Done():
 		}
 	}
-	now := time.Now()
-	s.hedgeMu.Lock()
-	hedge := now.Sub(s.hedgeAt) >= probeHedgeGap
-	if hedge {
-		s.hedgeAt = now
-	}
-	s.hedgeMu.Unlock()
 	go ask()
-	if !hedge {
-		select {
-		case out := <-ch:
-			return out.found, out.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
 	timer := time.NewTimer(probeHedgeDelay)
 	defer timer.Stop()
 	pending := 1
@@ -459,8 +444,17 @@ func (s *driveStorage) hedgedQuery(ctx context.Context, cond string) (map[string
 			}
 		case <-timer.C:
 			if pending == 1 {
-				pending = 2
-				go ask()
+				now := time.Now()
+				s.hedgeMu.Lock()
+				allowed := now.Sub(s.hedgeAt) >= probeHedgeGap
+				if allowed {
+					s.hedgeAt = now
+				}
+				s.hedgeMu.Unlock()
+				if allowed {
+					pending = 2
+					go ask()
+				}
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
