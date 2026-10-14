@@ -225,6 +225,7 @@ func (w *walWriter) upload(seq int64, chunk []byte, partial bool) {
 		w.mu.Lock()
 		if w.err == nil {
 			w.err = errors.New("failed to store segment").Base(err)
+			errors.LogWarning(w.ctx, "xdrive: ", w.prefix, " failed: ", w.err)
 		}
 		w.mu.Unlock()
 		w.storage.Put(w.ctx, objectName(w.prefix, seq, errSuffix), nil)
@@ -616,6 +617,7 @@ func (r *walReader) setErr(err error) {
 	defer r.errMu.Unlock()
 	if r.err == nil {
 		r.err = err
+		errors.LogWarning(r.ctx, "xdrive: ", r.prefix, " failed: ", err)
 	}
 }
 
