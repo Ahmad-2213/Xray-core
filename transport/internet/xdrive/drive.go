@@ -326,15 +326,20 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			lastErr = errors.New("Drive is rate limiting: ", string(payload))
 			errors.LogWarning(ctx, "rate limited by Drive, attempt ",
 				attempt+1, " of ", driveMaxAttempts)
+			s.coolMu.Lock()
+			s.coolUntil = time.Now().Add(jitter(driveCooldown))
+			s.coolMu.Unlock()
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
-			s.coolMu.Lock()
-			s.coolUntil = time.Now().Add(jitter(driveCooldown))
-			s.coolMu.Unlock()
+			if resp.StatusCode == http.StatusTooManyRequests {
+				s.coolMu.Lock()
+				s.coolUntil = time.Now().Add(jitter(driveCooldown))
+				s.coolMu.Unlock()
+			}
 			continue
 		}
 		return resp.StatusCode, payload, nil
