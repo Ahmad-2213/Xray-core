@@ -65,7 +65,7 @@ func newServiceClient(streamSettings *internet.MemoryStreamConfig, timeout time.
 		}
 
 		var conn net.Conn
-		if streamSettings.FinalMask != nil {
+		if streamSettings != nil && streamSettings.FinalMask != nil {
 			conn, err = streamSettings.FinalMask.DialTCP(ctx, target)
 		} else {
 			conn, err = internet.DialSystem(ctx, target, sockopt)
