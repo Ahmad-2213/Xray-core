@@ -433,6 +433,72 @@ func TestLiveDriveWritePrimitives(t *testing.T) {
 		liveDeleteAll(t, shared, prefix)
 	}
 
+	for _, size := range []int{16 * 1024, 20 * 1024, 24 * 1024, 32 * 1024, 48 * 1024, 64 * 1024, 96 * 1024} {
+		prefix := fmt.Sprintf("%s/desclimit%dk", root, size/1024)
+		data := make([]byte, size)
+		if _, err := rand.Read(data); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+		desc := base64.StdEncoding.EncodeToString(data)
+		var lat []time.Duration
+		ok := 0
+		abort := ""
+		descLen := len(desc)
+		seen := false
+		for i := 0; i < 20; i++ {
+			name := fmt.Sprintf("%s/%02d", prefix, i)
+			start := time.Now()
+			err := shared.putInline(ctx, name, data)
+			d := time.Since(start)
+			if a := liveStepErr(0, err); a != "" {
+				abort = a
+				break
+			}
+			if !seen {
+				if found, err := shared.query(ctx, "name = '"+quoteDriveValue(flatten(name))+"'"); err != nil {
+					if a := liveStepErr(0, err); a != "" {
+						abort = a
+						break
+					}
+				} else if file, present := found[flatten(name)]; present {
+					descLen = len(file.description)
+					seen = true
+				}
+			}
+			lat = append(lat, d)
+			ok++
+		}
+		status := "200"
+		if ok == 0 && abort != "" {
+			status = abort
+		}
+		proberesp := 0
+		if ok > 0 {
+			if entries, err := shared.probe(ctx, prefix, 0); err != nil {
+				if a := liveStepErr(0, err); a != "" && abort == "" {
+					abort = a
+				}
+			} else {
+				type pseq struct {
+					seq int64
+					n   int
+				}
+				var ordered []pseq
+				for _, entry := range entries {
+					if seq, valid := parseEntry(entry.Name); valid {
+						ordered = append(ordered, pseq{seq, len(entry.Inline)})
+					}
+				}
+				sort.Slice(ordered, func(i, j int) bool { return ordered[i].seq < ordered[j].seq })
+				for i := 0; i < len(ordered) && i < 10; i++ {
+					proberesp += ordered[i].n
+				}
+			}
+		}
+		t.Logf("%-24s %-12s n=%-3d status=%-6s descb64=%-7d p50=%-9s p95=%-9s proberesp10=%-7d ok=%d/%d abort=%s", "inline-desc", fmt.Sprintf("%dk", size/1024), 20, status, descLen, liveQuantile(lat, 0.5), liveQuantile(lat, 0.95), proberesp, ok, 20, abort)
+		liveDeleteAll(t, shared, prefix)
+	}
+
 	warm := map[bool]*driveStorage{false: shared}
 	warmH2 := newStorage(true)
 	stores = append(stores, warmH2)
