@@ -562,10 +562,14 @@ func (s *driveStorage) Put(ctx context.Context, name string, data []byte) error 
 	if len(data) <= driveInlineLimit {
 		if err := s.putInline(ctx, name, data); err == nil {
 			return nil
+		} else if errors.Cause(err) != errInlineRejected {
+			return err
 		}
 	}
 	return s.putMedia(ctx, name, data)
 }
+
+var errInlineRejected = errors.New("Drive rejected the inline upload body")
 
 func (s *driveStorage) putInline(ctx context.Context, name string, data []byte) error {
 	flat := flatten(name)
@@ -585,8 +589,12 @@ func (s *driveStorage) putInline(ctx context.Context, name string, data []byte) 
 		return err
 	}
 	if status != http.StatusOK {
-		return errors.New("Drive rejected the inline upload of ", name,
+		err := errors.New("Drive rejected the inline upload of ", name,
 			" with ", status, ": ", string(payload))
+		if status >= 400 && status < 500 {
+			return err.Base(errInlineRejected)
+		}
+		return err
 	}
 
 	var parsed struct {

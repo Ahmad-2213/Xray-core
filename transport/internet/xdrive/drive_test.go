@@ -3,6 +3,7 @@ package xdrive
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -44,6 +45,8 @@ type fakeDrive struct {
 	lastQuery     string
 	listDelay     time.Duration
 	listDelayNext time.Duration
+	createStatus  int
+	mediaUploads  int
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -102,6 +105,9 @@ func (d *fakeDrive) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	d.mediaUploads++
+	d.mu.Unlock()
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -155,6 +161,13 @@ func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	status := d.createStatus
+	d.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		return
+	}
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -1031,6 +1044,69 @@ func TestProbeHedgeAfterFastProbes(t *testing.T) {
 		orLists, _ := driveCounts(drive)
 		return orLists == 22
 	})
+}
+
+func TestPutRejectedFallsBackToMedia(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	payload := []byte("hello media")
+	drive.failOnceWith("upload", http.StatusBadRequest, "bad description")
+	if err := storage.Put(ctx, "sessions/rejected", payload); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	drive.mu.Lock()
+	uploads := drive.mediaUploads
+	drive.mu.Unlock()
+	if uploads != 1 {
+		t.Fatalf("fake saw %d media uploads, want 1", uploads)
+	}
+	got, err := storage.Get(ctx, "sessions/rejected")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("Get returned %q, want %q", got, payload)
+	}
+}
+
+func TestPutServerErrorSkipsMediaPath(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	drive.mu.Lock()
+	drive.createStatus = http.StatusInternalServerError
+	drive.mu.Unlock()
+
+	if err := storage.Put(ctx, "sessions/err500", []byte("x")); err == nil {
+		t.Fatal("Put succeeded after persistent 500s")
+	}
+	drive.mu.Lock()
+	uploads := drive.mediaUploads
+	drive.mu.Unlock()
+	if uploads != 0 {
+		t.Fatalf("fake saw %d media uploads, want 0", uploads)
+	}
+}
+
+func TestPutCancelledSkipsMediaPath(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := storage.Put(ctx, "sessions/cancelled", []byte("x"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Put returned %v, want context.Canceled", err)
+	}
+	drive.mu.Lock()
+	uploads := drive.mediaUploads
+	drive.mu.Unlock()
+	if uploads != 0 {
+		t.Fatalf("fake saw %d media uploads, want 0", uploads)
+	}
 }
 
 func TestNoCooldownAfterServerError(t *testing.T) {
