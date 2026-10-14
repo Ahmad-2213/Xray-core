@@ -24,6 +24,8 @@ const (
 	probeSafetyNetInterval = time.Second
 	probeHotWindow         = 2 * time.Second
 	lookaheadMinGap        = 100 * time.Millisecond
+
+	maxSubmitSpacing = 500 * time.Millisecond
 )
 
 var maxPartialInflight = 4
@@ -71,6 +73,11 @@ type walWriter struct {
 	partial  int
 	closed   bool
 	err      error
+
+	upAvg       time.Duration
+	upN         int
+	lastSubmit  time.Time
+	submitEvery time.Duration
 
 	maxBufSize int // maximum buffer size before forced flush
 }
@@ -194,7 +201,37 @@ func (w *walWriter) flushLocked() error {
 	}
 
 	w.wg.Add(1)
+
+	// A full segment's upload takes one Drive create, roughly the same for
+	// every segment. Releasing all the slots at once therefore makes them
+	// finish as one cluster, and the reader then drains that cluster and
+	// waits. Spacing submissions by upload/parallelism keeps the same
+	// throughput but staggers the completions into a steady flow. Partials
+	// carry interactive latency and are never paced.
+	var pace time.Duration
+	if !part && w.submitEvery > 0 && !w.lastSubmit.IsZero() {
+		if d := w.submitEvery - time.Since(w.lastSubmit); d > 0 {
+			pace = d
+		}
+	}
+
 	w.mu.Unlock()
+
+	if pace > 0 {
+		timer := time.NewTimer(pace)
+		select {
+		case <-w.ctx.Done():
+			timer.Stop()
+			w.mu.Lock()
+			if part {
+				w.partial--
+			}
+			w.wg.Done()
+			return w.ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	select {
 	case w.sem <- struct{}{}:
 	case <-w.ctx.Done():
@@ -205,12 +242,37 @@ func (w *walWriter) flushLocked() error {
 		w.wg.Done()
 		return w.ctx.Err()
 	}
+
+	w.mu.Lock()
+	if !part {
+		w.lastSubmit = time.Now()
+	}
+	w.mu.Unlock()
+
 	go w.upload(seq, chunk, part)
 	w.mu.Lock()
 	return nil
 }
 
+// noteUpload records how long a full segment took to store so that
+// submissions can be spaced by that time over the available parallelism.
+func (w *walWriter) noteUpload(d time.Duration) {
+	if w.upN == 0 {
+		w.upAvg = d
+	} else {
+		w.upAvg = (w.upAvg*3 + d) / 4
+	}
+	w.upN++
+
+	every := w.upAvg / time.Duration(w.concurrency)
+	if every > maxSubmitSpacing {
+		every = maxSubmitSpacing
+	}
+	w.submitEvery = every
+}
+
 func (w *walWriter) upload(seq int64, chunk []byte, partial bool) {
+	start := time.Now()
 	defer w.wg.Done()
 	defer func() { <-w.sem }()
 	if partial {
@@ -229,6 +291,12 @@ func (w *walWriter) upload(seq int64, chunk []byte, partial bool) {
 		}
 		w.mu.Unlock()
 		w.storage.Put(w.ctx, objectName(w.prefix, seq, errSuffix), nil)
+	}
+
+	if !partial {
+		w.mu.Lock()
+		w.noteUpload(time.Since(start))
+		w.mu.Unlock()
 	}
 }
 

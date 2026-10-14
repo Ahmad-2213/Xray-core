@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1018,6 +1019,83 @@ type growStub struct {
 
 func (g *growStub) shouldGrow() bool {
 	return true
+}
+
+func TestWriterSpacesFullSegmentSubmissions(t *testing.T) {
+	const prefix = "streams/pace"
+	s := &stubStorage{data: make(map[string][]byte), defDelay: 100 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newWALWriter(ctx, s, prefix, params{
+		segmentBytes:  64,
+		flushInterval: 5 * time.Millisecond,
+		concurrency:   4,
+	})
+
+	// Warm the writer up: the first upload teaches it how long a Drive
+	// create takes, which is what sets the spacing.
+	if _, err := w.Write(make([]byte, 64)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	w.mu.Lock()
+	every := w.submitEvery
+	w.mu.Unlock()
+	if every <= 0 {
+		t.Fatalf("submitEvery = %v after a completed upload, want > 0", every)
+	}
+	if every >= maxSubmitSpacing {
+		t.Fatalf("submitEvery = %v, want less than the %v clamp", every, maxSubmitSpacing)
+	}
+
+	_, base := s.putStats()
+	for i := 0; i < 4; i++ {
+		if _, err := w.Write(make([]byte, 64)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, calls := s.putStats()
+		if calls >= base+4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("uploads = %d, want at least %d", calls, base+4)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	starts, _ := s.putStats()
+
+	all := make([]time.Time, 0, len(starts))
+	for _, at := range starts {
+		all = append(all, at)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Before(all[j]) })
+	spread := all[len(all)-1].Sub(all[len(all)-4])
+	if spread < every {
+		t.Fatalf("4 full segments started within %v, want at least %v", spread, every)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestSubmitSpacingIsClamped(t *testing.T) {
+	w := &walWriter{params: params{concurrency: 4}}
+	w.noteUpload(60 * time.Second)
+	if w.submitEvery != maxSubmitSpacing {
+		t.Fatalf("submitEvery = %v, want the %v clamp", w.submitEvery, maxSubmitSpacing)
+	}
+	w.noteUpload(40 * time.Millisecond)
+	for i := 0; i < 60; i++ {
+		w.noteUpload(40 * time.Millisecond)
+	}
+	want := 40 * time.Millisecond / 4
+	if got := w.submitEvery; got < want || got > want+time.Millisecond {
+		t.Fatalf("submitEvery = %v after fast uploads, want %v", got, want)
+	}
 }
 
 func TestGrowingFullSegmentsBypassCap(t *testing.T) {
