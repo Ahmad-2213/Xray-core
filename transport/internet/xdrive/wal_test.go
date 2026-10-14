@@ -323,6 +323,34 @@ func TestProbeHotMissesSkipSafetyNet(t *testing.T) {
 	}
 }
 
+func TestProbeHotWindowFollowsEagerWindow(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	if err := storage.Put(ctx, objectName("streams/hotwin", 0, segSuffix), []byte("x")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	r := manualReader(storage, "streams/hotwin", params{concurrency: 8, holeTimeout: 100 * time.Millisecond})
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	r.eagerWindow = 3 * time.Second
+
+	time.Sleep(2500 * time.Millisecond)
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if _, containsLists := driveCounts(drive); containsLists != 0 {
+		t.Fatalf("hot probes ran %d full lists, want 0", containsLists)
+	}
+}
+
 func TestProbeSeesEnd(t *testing.T) {
 	_ = newFakeDrive(t)
 	storage := newDriveBackend(t)

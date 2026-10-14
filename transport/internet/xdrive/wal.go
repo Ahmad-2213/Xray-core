@@ -350,7 +350,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			r.lastHit = time.Now()
 		} else if perr != errNotFound {
 			return false, false, perr
-		} else if time.Since(r.lastHit) < probeHotWindow {
+		} else if time.Since(r.lastHit) < max(probeHotWindow, r.eagerWindow) {
 			return false, false, nil
 		} else if r.missSince.IsZero() {
 			r.missSince = time.Now()
