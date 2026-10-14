@@ -15,8 +15,6 @@ import (
 const (
 	maxCoalescedTicks = 8
 
-	maxPartialInflight = 4
-
 	segSuffix = ".seg"
 	endSuffix = ".end"
 	errSuffix = ".err"
@@ -27,6 +25,8 @@ const (
 	probeHotWindow         = 2 * time.Second
 	lookaheadMinGap        = 100 * time.Millisecond
 )
+
+var maxPartialInflight = 4
 
 func objectName(prefix string, seq int64, suffix string) string {
 	return fmt.Sprintf("%s/%09d%s", prefix, seq, suffix)
@@ -63,6 +63,7 @@ type walWriter struct {
 	segBytes int
 	lastSize int
 	held     int
+	partial  int
 	closed   bool
 	err      error
 }
@@ -111,7 +112,7 @@ func (w *walWriter) flushLoop() {
 		case <-ticker.C:
 			w.mu.Lock()
 			if !w.closed && w.err == nil && len(w.buf) > 0 && w.readyToFlush() {
-				if len(w.buf) >= w.segBytes || len(w.sem) < maxPartialInflight {
+				if len(w.buf) >= w.segBytes || w.partial < maxPartialInflight {
 					w.flushLocked()
 				}
 			}
@@ -178,23 +179,38 @@ func (w *walWriter) flushLocked() error {
 		}
 	}
 
+	part := n < w.segBytes
+	if part {
+		w.partial++
+	}
+
 	w.wg.Add(1)
 	w.mu.Unlock()
 	select {
 	case w.sem <- struct{}{}:
 	case <-w.ctx.Done():
 		w.mu.Lock()
+		if part {
+			w.partial--
+		}
 		w.wg.Done()
 		return w.ctx.Err()
 	}
-	go w.upload(seq, chunk)
+	go w.upload(seq, chunk, part)
 	w.mu.Lock()
 	return nil
 }
 
-func (w *walWriter) upload(seq int64, chunk []byte) {
+func (w *walWriter) upload(seq int64, chunk []byte, partial bool) {
 	defer w.wg.Done()
 	defer func() { <-w.sem }()
+	if partial {
+		defer func() {
+			w.mu.Lock()
+			w.partial--
+			w.mu.Unlock()
+		}()
+	}
 
 	if err := w.storage.Put(w.ctx, objectName(w.prefix, seq, segSuffix), chunk); err != nil {
 		w.mu.Lock()

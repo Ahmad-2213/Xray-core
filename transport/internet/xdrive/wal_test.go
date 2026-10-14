@@ -430,15 +430,41 @@ type stubStorage struct {
 	inflight    int
 	maxInflight int
 	startedGets int
+	putStarts   map[string]time.Time
+	putCalls    int
 }
 
-func (s *stubStorage) Put(_ context.Context, name string, data []byte) error {
+func (s *stubStorage) Put(ctx context.Context, name string, data []byte) error {
+	s.mu.Lock()
+	if s.putStarts == nil {
+		s.putStarts = make(map[string]time.Time)
+	}
+	s.putStarts[name] = time.Now()
+	s.putCalls++
+	s.mu.Unlock()
+
+	select {
+	case <-time.After(200 * time.Millisecond):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	s.data[name] = cp
 	return nil
+}
+
+func (s *stubStorage) putStats() (map[string]time.Time, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	starts := make(map[string]time.Time, len(s.putStarts))
+	for k, v := range s.putStarts {
+		starts[k] = v
+	}
+	return starts, s.putCalls
 }
 
 func (s *stubStorage) Get(ctx context.Context, name string) ([]byte, error) {
@@ -860,5 +886,109 @@ func TestWindowBacklogDrainsPipelined(t *testing.T) {
 	orLists, containsLists := driveCounts(drive)
 	if orLists < 2 || orLists > 4 || containsLists != 0 {
 		t.Fatalf("backlog drain issued %d probes and %d full lists, want 2-4 probes and 0 full lists", orLists, containsLists)
+	}
+}
+
+func TestPartialCapBoundsFlushes(t *testing.T) {
+	const prefix = "streams/partial"
+	const total = 200
+	run := func() (int, []byte) {
+		s := &stubStorage{data: make(map[string][]byte)}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		w := newWALWriter(ctx, s, prefix, params{
+			segmentBytes:  1 << 20,
+			flushInterval: 45 * time.Millisecond,
+			concurrency:   8,
+		})
+		tick := time.NewTicker(5 * time.Millisecond)
+		defer tick.Stop()
+		for i := 0; i < total; i++ {
+			<-tick.C
+			if _, err := w.Write([]byte{byte(i)}); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		_, puts := s.putStats()
+		var got []byte
+		for seq := 0; ; seq++ {
+			chunk, ok := s.data[objectName(prefix, int64(seq), segSuffix)]
+			if !ok {
+				break
+			}
+			got = append(got, chunk...)
+		}
+		return puts, got
+	}
+	check := func(got []byte) {
+		t.Helper()
+		if len(got) != total {
+			t.Fatalf("reassembled %d bytes, want %d", len(got), total)
+		}
+		for i := range got {
+			if got[i] != byte(i) {
+				t.Fatalf("byte %d = %d, want %d", i, got[i], byte(i))
+			}
+		}
+	}
+
+	putsCapped, gotCapped := run()
+	check(gotCapped)
+	if putsCapped > 12 {
+		t.Fatalf("capped run issued %d Puts, want <= 12", putsCapped)
+	}
+
+	oldCap := maxPartialInflight
+	maxPartialInflight = 1 << 30
+	defer func() { maxPartialInflight = oldCap }()
+	putsHuge, gotHuge := run()
+	check(gotHuge)
+
+	t.Logf("puts with cap=%d: %d, without cap: %d", oldCap, putsCapped, putsHuge)
+}
+
+func TestPartialCapSkipsFullSegments(t *testing.T) {
+	const prefix = "streams/trailing"
+	const segBytes = 1024
+	const full = 32
+	interval := 20 * time.Millisecond
+	s := &stubStorage{data: make(map[string][]byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newWALWriter(ctx, s, prefix, params{
+		segmentBytes:  segBytes,
+		flushInterval: interval,
+		concurrency:   40,
+	})
+	bulk := make([]byte, full*segBytes)
+	for i := range bulk {
+		bulk[i] = byte(i)
+	}
+	if _, err := w.Write(bulk); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := w.Write([]byte{0xAA}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	start := time.Now()
+	trail := objectName(prefix, full, segSuffix)
+	for {
+		starts, _ := s.putStats()
+		if ts, ok := starts[trail]; ok {
+			if d := ts.Sub(start); d > 2*interval {
+				t.Fatalf("trailing Put started after %v, want within %v", d, 2*interval)
+			}
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("trailing Put never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
