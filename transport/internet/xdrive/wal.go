@@ -26,6 +26,11 @@ const (
 	lookaheadMinGap        = 100 * time.Millisecond
 
 	maxSubmitSpacing = 500 * time.Millisecond
+
+	// inlineRampSegments is how many full segments the writer emits at the
+	// current ramp size before doubling it. Eight 16 KiB segments is 128 KiB,
+	// which covers a TLS handshake and a request with room to spare.
+	inlineRampSegments = 8
 )
 
 var maxPartialInflight = 4
@@ -79,6 +84,7 @@ type walWriter struct {
 	lastSubmit  time.Time
 	submitEvery time.Duration
 	wakeReader  func()
+	ramped      int
 
 	maxBufSize int // maximum buffer size before forced flush
 }
@@ -99,8 +105,26 @@ func newWALWriter(ctx context.Context, storage Storage, prefix string, p params)
 		sem:        make(chan struct{}, p.concurrency),
 		maxBufSize: p.concurrency * p.segmentBytes, // force flush after enough data
 	}
+	// A connection being set up is latency bound, not throughput bound, and
+	// a Drive inline create is about a second cheaper than a multipart one.
+	// So the first segments of a session are emitted at the inline size and
+	// then doubled up to the configured size. Bulk traffic walks out of the
+	// ramp within a second; a session that only carries small writes stays
+	// small, which is the right size for it anyway.
+	if start := rampStart(p.segmentBytes); start < p.segmentBytes {
+		w.segBytes = start
+	}
 	go w.flushLoop()
 	return w
+}
+
+// rampStart is the size the writer opens a session with, capped at what the
+// storage can store without a media body.
+func rampStart(segmentBytes int) int {
+	if driveInlineLimit < segmentBytes {
+		return driveInlineLimit
+	}
+	return segmentBytes
 }
 
 func (w *walWriter) Write(p []byte) (int, error) {
@@ -200,6 +224,21 @@ func (w *walWriter) flushLocked() error {
 					w.segBytes = limit
 				}
 			}
+		}
+	}
+
+	// Walk out of the latency ramp. Only full segments count, so a burst of
+	// small interactive writes does not push the writer into the bulk size
+	// before the session has actually started moving bulk data.
+	if n == w.segBytes && w.segBytes < w.segmentBytes {
+		w.ramped++
+		if w.ramped >= inlineRampSegments {
+			w.ramped = 0
+			m := w.segBytes * 2
+			if m > w.segmentBytes {
+				m = w.segmentBytes
+			}
+			w.segBytes = m
 		}
 	}
 

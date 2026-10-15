@@ -174,7 +174,7 @@ func TestGrowthCapHolds(t *testing.T) {
 	}
 }
 
-func TestGrowthNeverBelowConfigured(t *testing.T) {
+func TestWriterNeverExceedsConfigured(t *testing.T) {
 	_ = newFakeDrive(t)
 	storage := newDriveBackend(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -183,20 +183,59 @@ func TestGrowthNeverBelowConfigured(t *testing.T) {
 		storage.noteDelete(time.Millisecond)
 	}
 
-	const configured = 8 * 1024 * 1024
+	const configured = 262144
 	w := newWALWriter(ctx, storage, "streams/big", params{
 		segmentBytes:  configured,
 		flushInterval: time.Hour,
 		concurrency:   2,
-		growth:        2,
+		growth:        1,
 	})
 	defer w.wg.Wait()
 
-	if _, err := w.Write(make([]byte, configured+1)); err != nil {
+	// Enough to walk the whole ramp and then emit several segments at the
+	// configured size.
+	if _, err := w.Write(make([]byte, configured*12)); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	if w.segBytes != configured {
 		t.Fatalf("segBytes = %d, want configured %d", w.segBytes, configured)
+	}
+}
+
+func TestWriterRampsFromInlineSize(t *testing.T) {
+	s := &stubStorage{data: make(map[string][]byte)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const configured = 262144
+	w := newWALWriter(ctx, s, "streams/ramp", params{
+		segmentBytes:  configured,
+		flushInterval: time.Hour,
+		concurrency:   4,
+		growth:        1,
+	})
+	defer w.wg.Wait()
+
+	if w.segBytes != driveInlineLimit {
+		t.Fatalf("session opened at %d bytes, want the inline size %d", w.segBytes, driveInlineLimit)
+	}
+
+	// Every segment up to but not including the eighth stays inline.
+	if _, err := w.Write(make([]byte, driveInlineLimit*(inlineRampSegments-1))); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if w.segBytes != driveInlineLimit {
+		t.Fatalf("segBytes = %d after %d segments, want it still at the inline size %d",
+			w.segBytes, inlineRampSegments-1, driveInlineLimit)
+	}
+
+	if _, err := w.Write(make([]byte, driveInlineLimit)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if w.segBytes <= driveInlineLimit {
+		t.Fatalf("segBytes = %d, want it grown past the inline size", w.segBytes)
+	}
+	if w.segBytes > configured {
+		t.Fatalf("segBytes = %d, want at most the configured %d", w.segBytes, configured)
 	}
 }
 
