@@ -459,6 +459,67 @@ func TestSlotPageLoad(t *testing.T) {
 	}
 }
 
+// TestSlotSlowConsumer pins the loop that killed a real session.
+//
+// A consumer that stops reading fills the reader's buffer. If the reader only
+// acknowledges a slot once the bytes have been handed on, the writer's gate
+// shuts, the writer stops, and the consumer never gets the data it was waiting
+// for. Nothing times out quickly and nothing explains itself: the session just
+// goes quiet and eventually dies, taking every mux substream with it.
+//
+// Here the client writes steadily and never reads. The server must keep
+// writing regardless.
+func TestSlotSlowConsumer(t *testing.T) {
+	p := simSlotParams(262144, 8)
+	client, server, store := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+
+	// The server never reads, so its own read buffer fills, but that must not
+	// stop it writing.
+	writeErr := make(chan error, 1)
+	go func() {
+		chunk := make([]byte, 4096)
+		for i := 0; i < 200; i++ {
+			if _, err := server.Write(chunk); err != nil {
+				writeErr <- err
+				return
+			}
+		}
+		writeErr <- nil
+	}()
+
+	// The client reads slowly: one segment at a time, slowly enough that the
+	// buffer between reader and consumer is under pressure.
+	drained := make(chan int64, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var total int64
+		for i := 0; i < 200*4096; i++ {
+			n, err := client.Read(buf)
+			if err != nil {
+				break
+			}
+			total += int64(n)
+		}
+		drained <- total
+	}()
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("the server stopped writing: %v | clientReader=%q serverReader=%q",
+				err, client.reader.Stopped(), server.reader.Stopped())
+		}
+		t.Logf("the server wrote all 200 segments while the client was still reading | store=%d", store.total())
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the server stalled with a slow consumer | clientReader=%q serverReader=%q",
+			client.reader.Stopped(), server.reader.Stopped())
+	}
+	client.Close()
+	<-drained
+}
+
 // TestSlotSustained reports throughput and what it costs in Drive requests,
 // which is the budget that actually limits this transport.
 func TestSlotSustained(t *testing.T) {

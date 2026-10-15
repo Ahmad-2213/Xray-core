@@ -99,11 +99,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 	p := paramsFromConfig(config)
 
-	// A slot session is preferred where the storage can do it. It costs a few
-	// more objects up front and buys a round trip roughly 40% shorter, because
-	// neither side has to wait for Drive's index or run a listing to find a
-	// file the other already named. If the ring cannot be built, the segment
-	// protocol still works and is used instead.
 	if slots, ok := storage.(slotStore); ok {
 		table, err := buildSlotTable(ctx, slots, session, p)
 		if err == nil {
@@ -137,10 +132,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}), nil
 }
 
-// buildSlotTable creates the rings for both directions of a session. They are
-// created together because the count is set by how much of a full session is
-// in flight, and the objects are independent, so asking for them at once
-// costs one create's worth of time rather than fourteen.
 func buildSlotTable(ctx context.Context, store slotStore, session string, p params) ([2]slotTable, error) {
 	depth := p.concurrency
 	if depth > slotDepthLimit {
@@ -292,10 +283,6 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 		}
 		go l.drop(full)
 
-		// The announcement carries the slot rings when the client managed to
-		// build one. Its description is inline, so the server learns every file
-		// id it needs from the listing it was already going to run: no extra
-		// request, and nothing that has to wait for Drive's index.
 		if listed.Inline != nil {
 			if table, ok := decodeAnnounce(string(listed.Inline)); ok {
 				errors.LogInfo(logCtx, "accepted session ", session, " on a slot ring")
@@ -341,8 +328,6 @@ func (l *Listener) newSessionConn(session string) *Conn {
 		})
 }
 
-// newSlotSessionConn is the same session seen from the other side: the server
-// reads the ring the client is writing and writes the ring the client reads.
 func (l *Listener) newSlotSessionConn(session string, table slotAnnounce) *slotConn {
 	store, _ := l.storage.(slotStore)
 	shared := true

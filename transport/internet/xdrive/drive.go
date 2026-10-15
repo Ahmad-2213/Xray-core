@@ -54,9 +54,6 @@ var (
 	driveTokenURL       = "https://oauth2.googleapis.com/token"
 	driveFilesURL       = "https://www.googleapis.com/drive/v3/files"
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
-	// The media body of an object that already exists goes to this base with
-	// the file id spliced in before the query. The multipart URL above cannot
-	// be reused for it, because the id has to sit in the path, not the query.
 	driveUpdateURL      = "https://www.googleapis.com/upload/drive/v3/files"
 	driveInitialBackoff = 200 * time.Millisecond
 
@@ -686,13 +683,6 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 	return nil
 }
 
-// putMediaBody replaces the body of a file that already exists. The slot
-// transport uses it for segments too large for a description.
-//
-// The verb is PATCH, not POST. The upload endpoint mirrors the method of the
-// operation it performs, and a create is a POST while an update is not; a
-// POST here answers 404 for a file that is plainly there, which is a
-// particularly confusing way to be told the wrong thing.
 func (s *driveStorage) putMediaBody(ctx context.Context, id string, data []byte) error {
 	status, payload, err := s.do(ctx, http.MethodPatch,
 		s.updateURL+"/"+url.PathEscape(id)+"?uploadType=media&fields=id",
@@ -916,13 +906,6 @@ func (s *driveStorage) Close() error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// slot transport
-//
-// Every call below is addressed by a file id both peers already hold, so the
-// reader never waits on Drive's search index and never runs a listing to
-// discover what it could have been told once.
-
 func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error) {
 	body, err := json.Marshal(map[string]interface{}{
 		"name":    flatten(name),
@@ -972,9 +955,6 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 		return nil
 	}
 
-	// A segment too large for a description goes in the object body instead.
-	// The description still carries the sequence so the reader knows the slot
-	// is ready before it spends a download on it.
 	if err := s.putMediaBody(ctx, id, data); err != nil {
 		return err
 	}

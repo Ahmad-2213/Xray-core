@@ -1,16 +1,11 @@
 package xdrive
 
-// The connection that carries a slot session. It presents the same net.Conn
-// shape as Conn so everything above it, VLESS included, is unchanged; the
-// difference is entirely in how bytes reach Google Drive.
-
 import (
 	"context"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 )
 
@@ -72,11 +67,6 @@ func (c *slotConn) Read(b []byte) (int, error) {
 	n := copy(b, c.readBuf)
 	c.readBuf = c.readBuf[n:]
 	return n, nil
-}
-
-// Err reports why the peer stream stopped.
-func (r *slotReader) Err() error {
-	return errors.New(r.Stopped())
 }
 
 func (c *slotConn) Write(b []byte) (int, error) {
