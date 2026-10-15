@@ -59,6 +59,14 @@ const (
 	// so 14 KiB of payload encodes to about 18.7k characters.
 	slotInlineLimit = 14 * 1024
 
+	slotDepthLimit = 8
+)
+
+// The timings below are variables rather than constants so the simulator can
+// scale Drive's latencies and these together. Only the proportions between
+// them decide how the transport behaves, so a test that shrinks one and not
+// the other is testing something the real transport never does.
+var (
 	// The widest gap the reader will use while it still expects a segment.
 	// Drive commits a write in about a second, so asking more often than this
 	// only spends requests on answers that say "not yet". It is deliberately
@@ -67,14 +75,21 @@ const (
 	// the cheapest kind on the API.
 	slotHuntCeiling = 120 * time.Millisecond
 
-	// How many segments the reader will acknowledge with one watermark write.
-	// Four keeps the acknowledgement traffic near a twentieth of the payload
-	// traffic without letting the writer stall at the end of a lap.
-	slotAckStride = 4
+	// How far ahead of the reader's own acknowledgement a segment may be
+	// written. Two is enough to keep the writer busy through a watermark
+	// round trip without letting the reader fall out of the ring.
+	slotAckStride = 2
+
+	// How often the acknowledgement loop rechecks. A watermark write costs
+	// about a second, so this is a floor, not a rate.
+	slotAckRetry = 150 * time.Millisecond
 
 	// A watermark that stops moving means the reader is gone. Holding the
-	// writer is the safe answer; overwriting is not.
-	slotStallTimeout = 20 * time.Second
+	// writer is the safe answer; overwriting is not. The window is generous
+	// because acknowledgements are now retried until Drive confirms them, so
+	// reaching it really does mean the peer is gone rather than that one write
+	// happened to fail.
+	slotStallTimeout = 60 * time.Second
 
 	// How long a closing writer waits before giving up on a slot.
 	slotCloseGrace = 2 * time.Second
@@ -86,9 +101,12 @@ const (
 
 	// How many segments behind the head the reader will chase at once. Every
 	// one of them is a real Drive request, but a download costs about a
-	// second whether it runs alone or in company, so overlapping three is
-	// close to free and overlapping more just spends the request budget.
-	slotFetchAhead = 3
+	// second whether it runs alone or in company, so overlapping six is
+	// close to free and overlapping more just spends the request budget. Six
+	// rather than three matters for page loads: a dozen responses arriving
+	// together are collected six at a time rather than three, which is the
+	// difference between one round of fetches and two.
+	slotFetchAhead = 6
 
 	// The gap a segment behind the head settles into: about one arrival
 	// interval, bounded so an idle stream still checks in and a busy one
@@ -100,8 +118,6 @@ const (
 	// starting well below the ceiling only buys extra requests that are
 	// certain to come back empty.
 	slotHuntFloor = 50 * time.Millisecond
-
-	slotDepthLimit = 8
 )
 
 const (
@@ -303,6 +319,19 @@ func (w *slotWriter) Write(p []byte) (int, error) {
 // flushLoop turns a quiet stream into a segment without waiting for a write to
 // fill one. The first tick after a write that grew the buffer holds off, which
 // coalesces a burst without adding a round trip to a single small write.
+//
+// While the writer still has segments in flight the timer is ignored, unless
+// the buffer has already grown past half a segment. That is the difference
+// between a page load and a single request. A single request finds the pipe
+// idle and goes out immediately, at the smallest size, which is the cheapest
+// write there is. A page load arrives as a dozen responses inside a second,
+// and sending each as its own small segment means a dozen Drive writes at
+// roughly a second each, all competing for a handful of slots, which is how a
+// four slot ring turns a page load into a queue. Holding them until the
+// segment fills turns the same dozen responses into one or two writes.
+//
+// The wait is bounded by held regardless, so a stream that sends a trickle
+// still moves.
 func (w *slotWriter) flushLoop() {
 	ticker := time.NewTicker(w.flushInterval)
 	defer ticker.Stop()
@@ -317,11 +346,15 @@ func (w *slotWriter) flushLoop() {
 			done := w.closed || w.err != nil
 			ready := false
 			if !done && len(w.buf) > 0 && w.partial < maxPartialInflight {
+				busy := len(w.slots) > 0
 				grew := len(w.buf) > last
 				last = len(w.buf)
-				if grew && held < maxCoalescedTicks {
+				switch {
+				case busy && held < maxCoalescedTicks && len(w.buf) < w.segBytes/2:
 					held++
-				} else {
+				case grew && held < maxCoalescedTicks:
+					held++
+				default:
 					held = 0
 					ready = true
 				}
@@ -559,6 +592,7 @@ type slotReader struct {
 	mu          sync.Mutex
 	seq         int64
 	acked       int64
+	ackWanted   int64
 	started     bool
 	lastHit     time.Time
 	intervalAvg float64
@@ -581,6 +615,7 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		lastHit: time.Now(),
 	}
 	go r.run()
+	go r.ackLoop()
 	return r
 }
 
@@ -828,23 +863,57 @@ func (r *slotReader) hold(d, ceiling time.Duration) bool {
 	}
 }
 
-// consumed moves past a segment and, every few, tells the writer the slot it
-// was holding is free.
+// consumed moves past a segment and records that the slot it was holding is
+// free.
+//
+// The acknowledgement is not written here. It is handed to ackLoop, which
+// retries until Drive has it, because this value is the only thing standing
+// between a slow reader and a writer that will not touch a slot again. An
+// earlier version published it in a detached goroutine and threw the error
+// away; a single failed patch left the reader believing it had acknowledged,
+// so it did not try again for another few segments, the writer's gate stayed
+// shut, and after the stall timeout the writer tore the whole session down.
+// A page load is exactly the workload that produces a transient Drive error,
+// so that was not a rare path.
 func (r *slotReader) consumed(seq int64) {
 	r.mu.Lock()
 	r.seq = seq + 1
 	r.started = true
-	publish := seq-r.acked >= slotAckStride || r.acked < 0
-	if publish {
-		r.acked = seq
-	}
+	r.ackWanted = seq
 	r.mu.Unlock()
 
 	r.noteInterval()
 	r.armed()
+}
 
-	if publish {
-		go func() { _ = r.store.writeWatermark(r.ctx, r.table.Watermark, seq) }()
+// ackLoop keeps the peer's watermark current. It only records an
+// acknowledgement once Drive has confirmed it, and it always republishes the
+// furthest segment seen, so a failed write costs latency rather than the
+// session.
+func (r *slotReader) ackLoop() {
+	for {
+		if r.ctx.Err() != nil {
+			return
+		}
+		r.mu.Lock()
+		want, acked := r.ackWanted, r.acked
+		r.mu.Unlock()
+
+		if want > acked && want-acked >= int64(slotAckStride) {
+			if err := r.store.writeWatermark(r.ctx, r.table.Watermark, want); err == nil {
+				r.mu.Lock()
+				if want > r.acked {
+					r.acked = want
+				}
+				r.mu.Unlock()
+				continue
+			}
+		}
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(slotAckRetry):
+		}
 	}
 }
 

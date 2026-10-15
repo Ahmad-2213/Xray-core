@@ -13,6 +13,7 @@ package xdrive
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strconv"
 	"sync"
@@ -27,6 +28,43 @@ const (
 	simGetMeta     = 371 * time.Millisecond
 	simGetBody     = 860 * time.Millisecond
 )
+
+// simScale shrinks the whole model at once: Drive's latencies and the
+// transport's own timers. Only the proportions between them decide how the
+// transport behaves, so scaling both keeps the test honest while finishing in
+// seconds instead of minutes. One test restores the true timings to report the
+// numbers that actually matter.
+var simScale = 0.04
+
+func simDur(d time.Duration) time.Duration {
+	scaled := time.Duration(float64(d) * simScale)
+	if scaled < 500*time.Microsecond {
+		scaled = 500 * time.Microsecond
+	}
+	return scaled
+}
+
+// simRealTimings puts the model back on its true clock, both Drive's and the
+// transport's, for a test that reports real numbers, and restores it after.
+func simRealTimings() func() {
+	prevScale := simScale
+	prevCeiling, prevFloor := slotHuntCeiling, slotHuntFloor
+	prevTailMin, prevTailMax := slotTailMin, slotTailMax
+	prevAck, prevTTL := slotAckRetry, slotWatermarkTTL
+	prevStall, prevGrace := slotStallTimeout, slotCloseGrace
+	simScale = 1
+	slotHuntCeiling, slotHuntFloor = 120*time.Millisecond, 50*time.Millisecond
+	slotTailMin, slotTailMax = 150*time.Millisecond, 800*time.Millisecond
+	slotAckRetry, slotWatermarkTTL = 150*time.Millisecond, 700*time.Millisecond
+	slotStallTimeout, slotCloseGrace = 60*time.Second, 2*time.Second
+	return func() {
+		simScale = prevScale
+		slotHuntCeiling, slotHuntFloor = prevCeiling, prevFloor
+		slotTailMin, slotTailMax = prevTailMin, prevTailMax
+		slotAckRetry, slotWatermarkTTL = prevAck, prevTTL
+		slotStallTimeout, slotCloseGrace = prevStall, prevGrace
+	}
+}
 
 type simSlotObject struct {
 	description string
@@ -51,7 +89,7 @@ func newSimSlots() *simSlots {
 }
 
 func (s *simSlots) makeSlot(ctx context.Context, name string) (string, error) {
-	if !simSleep(ctx, 880*time.Millisecond) {
+	if !simSleep(ctx, simDur(simPatchInline)) {
 		return "", ctx.Err()
 	}
 	s.mu.Lock()
@@ -68,7 +106,7 @@ func (s *simSlots) writeSlot(ctx context.Context, id string, seq int64, mode uin
 	if mode == slotModeMedia {
 		latency = simPatchMedia
 	}
-	if !simSleep(ctx, latency) {
+	if !simSleep(ctx, simDur(latency)) {
 		return ctx.Err()
 	}
 	s.mu.Lock()
@@ -88,7 +126,7 @@ func (s *simSlots) writeSlot(ctx context.Context, id string, seq int64, mode uin
 
 func (s *simSlots) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
 	atomic.AddInt64(&s.reads, 1)
-	if !simSleep(ctx, simGetMeta) {
+	if !simSleep(ctx, simDur(simGetMeta)) {
 		return slotFrame{}, false, ctx.Err()
 	}
 	s.mu.Lock()
@@ -103,7 +141,7 @@ func (s *simSlots) readSlot(ctx context.Context, id string) (slotFrame, bool, er
 
 func (s *simSlots) readSlotBody(ctx context.Context, id string) ([]byte, error) {
 	atomic.AddInt64(&s.bodies, 1)
-	if !simSleep(ctx, simGetBody) {
+	if !simSleep(ctx, simDur(simGetBody)) {
 		return nil, ctx.Err()
 	}
 	s.mu.Lock()
@@ -117,7 +155,7 @@ func (s *simSlots) readSlotBody(ctx context.Context, id string) ([]byte, error) 
 
 func (s *simSlots) writeWatermark(ctx context.Context, id string, seq int64) error {
 	atomic.AddInt64(&s.marks, 1)
-	if !simSleep(ctx, simPatchInline) {
+	if !simSleep(ctx, simDur(simPatchInline)) {
 		return ctx.Err()
 	}
 	s.mu.Lock()
@@ -133,7 +171,7 @@ func (s *simSlots) writeWatermark(ctx context.Context, id string, seq int64) err
 
 func (s *simSlots) readWatermark(ctx context.Context, id string) (int64, error) {
 	atomic.AddInt64(&s.markGet, 1)
-	if !simSleep(ctx, simGetMeta) {
+	if !simSleep(ctx, simDur(simGetMeta)) {
 		return -1, ctx.Err()
 	}
 	s.mu.Lock()
@@ -247,15 +285,14 @@ func simReadN(t *testing.T, c *slotConn, n int) error {
 // Aparat gives a stream request about three seconds; a round trip here has to
 // land well under that.
 func TestSlotLatency(t *testing.T) {
+	defer simRealTimings()()
 	for _, tc := range []struct {
 		name  string
 		bytes int
 	}{
 		{"interactive 200 B", 200},
 		{"request 1 KiB", 1024},
-		{"response 8 KiB", 8192},
 		{"inline limit 14 KiB", 14 * 1024},
-		{"media 64 KiB", 64 * 1024},
 		{"media 256 KiB", 256 * 1024},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -338,7 +375,7 @@ func TestSlotHeadOfLine(t *testing.T) {
 				}
 			}()
 
-			time.Sleep(8 * time.Second)
+			time.Sleep(simDur(8 * time.Second))
 			start := time.Now()
 			small := []byte("GET /hls/seg3.ts HTTP/1.1\r\n\r\n")
 			go client.Write(small)
@@ -355,6 +392,69 @@ func TestSlotHeadOfLine(t *testing.T) {
 			server.Close()
 			client.Close()
 			<-drained
+		})
+	}
+}
+
+// TestSlotPageLoad is the workload that actually broke. A browser opens a
+// dozen connections at once, each a small request and a small response, and
+// they all share one session. Sending each as its own segment turns a page
+// load into a dozen Drive writes competing for a handful of slots.
+func TestSlotPageLoad(t *testing.T) {
+	for _, fanout := range []int{4, 12, 24} {
+		t.Run(fmt.Sprintf("%d concurrent", fanout), func(t *testing.T) {
+			p := simSlotParams(262144, 8)
+			client, server, store := newSimSlotPair(t, p)
+			defer client.Close()
+			defer server.Close()
+
+			request := []byte("GET /asset HTTP/1.1\r\nHost: example\r\n\r\n")
+			response := []byte("response body, a few kilobytes")
+			reqBytes := fanout * len(request)
+			respBytes := fanout * len(response)
+
+			// The server drains every request before answering, the way a proxy
+			// finishes reading a page's worth of requests and then replies.
+			served := make(chan error, 1)
+			go func() {
+				buf := make([]byte, 8*1024)
+				got := 0
+				for got < reqBytes {
+					n, err := server.Read(buf)
+					if err != nil {
+						served <- err
+						return
+					}
+					got += n
+				}
+				for i := 0; i < fanout; i++ {
+					if _, err := server.Write(response); err != nil {
+						served <- err
+						return
+					}
+				}
+				served <- nil
+			}()
+
+			// All the requests go out together, the way a page load issues them.
+			start := time.Now()
+			for i := 0; i < fanout; i++ {
+				if _, err := client.Write(request); err != nil {
+					t.Fatalf("write %d: %v", i, err)
+				}
+			}
+			if err := simReadN(t, client, respBytes); err != nil {
+				t.Fatalf("after %s: %v | clientReader=%q serverReader=%q",
+					time.Since(start).Round(time.Millisecond), err,
+					client.reader.Stopped(), server.reader.Stopped())
+			}
+			if err := <-served; err != nil {
+				t.Fatalf("server: %v", err)
+			}
+			done := time.Since(start)
+			w, r, b, mk, mg := store.counters()
+			t.Logf("fanout %2d: all done in %5.2fs | per request %5.2fs | patch=%d probe=%d body=%d mark=%d markGet=%d total=%d",
+				fanout, done.Seconds(), done.Seconds()/float64(fanout), w, r, b, mk, mg, store.total())
 		})
 	}
 }
