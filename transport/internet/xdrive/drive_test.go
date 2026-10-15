@@ -76,19 +76,22 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 	}
 	mux.HandleFunc("/token", record(drive.handleToken))
 	mux.HandleFunc("/upload", record(drive.handleUpload))
+	mux.HandleFunc("/upload/", record(drive.handleUploadBody))
 	mux.HandleFunc("/files", record(drive.handleFiles))
 	mux.HandleFunc("/files/", record(drive.handleFile))
 	drive.server = httptest.NewServer(mux)
 
-	previous := []string{driveTokenURL, driveFilesURL, driveUploadURL}
+	previous := []string{driveTokenURL, driveFilesURL, driveUploadURL, driveUpdateURL}
 	previousBackoff := driveInitialBackoff
 	driveTokenURL = drive.server.URL + "/token"
 	driveFilesURL = drive.server.URL + "/files"
-	driveUploadURL = drive.server.URL + "/upload"
+	driveUploadURL = drive.server.URL + "/upload?uploadType=multipart&fields=id"
+	driveUpdateURL = drive.server.URL + "/upload"
 	driveInitialBackoff = 5 * time.Millisecond
 
 	t.Cleanup(func() {
-		driveTokenURL, driveFilesURL, driveUploadURL = previous[0], previous[1], previous[2]
+		driveTokenURL, driveFilesURL = previous[0], previous[1]
+		driveUploadURL, driveUpdateURL = previous[2], previous[3]
 		driveInitialBackoff = previousBackoff
 		drive.server.Close()
 	})
@@ -151,6 +154,31 @@ func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
 	d.mu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]string{"id": id, "name": metadata.Name})
+}
+
+// handleUploadBody replaces the body of a file that already exists, which is
+// what the slot transport does for a segment too large for a description.
+func (d *fakeDrive) handleUploadBody(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/upload/")
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	file, ok := d.files[id]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	file.data = data
+	d.mediaUploads++
+	json.NewEncoder(w).Encode(map[string]string{"id": id})
 }
 
 func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -288,6 +316,20 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 	if ok && r.Method == http.MethodDelete {
 		delete(d.files, id)
 	}
+	if ok && r.Method == http.MethodPatch {
+		var meta struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &meta)
+		if meta.Description != "" {
+			file.description = meta.Description
+		}
+		if meta.Name != "" {
+			file.name = meta.Name
+		}
+	}
 	d.mu.Unlock()
 
 	if !ok {
@@ -298,11 +340,21 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if strings.Contains(r.URL.RawQuery, "fields=description") {
-		json.NewEncoder(w).Encode(map[string]string{"description": file.description})
+	if r.Method == http.MethodPatch {
+		json.NewEncoder(w).Encode(map[string]string{"id": id})
 		return
 	}
-	w.Write(file.data)
+	if strings.Contains(r.URL.RawQuery, "fields=description") {
+		d.mu.Lock()
+		description := file.description
+		d.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]string{"description": description})
+		return
+	}
+	d.mu.Lock()
+	data := file.data
+	d.mu.Unlock()
+	w.Write(data)
 }
 
 func (d *fakeDrive) shouldFail(kind string) bool {

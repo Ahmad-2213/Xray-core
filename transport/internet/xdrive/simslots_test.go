@@ -1,0 +1,410 @@
+package xdrive
+
+// Simulator for the slot transport, driven by the latencies measured against
+// the live Drive API on 2026-10-15:
+//
+//	files.patch, description only   876 ms median   (range 634-1619)
+//	files.patch, with media body    1270 ms
+//	files.get?fields=description    371 ms           5 quota units
+//	files.get?alt=media             860 ms          200 quota units
+//
+// Drive's index lag and files.list play no part here at all, which is the
+// point: the reader never waits for either.
+
+import (
+	"context"
+	"io"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+const (
+	simPatchInline = 880 * time.Millisecond
+	simPatchMedia  = 1270 * time.Millisecond
+	simGetMeta     = 371 * time.Millisecond
+	simGetBody     = 860 * time.Millisecond
+)
+
+type simSlotObject struct {
+	description string
+	content     []byte
+}
+
+type simSlots struct {
+	mu   sync.Mutex
+	byID map[string]*simSlotObject
+	next int
+
+	writes  int64
+	reads   int64
+	bodies  int64
+	marks   int64
+	markGet int64
+	bytes   int64
+}
+
+func newSimSlots() *simSlots {
+	return &simSlots{byID: map[string]*simSlotObject{}}
+}
+
+func (s *simSlots) makeSlot(ctx context.Context, name string) (string, error) {
+	if !simSleep(ctx, 880*time.Millisecond) {
+		return "", ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	id := "simslot-" + strconv.Itoa(s.next)
+	s.byID[id] = &simSlotObject{description: encodeWatermark(-1)}
+	return id, nil
+}
+
+func (s *simSlots) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	atomic.AddInt64(&s.writes, 1)
+	latency := simPatchInline
+	if mode == slotModeMedia {
+		latency = simPatchMedia
+	}
+	if !simSleep(ctx, latency) {
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok := s.byID[id]
+	if !ok {
+		object = &simSlotObject{}
+		s.byID[id] = object
+	}
+	object.description = encodeSlot(slotFrame{Seq: seq, Mode: mode, Data: data})
+	if mode == slotModeMedia {
+		object.content = append([]byte(nil), data...)
+	}
+	atomic.AddInt64(&s.bytes, int64(len(data)))
+	return nil
+}
+
+func (s *simSlots) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	atomic.AddInt64(&s.reads, 1)
+	if !simSleep(ctx, simGetMeta) {
+		return slotFrame{}, false, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok := s.byID[id]
+	if !ok {
+		return slotFrame{}, false, nil
+	}
+	frame, good := decodeSlot(object.description)
+	return frame, good, nil
+}
+
+func (s *simSlots) readSlotBody(ctx context.Context, id string) ([]byte, error) {
+	atomic.AddInt64(&s.bodies, 1)
+	if !simSleep(ctx, simGetBody) {
+		return nil, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok := s.byID[id]
+	if !ok {
+		return nil, errNotFound
+	}
+	return object.content, nil
+}
+
+func (s *simSlots) writeWatermark(ctx context.Context, id string, seq int64) error {
+	atomic.AddInt64(&s.marks, 1)
+	if !simSleep(ctx, simPatchInline) {
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok := s.byID[id]
+	if !ok {
+		object = &simSlotObject{}
+		s.byID[id] = object
+	}
+	object.description = encodeWatermark(seq)
+	return nil
+}
+
+func (s *simSlots) readWatermark(ctx context.Context, id string) (int64, error) {
+	atomic.AddInt64(&s.markGet, 1)
+	if !simSleep(ctx, simGetMeta) {
+		return -1, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	object, ok := s.byID[id]
+	if !ok {
+		return -1, nil
+	}
+	return decodeWatermark(object.description), nil
+}
+
+func (s *simSlots) counters() (writes, reads, bodies, marks, markGet int64) {
+	return atomic.LoadInt64(&s.writes), atomic.LoadInt64(&s.reads),
+		atomic.LoadInt64(&s.bodies), atomic.LoadInt64(&s.marks),
+		atomic.LoadInt64(&s.markGet)
+}
+
+func (s *simSlots) total() int64 {
+	w, r, b, mk, mg := s.counters()
+	return w + r + b + mk + mg
+}
+
+func (s *simSlots) Close() error { return nil }
+
+func simSleep(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func simSlotParams(segmentBytes, depth int) params {
+	return params{
+		segmentBytes:    segmentBytes,
+		flushInterval:   10 * time.Millisecond,
+		minPollInterval: 20 * time.Millisecond,
+		maxPollInterval: 400 * time.Millisecond,
+		eagerWindow:     2 * time.Second,
+		holeTimeout:     30 * time.Second,
+		sessionTTL:      time.Minute,
+		concurrency:     depth,
+		growth:          1,
+	}
+}
+
+// newSimSlotPair builds both ends of one session over a shared slot store,
+// exactly the way Dial and the listener build them.
+func newSimSlotPair(t *testing.T, p params) (*slotConn, *slotConn, *simSlots) {
+	t.Helper()
+	store := newSimSlots()
+	depth := 0
+	for _, id := range []string{} {
+		_ = id
+	}
+	_ = depth
+
+	build := func() slotTable {
+		table := slotTable{Slots: make([]string, 0, 8)}
+		for i := 0; i < p.concurrency && i < slotDepthLimit; i++ {
+			id, err := store.makeSlot(context.Background(), "")
+			if err != nil {
+				t.Fatalf("makeSlot: %v", err)
+			}
+			table.Slots = append(table.Slots, id)
+		}
+		mark, err := store.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Watermark = mark
+		return table
+	}
+
+	c2s, s2c := build(), build()
+	clientView := slotAnnounce{Uplink: c2s, Downlink: s2c}
+	serverView := slotAnnounce{Uplink: s2c, Downlink: c2s}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := newSlotConn(ctx, store, clientView, p, nil)
+	server := newSlotConn(ctx, store, serverView, p, nil)
+	return client, server, store
+}
+
+func simReadN(t *testing.T, c *slotConn, n int) error {
+	t.Helper()
+	got := 0
+	buf := make([]byte, 32*1024)
+	for got < n {
+		want := n - got
+		if want > len(buf) {
+			want = len(buf)
+		}
+		m, err := c.Read(buf[:want])
+		got += m
+		if err != nil {
+			if err == io.EOF {
+				return io.EOF
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// TestSlotLatency is the number that decides whether HLS can work at all.
+// Aparat gives a stream request about three seconds; a round trip here has to
+// land well under that.
+func TestSlotLatency(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		bytes int
+	}{
+		{"interactive 200 B", 200},
+		{"request 1 KiB", 1024},
+		{"response 8 KiB", 8192},
+		{"inline limit 14 KiB", 14 * 1024},
+		{"media 64 KiB", 64 * 1024},
+		{"media 256 KiB", 256 * 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := simSlotParams(256*1024, 6)
+			client, server, store := newSimSlotPair(t, p)
+			defer client.Close()
+			defer server.Close()
+
+			payload := make([]byte, tc.bytes)
+			for i := range payload {
+				payload[i] = byte(i * 7)
+			}
+
+			start := time.Now()
+			go client.Write(payload)
+			if err := simReadN(t, server, tc.bytes); err != nil {
+				t.Fatalf("upstream %v after %s | requests=%d | clientReader=%q serverReader=%q",
+					err, time.Since(start).Round(time.Millisecond), store.total(),
+					client.reader.Stopped(), server.reader.Stopped())
+			}
+			up := time.Since(start)
+
+			go server.Write(payload)
+			if err := simReadN(t, client, tc.bytes); err != nil {
+				t.Fatalf("downstream %v after %s | requests=%d | clientReader=%q serverReader=%q",
+					err, time.Since(start).Round(time.Millisecond), store.total(),
+					client.reader.Stopped(), server.reader.Stopped())
+			}
+			down := time.Since(start)
+
+			w, r, b, mk, mg := store.counters()
+			t.Logf("%-20s one way %5.2fs   ROUND TRIP %5.2fs   patch=%d probe=%d body=%d mark=%d markGet=%d  total=%d",
+				tc.name, up.Seconds(), down.Seconds(), w, r, b, mk, mg, store.total())
+		})
+	}
+}
+
+// TestSlotHeadOfLine is the download-in-progress case the user reported as
+// twenty seconds. Nothing in the slot path shares a budget with a bulk
+// segment, so this should land near the idle number.
+func TestSlotHeadOfLine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		segment int
+		depth   int
+	}{
+		{"depth 4, 256 KiB", 262144, 4},
+		{"depth 8, 256 KiB", 262144, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := simSlotParams(tc.segment, tc.depth)
+			client, server, store := newSimSlotPair(t, p)
+			defer client.Close()
+			defer server.Close()
+
+			// The download has to actually be drained, otherwise the client's
+			// reader fills up, stops publishing its watermark, and the server
+			// correctly refuses to overwrite a slot. That is the backpressure
+			// working, and it is worth having in the test.
+			drained := make(chan int64, 1)
+			go func() {
+				buf := make([]byte, 64*1024)
+				var total int64
+				for {
+					n, err := client.Read(buf)
+					if err != nil {
+						break
+					}
+					total += int64(n)
+				}
+				drained <- total
+			}()
+
+			go func() {
+				chunk := make([]byte, tc.segment)
+				for i := 0; i < 40; i++ {
+					if _, err := server.Write(chunk); err != nil {
+						return
+					}
+				}
+			}()
+
+			time.Sleep(8 * time.Second)
+			start := time.Now()
+			small := []byte("GET /hls/seg3.ts HTTP/1.1\r\n\r\n")
+			go client.Write(small)
+			if err := simReadN(t, server, len(small)); err != nil {
+				t.Fatalf("%v after %s | clientReader=%q serverReader=%q",
+					err, time.Since(start).Round(time.Millisecond),
+					client.reader.Stopped(), server.reader.Stopped())
+			}
+			t.Logf("%-20s interactive delivered in %6.2fs while %d Drive requests were in flight",
+				tc.name, time.Since(start).Seconds(), store.total())
+
+			// Close the sender first; the drainer then sees the end marker and
+			// stops on its own.
+			server.Close()
+			client.Close()
+			<-drained
+		})
+	}
+}
+
+// TestSlotSustained reports throughput and what it costs in Drive requests,
+// which is the budget that actually limits this transport.
+func TestSlotSustained(t *testing.T) {
+	p := simSlotParams(256*1024, 8)
+	client, server, store := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+
+	total := 4 << 20
+	go func() {
+		chunk := make([]byte, 262144)
+		for sent := 0; sent < total; {
+			n, err := server.Write(chunk)
+			if err != nil {
+				return
+			}
+			sent += n
+		}
+	}()
+
+	buf := make([]byte, 64*1024)
+	start := time.Now()
+	got, stalls := 0, 0
+	maxGap := time.Duration(0)
+	last := start
+	for got < total {
+		n, err := client.Read(buf)
+		if err != nil {
+			t.Fatalf("read %d/%d after %s: %v | clientReader=%q",
+				got, total, time.Since(start).Round(time.Millisecond), err, client.reader.Stopped())
+		}
+		got += n
+		d := time.Since(last)
+		if d > 500*time.Millisecond {
+			stalls++
+		}
+		if d > maxGap {
+			maxGap = d
+		}
+		last = time.Now()
+	}
+	elapsed := time.Since(start)
+	w, r, b, mk, mg := store.counters()
+	segments := float64(total) / 262144
+	t.Logf("4 MiB in %5.1fs = %4.0f KB/s | stalls>500ms=%d maxGap=%s | patch=%d probe=%d body=%d mark=%d markGet=%d",
+		elapsed.Seconds(), float64(total)/elapsed.Seconds()/1024, stalls, maxGap.Round(time.Millisecond), w, r, b, mk, mg)
+	t.Logf("   %.2f Drive requests per 256 KiB segment, %.1f requests per second",
+		float64(store.total())/segments, float64(store.total())/elapsed.Seconds())
+}

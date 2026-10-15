@@ -54,6 +54,10 @@ var (
 	driveTokenURL       = "https://oauth2.googleapis.com/token"
 	driveFilesURL       = "https://www.googleapis.com/drive/v3/files"
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
+	// The media body of an object that already exists goes to this base with
+	// the file id spliced in before the query. The multipart URL above cannot
+	// be reused for it, because the id has to sit in the path, not the query.
+	driveUpdateURL      = "https://www.googleapis.com/upload/drive/v3/files"
 	driveInitialBackoff = 200 * time.Millisecond
 
 	driveAttemptTimeout = 30 * time.Second
@@ -73,6 +77,7 @@ type driveStorage struct {
 	tokenURL     string
 	filesURL     string
 	uploadURL    string
+	updateURL    string
 	backoff      time.Duration
 
 	tokenMu     sync.Mutex
@@ -133,6 +138,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		tokenURL:     driveTokenURL,
 		filesURL:     driveFilesURL,
 		uploadURL:    driveUploadURL,
+		updateURL:    driveUpdateURL,
 		backoff:      driveInitialBackoff,
 		inflight:     make(chan struct{}, driveMaxInflight),
 		ids:          make(map[string]string),
@@ -680,6 +686,26 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 	return nil
 }
 
+// putMediaBody replaces the body of a file that already exists. The slot
+// transport uses it for segments too large for a description.
+//
+// The verb is PATCH, not POST. The upload endpoint mirrors the method of the
+// operation it performs, and a create is a POST while an update is not; a
+// POST here answers 404 for a file that is plainly there, which is a
+// particularly confusing way to be told the wrong thing.
+func (s *driveStorage) putMediaBody(ctx context.Context, id string, data []byte) error {
+	status, payload, err := s.do(ctx, http.MethodPatch,
+		s.updateURL+"/"+url.PathEscape(id)+"?uploadType=media&fields=id",
+		"application/octet-stream", data)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		return errors.New("Drive refused the slot body with ", status, ": ", string(payload))
+	}
+	return nil
+}
+
 func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 	flat := flatten(name)
 	id, err := s.resolveID(ctx, flat)
@@ -888,4 +914,160 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 func (s *driveStorage) Close() error {
 	s.client.CloseIdleConnections()
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// slot transport
+//
+// Every call below is addressed by a file id both peers already hold, so the
+// reader never waits on Drive's search index and never runs a listing to
+// discover what it could have been told once.
+
+func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error) {
+	body, err := json.Marshal(map[string]interface{}{
+		"name":    flatten(name),
+		"parents": []string{s.folder},
+	})
+	if err != nil {
+		return "", errors.New("failed to build the slot metadata").Base(err)
+	}
+	status, payload, err := s.doMetaWrite(ctx, http.MethodPost, s.filesURL+"?fields=id",
+		"application/json; charset=UTF-8", body)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", errors.New("Drive refused the slot ", name, " with ", status, ": ", string(payload))
+	}
+	var parsed struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return "", errors.New("failed to parse the slot response").Base(err)
+	}
+	if parsed.ID == "" {
+		return "", errors.New("Drive returned no id for slot ", name)
+	}
+	return parsed.ID, nil
+}
+
+func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	if mode == slotModeInline {
+		body, err := json.Marshal(map[string]interface{}{
+			"description": encodeSlot(slotFrame{Seq: seq, Mode: mode, Data: data}),
+		})
+		if err != nil {
+			return errors.New("failed to build the slot update").Base(err)
+		}
+		status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
+			s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
+			"application/json; charset=UTF-8", body)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return errors.New("Drive refused the slot update at segment ", seq,
+				" with ", status, ": ", string(payload))
+		}
+		return nil
+	}
+
+	// A segment too large for a description goes in the object body instead.
+	// The description still carries the sequence so the reader knows the slot
+	// is ready before it spends a download on it.
+	if err := s.putMediaBody(ctx, id, data); err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"description": encodeSlot(slotFrame{Seq: seq, Mode: mode}),
+	})
+	if err != nil {
+		return errors.New("failed to build the slot header").Base(err)
+	}
+	status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
+		"application/json; charset=UTF-8", body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return errors.New("Drive refused the slot header at segment ", seq,
+			" with ", status, ": ", string(payload))
+	}
+	return nil
+}
+
+func (s *driveStorage) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	status, payload, err := s.doMeta(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
+	if err != nil {
+		return slotFrame{}, false, err
+	}
+	if status == http.StatusNotFound {
+		return slotFrame{}, false, nil
+	}
+	if status != http.StatusOK {
+		return slotFrame{}, false, errors.New("Drive answered ", status, " for a slot: ", string(payload))
+	}
+	var parsed struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return slotFrame{}, false, errors.New("failed to parse the slot").Base(err)
+	}
+	frame, ok := decodeSlot(parsed.Description)
+	return frame, ok, nil
+}
+
+func (s *driveStorage) readSlotBody(ctx context.Context, id string) ([]byte, error) {
+	status, payload, err := s.do(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		return nil, errNotFound
+	}
+	if status != http.StatusOK {
+		return nil, errors.New("Drive answered ", status, " for a slot body: ", string(payload))
+	}
+	return payload, nil
+}
+
+func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64) error {
+	body, err := json.Marshal(map[string]interface{}{"description": encodeWatermark(seq)})
+	if err != nil {
+		return errors.New("failed to build the watermark").Base(err)
+	}
+	status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
+		"application/json; charset=UTF-8", body)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return errors.New("Drive refused the watermark at ", seq, " with ", status, ": ", string(payload))
+	}
+	return nil
+}
+
+func (s *driveStorage) readWatermark(ctx context.Context, id string) (int64, error) {
+	status, payload, err := s.doMeta(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
+	if err != nil {
+		return -1, err
+	}
+	if status == http.StatusNotFound {
+		return -1, nil
+	}
+	if status != http.StatusOK {
+		return -1, errors.New("Drive answered ", status, " for the watermark: ", string(payload))
+	}
+	var parsed struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return -1, errors.New("failed to parse the watermark").Base(err)
+	}
+	return decodeWatermark(parsed.Description), nil
 }
