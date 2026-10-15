@@ -21,13 +21,12 @@ import (
 const (
 	flatSeparator = "~"
 
-	driveBoundary    = "xdrive-boundary"
-	drivePageSize    = 1000
-	driveMaxAttempts = 8
-	driveMaxInflight = 32
-	// Slot acknowledgements draw on their own small pool so that a session
-	// full of polling can never starve the one request that releases a writer.
+	driveBoundary         = "xdrive-boundary"
+	drivePageSize         = 1000
+	driveMaxAttempts      = 8
+	driveMaxInflight      = 32
 	driveReservedInflight = 4
+	slotHeaderAttempts    = 4
 	driveInlineLimit      = 16 * 1024
 	driveTimeout          = 60 * time.Second
 
@@ -341,9 +340,6 @@ func (s *driveStorage) doBudgetPooled(ctx context.Context, method, target, conte
 			continue
 		}
 
-		// The acknowledgement that releases a writer's slot is the one request
-		// that must never queue behind polling, so it takes a reserved slot
-		// rather than a share of the general pool.
 		pool := s.inflight
 		if reserved {
 			pool = s.reserved
@@ -984,17 +980,30 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 	if err != nil {
 		return errors.New("failed to build the slot header").Base(err)
 	}
-	status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
-		s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
-		"application/json; charset=UTF-8", body)
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 0; attempt < slotHeaderAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+			}
+		}
+		status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
+			s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
+			"application/json; charset=UTF-8", body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if status != http.StatusOK {
+			lastErr = errors.New("Drive refused the slot header at segment ", seq,
+				" with ", status, ": ", string(payload))
+			continue
+		}
+		return nil
 	}
-	if status != http.StatusOK {
-		return errors.New("Drive refused the slot header at segment ", seq,
-			" with ", status, ": ", string(payload))
-	}
-	return nil
+	return lastErr
 }
 
 func (s *driveStorage) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {

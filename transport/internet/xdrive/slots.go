@@ -26,16 +26,17 @@ const (
 )
 
 var (
-	slotHuntCeiling  = 120 * time.Millisecond
-	slotHuntFloor    = 50 * time.Millisecond
-	slotTailMin      = 150 * time.Millisecond
-	slotTailMax      = 800 * time.Millisecond
-	slotFetchAhead   = 6
-	slotAckStride    = 2
-	slotAckRetry     = 150 * time.Millisecond
-	slotWatermarkTTL = 700 * time.Millisecond
-	slotStallTimeout = 60 * time.Second
-	slotCloseGrace   = 2 * time.Second
+	slotHuntCeiling   = 200 * time.Millisecond
+	slotHuntFloor     = 50 * time.Millisecond
+	slotTailMin       = 150 * time.Millisecond
+	slotTailMax       = 800 * time.Millisecond
+	slotFetchAhead    = 6
+	slotAckStride     = 2
+	slotAckRetry      = 100 * time.Millisecond
+	slotWriteAttempts = 3
+	slotWatermarkTTL  = 700 * time.Millisecond
+	slotStallTimeout  = 60 * time.Second
+	slotCloseGrace    = 2 * time.Second
 )
 
 type slotTiming struct {
@@ -394,29 +395,57 @@ func (w *slotWriter) await(seq int64) error {
 }
 
 func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
-	defer w.wg.Done()
-	defer w.unpark(part)
+	acquired := false
+	defer func() {
+		if acquired {
+			w.unpark(part)
+		} else {
+			w.release(part)
+		}
+		w.wg.Done()
+	}()
 
 	select {
 	case w.slots <- struct{}{}:
+		acquired = true
 	case <-w.ctx.Done():
 		return
 	}
+	var lastErr error
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		return
 	}
-	mode := uint8(slotModeMedia)
-	if len(chunk) <= slotInlineLimit {
-		mode = slotModeInline
+	for attempt := 0; attempt < slotWriteAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
+			}
+		}
+		mode := uint8(slotModeMedia)
+		if len(chunk) <= slotInlineLimit {
+			mode = slotModeInline
+		}
+		if err := w.store.writeSlot(w.ctx, id, seq, mode, chunk); err != nil {
+			lastErr = err
+			if w.ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		return
 	}
-	if err := w.store.writeSlot(w.ctx, id, seq, mode, chunk); err != nil {
-		w.fail(errors.New("failed to store segment ", seq).Base(err))
-	}
+	w.fail(errors.New("failed to store segment ", seq).Base(lastErr))
 }
 
 func (w *slotWriter) unpark(part bool) {
 	<-w.slots
+	w.release(part)
+}
+
+func (w *slotWriter) release(part bool) {
 	if !part {
 		return
 	}
@@ -739,9 +768,6 @@ func (r *slotReader) ackLoop() {
 				wait = r.tune.ackRetry
 				continue
 			}
-			// Every failed acknowledgement is retried, and a retry that
-			// hammers Drive starves the very poll the writer is waiting on,
-			// because both share one in-flight pool. Back off instead.
 			wait *= 2
 			if wait > 5*time.Second {
 				wait = 5 * time.Second
