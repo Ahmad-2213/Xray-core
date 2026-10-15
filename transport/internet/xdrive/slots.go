@@ -365,6 +365,7 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 func (w *slotWriter) await(seq int64) error {
 	start := time.Now()
 	deadline := start.Add(w.tune.stallTimeout)
+	wait := 100 * time.Millisecond
 	for {
 		ok, err := w.drained(seq)
 		if err == nil && ok {
@@ -376,10 +377,18 @@ func (w *slotWriter) await(seq int64) error {
 		if time.Now().After(deadline) || (closing && time.Since(start) > w.tune.closeGrace) {
 			return errors.New("the reader stopped acknowledging slot ", w.slotID(seq)).Base(err)
 		}
+		if err != nil {
+			wait *= 2
+			if wait > 2*time.Second {
+				wait = 2 * time.Second
+			}
+		} else {
+			wait = 100 * time.Millisecond
+		}
 		select {
 		case <-w.ctx.Done():
 			return w.ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(wait):
 		}
 	}
 }
@@ -711,6 +720,7 @@ func (r *slotReader) consumed(seq int64) {
 }
 
 func (r *slotReader) ackLoop() {
+	wait := r.tune.ackRetry
 	for {
 		if r.ctx.Err() != nil {
 			return
@@ -726,13 +736,21 @@ func (r *slotReader) ackLoop() {
 					r.acked = want
 				}
 				r.mu.Unlock()
+				wait = r.tune.ackRetry
 				continue
+			}
+			// Every failed acknowledgement is retried, and a retry that
+			// hammers Drive starves the very poll the writer is waiting on,
+			// because both share one in-flight pool. Back off instead.
+			wait *= 2
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
 			}
 		}
 		select {
 		case <-r.ctx.Done():
 			return
-		case <-time.After(r.tune.ackRetry):
+		case <-time.After(wait):
 		}
 	}
 }

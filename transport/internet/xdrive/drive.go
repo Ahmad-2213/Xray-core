@@ -25,8 +25,11 @@ const (
 	drivePageSize    = 1000
 	driveMaxAttempts = 8
 	driveMaxInflight = 32
-	driveInlineLimit = 16 * 1024
-	driveTimeout     = 60 * time.Second
+	// Slot acknowledgements draw on their own small pool so that a session
+	// full of polling can never starve the one request that releases a writer.
+	driveReservedInflight = 4
+	driveInlineLimit      = 16 * 1024
+	driveTimeout          = 60 * time.Second
 
 	// A listing is on the reader's critical path, so it gets a short
 	// per-attempt budget: one hung query must not stall delivery for the
@@ -82,6 +85,7 @@ type driveStorage struct {
 	tokenExpiry time.Time
 
 	inflight chan struct{}
+	reserved chan struct{}
 
 	coolMu    sync.Mutex
 	coolUntil time.Time
@@ -138,6 +142,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		updateURL:    driveUpdateURL,
 		backoff:      driveInitialBackoff,
 		inflight:     make(chan struct{}, driveMaxInflight),
+		reserved:     make(chan struct{}, driveReservedInflight),
 		ids:          make(map[string]string),
 		lists: make(map[string]struct {
 			entries []Entry
@@ -280,6 +285,14 @@ func (s *driveStorage) doMetaWrite(ctx context.Context, method, target, contentT
 }
 
 func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType string, body []byte, attemptTimeout, totalTimeout time.Duration) (int, []byte, error) {
+	return s.doBudgetPooled(ctx, method, target, contentType, body, attemptTimeout, totalTimeout, false)
+}
+
+func (s *driveStorage) doBudgetReserved(ctx context.Context, method, target, contentType string, body []byte, attemptTimeout, totalTimeout time.Duration) (int, []byte, error) {
+	return s.doBudgetPooled(ctx, method, target, contentType, body, attemptTimeout, totalTimeout, true)
+}
+
+func (s *driveStorage) doBudgetPooled(ctx context.Context, method, target, contentType string, body []byte, attemptTimeout, totalTimeout time.Duration, reserved bool) (int, []byte, error) {
 	backoff := s.backoff
 	var lastErr error
 	fastLeft := driveFastRetries
@@ -328,8 +341,15 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 			continue
 		}
 
+		// The acknowledgement that releases a writer's slot is the one request
+		// that must never queue behind polling, so it takes a reserved slot
+		// rather than a share of the general pool.
+		pool := s.inflight
+		if reserved {
+			pool = s.reserved
+		}
 		select {
-		case s.inflight <- struct{}{}:
+		case pool <- struct{}{}:
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
 		}
@@ -342,7 +362,7 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
 		if err != nil {
 			cancel()
-			<-s.inflight
+			<-pool
 			return 0, nil, errors.New("failed to build a Drive request").Base(err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -353,7 +373,7 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 		resp, err := s.client.Do(req)
 		if err != nil {
 			cancel()
-			<-s.inflight
+			<-pool
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
 			}
@@ -366,7 +386,7 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 		payload, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		cancel()
-		<-s.inflight
+		<-pool
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
@@ -1019,9 +1039,10 @@ func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64)
 	if err != nil {
 		return errors.New("failed to build the watermark").Base(err)
 	}
-	status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
+	status, payload, err := s.doBudgetReserved(ctx, http.MethodPatch,
 		s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
-		"application/json; charset=UTF-8", body)
+		"application/json; charset=UTF-8", body,
+		driveMetaAttemptTimeout, driveMetaTotalTimeout)
 	if err != nil {
 		return err
 	}
@@ -1032,8 +1053,9 @@ func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64)
 }
 
 func (s *driveStorage) readWatermark(ctx context.Context, id string) (int64, error) {
-	status, payload, err := s.doMeta(ctx, http.MethodGet,
-		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
+	status, payload, err := s.doBudgetReserved(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil,
+		queryAttemptTimeout, queryTotalTimeout)
 	if err != nil {
 		return -1, err
 	}
