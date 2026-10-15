@@ -29,10 +29,13 @@ type Conn struct {
 
 func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
+	reader := newWALReader(ctx, storage, readPrefix, p)
+	writer := newWALWriter(ctx, storage, writePrefix, p)
+	writer.setReaderWake(reader.Wake)
 	return &Conn{
 		cancel:  cancel,
-		writer:  newWALWriter(ctx, storage, writePrefix, p),
-		reader:  newWALReader(ctx, storage, readPrefix, p),
+		writer:  writer,
+		reader:  reader,
 		onClose: onClose,
 	}
 }

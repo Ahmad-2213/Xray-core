@@ -947,8 +947,34 @@ func TestWindowBacklogDrainsPipelined(t *testing.T) {
 		}
 	}
 	orLists, containsLists := driveCounts(drive)
-	if orLists < 2 || orLists > 4 || containsLists != 0 {
-		t.Fatalf("backlog drain issued %d probes and %d full lists, want 2-4 probes and 0 full lists", orLists, containsLists)
+	if orLists != 1 || containsLists != 0 {
+		t.Fatalf("backlog drain issued %d probes and %d full lists, want exactly 1 probe and 0 full lists", orLists, containsLists)
+	}
+}
+
+func TestProbeIdleIssuesOneQueryPerCycle(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	prefix := "streams/onequery"
+	for i := 0; i < 6; i++ {
+		if err := storage.Put(context.Background(),
+			objectName(prefix, int64(i), segSuffix), []byte("payload")); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	r := manualReader(storage, prefix, params{concurrency: 4, holeTimeout: time.Second})
+	if _, _, err := r.poll(); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if got := drainReader(t, r); len(got) != 6 {
+		t.Fatalf("delivered %d chunks, want 6", len(got))
+	}
+	// The listing that found the backlog already covered this sequence, so
+	// the first look-ahead must not immediately repeat it.
+	orLists, containsLists := driveCounts(drive)
+	if orLists != 1 || containsLists != 0 {
+		t.Fatalf("poll issued %d probes and %d full lists, want 1 and 0", orLists, containsLists)
 	}
 }
 

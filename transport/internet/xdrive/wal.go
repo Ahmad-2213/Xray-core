@@ -78,8 +78,15 @@ type walWriter struct {
 	upN         int
 	lastSubmit  time.Time
 	submitEvery time.Duration
+	wakeReader  func()
 
 	maxBufSize int // maximum buffer size before forced flush
+}
+
+func (w *walWriter) setReaderWake(fn func()) {
+	w.mu.Lock()
+	w.wakeReader = fn
+	w.mu.Unlock()
 }
 
 func newWALWriter(ctx context.Context, storage Storage, prefix string, p params) *walWriter {
@@ -244,10 +251,18 @@ func (w *walWriter) flushLocked() error {
 	}
 
 	w.mu.Lock()
+	wake := w.wakeReader
 	if !part {
 		w.lastSubmit = time.Now()
+		// A full segment means bulk traffic in this direction, so the
+		// reader should stop backing off and probe at the hot rate.
+		wake = w.wakeReader
 	}
 	w.mu.Unlock()
+
+	if wake != nil {
+		wake()
+	}
 
 	go w.upload(seq, chunk, part)
 	w.mu.Lock()
@@ -364,6 +379,15 @@ func (r *walReader) Wake() {
 	}
 }
 
+// lookGap paces look-ahead probes. It never drops below lookaheadMinGap, so
+// a re-armed probe can never be served from the list cache.
+func (r *walReader) lookGap() time.Duration {
+	if r.minPollInterval < lookaheadMinGap {
+		return lookaheadMinGap
+	}
+	return r.minPollInterval
+}
+
 func (r *walReader) run() {
 	defer close(r.ch)
 
@@ -468,6 +492,18 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		return false, false, nil
 	}
 
+	// The listing above already covered this sequence. Arm the timer now so
+	// the first look-ahead is not an immediate duplicate of it, and so the
+	// reader is never left without a probe in flight between poll cycles.
+	var look chan struct {
+		listed []Entry
+		err    error
+	}
+	var lookTimer <-chan time.Time
+	if probed {
+		lookTimer = time.After(r.lookGap())
+	}
+
 	pending := make(map[int64]Entry, len(listed))
 	ahead := false
 	for _, entry := range listed {
@@ -496,11 +532,6 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		chunk []byte
 		err   error
 	})
-	var look chan struct {
-		listed []Entry
-		err    error
-	}
-	var lookTimer <-chan time.Time
 	spinBound := r.eagerWindow
 	if spinBound <= 0 {
 		spinBound = r.holeTimeout
@@ -606,6 +637,11 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 				if res.err != errNotFound {
 					return advanced, false, res.err
 				}
+				// The entry left the window, so the refill loop cannot
+				// re-issue the same Get back to back. The look-ahead probe
+				// re-discovers the segment if the miss was Drive's index
+				// lagging behind its own upload.
+				delete(pending, r.seq)
 				if missAt.IsZero() {
 					missAt = time.Now()
 				}
@@ -639,11 +675,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 					delete(pending, seq)
 				}
 			}
-			gap := r.minPollInterval
-			if gap < lookaheadMinGap {
-				gap = lookaheadMinGap
-			}
-			lookTimer = time.After(gap)
+			lookTimer = time.After(r.lookGap())
 		case <-lookTimer:
 			lookTimer = nil
 		case <-r.ctx.Done():

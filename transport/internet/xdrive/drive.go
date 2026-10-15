@@ -28,8 +28,15 @@ const (
 	driveInlineLimit = 16 * 1024
 	driveTimeout     = 60 * time.Second
 
-	driveMetaTimeout = 15 * time.Second
-	driveCooldown    = 2 * time.Second
+	// A listing is on the reader's critical path, so it gets a short
+	// per-attempt budget: one hung query must not stall delivery for the
+	// whole total. Measured probe latency is well under two seconds.
+	queryAttemptTimeout = 8 * time.Second
+	queryTotalTimeout   = 30 * time.Second
+	driveWarmTimeout    = 15 * time.Second
+	driveCooldown       = 2 * time.Second
+
+	driveMaxIDs = 4096
 
 	minDeleteSamples = 3
 	deleteLatencyNum = 3
@@ -136,7 +143,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		flights: make(map[string]*listFlight),
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), driveMetaTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), driveWarmTimeout)
 		defer cancel()
 		token, err := s.accessToken(ctx)
 		if err != nil {
@@ -262,7 +269,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 }
 
 func (s *driveStorage) doMeta(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
-	return s.doBudget(ctx, method, target, contentType, body, driveAttemptTimeout, driveMetaTimeout)
+	return s.doBudget(ctx, method, target, contentType, body, queryAttemptTimeout, queryTotalTimeout)
 }
 
 func (s *driveStorage) doMetaWrite(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
@@ -329,9 +336,10 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 			reader = bytes.NewReader(body)
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		defer cancel()
 		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
 		if err != nil {
+			cancel()
+			<-s.inflight
 			return 0, nil, errors.New("failed to build a Drive request").Base(err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -340,8 +348,9 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 		}
 
 		resp, err := s.client.Do(req)
-		<-s.inflight
 		if err != nil {
+			cancel()
+			<-s.inflight
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
 			}
@@ -353,6 +362,8 @@ func (s *driveStorage) doBudget(ctx context.Context, method, target, contentType
 		}
 		payload, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		cancel()
+		<-s.inflight
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
@@ -402,6 +413,12 @@ func (s *driveStorage) invalidateToken() {
 
 func (s *driveStorage) rememberID(name, id string) {
 	s.idMu.Lock()
+	for len(s.ids) >= driveMaxIDs {
+		for k := range s.ids {
+			delete(s.ids, k)
+			break
+		}
+	}
 	s.ids[name] = id
 	s.idMu.Unlock()
 }
