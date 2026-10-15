@@ -31,23 +31,24 @@ type fakeFile struct {
 type fakeDrive struct {
 	server *httptest.Server
 
-	mu            sync.Mutex
-	files         map[string]*fakeFile
-	nextID        int
-	failOnce      map[string]bool
-	failStatus    map[string]int
-	failBody      map[string]string
-	tokens        int
-	hosts         map[string]bool
-	addrs         map[string]bool
-	orLists       int
-	containsLists int
-	lastQuery     string
-	listDelay     time.Duration
-	listDelayNext time.Duration
-	uploadDelay   time.Duration
-	createStatus  int
-	mediaUploads  int
+	mu               sync.Mutex
+	files            map[string]*fakeFile
+	nextID           int
+	failOnce         map[string]bool
+	failStatus       map[string]int
+	failBody         map[string]string
+	tokens           int
+	hosts            map[string]bool
+	addrs            map[string]bool
+	orLists          int
+	containsLists    int
+	lastQuery        string
+	listDelay        time.Duration
+	listDelayNext    time.Duration
+	uploadDelay      time.Duration
+	createStatus     int
+	mediaUploads     int
+	multipartUploads int
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -163,7 +164,49 @@ func (d *fakeDrive) handleUploadBody(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	if d.shouldFail("upload") {
+		if status, body := d.failure("upload"); status != 0 {
+			w.WriteHeader(status)
+			w.Write([]byte(body))
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
 	id := strings.TrimPrefix(r.URL.Path, "/upload/")
+	ctype := r.Header.Get("Content-Type")
+	if mt, params, err := mime.ParseMediaType(ctype); err == nil && strings.HasPrefix(mt, "multipart/") {
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		metaPart, err := reader.NextPart()
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var metadata struct {
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(metaPart).Decode(&metadata); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var data []byte
+		if dataPart, err := reader.NextPart(); err == nil {
+			data, _ = io.ReadAll(dataPart)
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		file, ok := d.files[id]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		file.data = data
+		file.description = metadata.Description
+		d.mediaUploads++
+		d.multipartUploads++
+		json.NewEncoder(w).Encode(map[string]string{"id": id})
+		return
+	}
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -1236,5 +1279,76 @@ func TestMetaWriteSurvivesSlowAttempt(t *testing.T) {
 	}
 	if d := time.Since(start); d <= 150*time.Millisecond {
 		t.Fatalf("Put took %v, want more than the scaled 15s budget", d)
+	}
+}
+
+func TestSlotMediaSingleRequest(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	payload := make([]byte, 64*1024)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	id, err := storage.makeSlot(ctx, "streams/multipart/s0")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	if err := storage.writeSlot(ctx, id, 3, slotModeMedia, payload); err != nil {
+		t.Fatalf("writeSlot: %v", err)
+	}
+	frame, ok, err := storage.readSlot(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("readSlot: %v ok=%v", ok, err)
+	}
+	if frame.Seq != 3 || frame.Mode != slotModeMedia {
+		t.Fatalf("frame = %+v, want seq 3 mode media", frame)
+	}
+	got, err := storage.readSlotBody(ctx, id)
+	if err != nil {
+		t.Fatalf("readSlotBody: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatal("body mismatch")
+	}
+	drive.mu.Lock()
+	multi, media := drive.multipartUploads, drive.mediaUploads
+	drive.mu.Unlock()
+	if multi != 1 || media != 1 {
+		t.Fatalf("multipart = %d media = %d, want 1 and 1", multi, media)
+	}
+}
+
+func TestSlotMediaFallsBack(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	payload := []byte("fallback body")
+	id, err := storage.makeSlot(ctx, "streams/multipartfb/s0")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	drive.failOnceWith("upload", http.StatusBadRequest, "no multipart here")
+	if err := storage.writeSlot(ctx, id, 5, slotModeMedia, payload); err != nil {
+		t.Fatalf("writeSlot: %v", err)
+	}
+	got, err := storage.readSlotBody(ctx, id)
+	if err != nil {
+		t.Fatalf("readSlotBody: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatal("body mismatch after fallback")
+	}
+	frame, ok, err := storage.readSlot(ctx, id)
+	if err != nil || !ok || frame.Seq != 5 {
+		t.Fatalf("frame = %+v ok=%v err=%v, want seq 5", frame, ok, err)
+	}
+	drive.mu.Lock()
+	multi, media := drive.multipartUploads, drive.mediaUploads
+	drive.mu.Unlock()
+	if multi != 0 || media != 1 {
+		t.Fatalf("multipart = %d media = %d, want 0 and 1", multi, media)
 	}
 }

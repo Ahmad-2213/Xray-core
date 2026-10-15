@@ -699,6 +699,36 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 	return nil
 }
 
+func (s *driveStorage) putMultipartSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) (bool, error) {
+	meta, err := json.Marshal(map[string]interface{}{
+		"description": encodeSlot(slotFrame{Seq: seq, Mode: mode}),
+	})
+	if err != nil {
+		return false, err
+	}
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", driveBoundary)
+	body.Write(meta)
+	fmt.Fprintf(&body, "\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", driveBoundary)
+	body.Write(data)
+	fmt.Fprintf(&body, "\r\n--%s--\r\n", driveBoundary)
+	status, payload, err := s.do(ctx, http.MethodPatch,
+		s.updateURL+"/"+url.PathEscape(id)+"?uploadType=multipart&fields=id",
+		"multipart/related; boundary="+driveBoundary, body.Bytes())
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusOK || status == http.StatusCreated {
+		return false, nil
+	}
+	multipartErr := errors.New("Drive refused the multipart slot update at segment ", seq,
+		" with ", status, ": ", string(payload))
+	if status >= 400 && status < 500 && status != http.StatusTooManyRequests && !rateLimited(payload) {
+		return true, multipartErr
+	}
+	return false, multipartErr
+}
+
 func (s *driveStorage) putMediaBody(ctx context.Context, id string, data []byte) error {
 	status, payload, err := s.do(ctx, http.MethodPatch,
 		s.updateURL+"/"+url.PathEscape(id)+"?uploadType=media&fields=id",
@@ -971,6 +1001,13 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 		return nil
 	}
 
+	fallback, err := s.putMultipartSlot(ctx, id, seq, mode, data)
+	if err == nil {
+		return nil
+	}
+	if !fallback {
+		return err
+	}
 	if err := s.putMediaBody(ctx, id, data); err != nil {
 		return err
 	}
