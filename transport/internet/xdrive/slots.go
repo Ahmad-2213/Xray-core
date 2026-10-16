@@ -614,6 +614,7 @@ func (w *slotWriter) Close() error {
 		return nil
 	}
 	w.closed = true
+	w.progAt = time.Now()
 	for len(w.buf) > 0 && w.err == nil {
 		w.flushLocked()
 	}

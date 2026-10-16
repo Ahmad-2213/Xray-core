@@ -789,6 +789,81 @@ func TestSlotCloseDrainsSlowReader(t *testing.T) {
 	}
 }
 
+func TestSlotCloseAfterIdleDrains(t *testing.T) {
+	const depth = 2
+	const segs = 6
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	store := &slowReadSlotStore{slotStore: inner, delay: time.Second}
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, store, table, p)
+	r := newSlotReader(ctx, store, table, p)
+
+	time.Sleep(12 * time.Second)
+	for i := 0; i < segs; i++ {
+		seg := make([]byte, 1024)
+		for j := range seg {
+			seg[j] = byte(i + 1)
+		}
+		if _, err := w.Write(seg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	finished := make(chan [][]byte, 1)
+	go func() {
+		var out [][]byte
+		for data := range r.ch {
+			out = append(out, data)
+		}
+		finished <- out
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("Close did not drain after idle")
+	}
+	select {
+	case out := <-finished:
+		if len(out) != segs {
+			t.Fatalf("delivered %d segments, want %d", len(out), segs)
+		}
+		for i, c := range out {
+			if len(c) != 1024 || c[0] != byte(i+1) {
+				t.Fatalf("segment %d corrupt", i)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not stop after the end marker")
+	}
+	if got := r.Stopped(); got != "the peer closed the stream" {
+		t.Fatalf("reader stopped with %q, want clean end", got)
+	}
+}
+
 type corruptBodySlotStore struct {
 	slotStore
 	mu    sync.Mutex
