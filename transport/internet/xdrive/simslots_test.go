@@ -644,3 +644,92 @@ func TestSlotWriterBackpressure(t *testing.T) {
 		}
 	}
 }
+
+type slowReadSlotStore struct {
+	slotStore
+	delay time.Duration
+}
+
+func (s *slowReadSlotStore) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	if !simSleep(ctx, s.delay) {
+		return slotFrame{}, false, ctx.Err()
+	}
+	return s.slotStore.readSlot(ctx, id)
+}
+
+func TestSlotCloseDrainsSlowReader(t *testing.T) {
+	const depth = 2
+	const segs = 6
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	store := &slowReadSlotStore{slotStore: inner, delay: time.Second}
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, store, table, p)
+	r := newSlotReader(ctx, store, table, p)
+
+	for i := 0; i < segs; i++ {
+		seg := make([]byte, 1024)
+		for j := range seg {
+			seg[j] = byte(i + 1)
+		}
+		if _, err := w.Write(seg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	type result struct {
+		chunks [][]byte
+	}
+	finished := make(chan result, 1)
+	go func() {
+		var res result
+		for data := range r.ch {
+			res.chunks = append(res.chunks, data)
+		}
+		finished <- res
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("Close did not drain a progressing reader")
+	}
+	select {
+	case res := <-finished:
+		if len(res.chunks) != segs {
+			t.Fatalf("delivered %d segments, want %d", len(res.chunks), segs)
+		}
+		for i, c := range res.chunks {
+			if len(c) != 1024 || c[0] != byte(i+1) {
+				t.Fatalf("segment %d corrupt", i)
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader did not stop after the end marker")
+	}
+	if got := r.Stopped(); got != "the peer closed the stream" {
+		t.Fatalf("reader stopped with %q, want clean end", got)
+	}
+}

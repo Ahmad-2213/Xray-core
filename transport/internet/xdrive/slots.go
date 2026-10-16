@@ -36,7 +36,7 @@ var (
 	slotWriteAttempts = 3
 	slotWatermarkTTL  = 700 * time.Millisecond
 	slotStallTimeout  = 60 * time.Second
-	slotCloseGrace    = 2 * time.Second
+	slotCloseGrace    = 10 * time.Second
 )
 
 type slotTiming struct {
@@ -188,6 +188,7 @@ type slotWriter struct {
 	err      error
 	acked    int64
 	ackAt    time.Time
+	progAt   time.Time
 	wake     func()
 
 	slots   chan struct{}
@@ -206,6 +207,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		slots:    make(chan struct{}, len(table.Slots)),
 		pending:  make(chan struct{}, 2*len(table.Slots)),
 		acked:    -1,
+		progAt:   time.Now(),
 	}
 	if start := slotRampStart(p.segmentBytes); start < p.segmentBytes {
 		w.segBytes = start
@@ -387,8 +389,13 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	now := time.Now()
 	w.mu.Lock()
-	w.acked, w.ackAt = acked, time.Now()
+	if acked > w.acked {
+		w.acked = acked
+		w.progAt = now
+	}
+	w.ackAt = now
 	w.mu.Unlock()
 	return acked >= seq-depth, nil
 }
@@ -404,8 +411,9 @@ func (w *slotWriter) await(seq int64) error {
 		}
 		w.mu.Lock()
 		closing := w.closed
+		prog := w.progAt
 		w.mu.Unlock()
-		if time.Now().After(deadline) || (closing && time.Since(start) > w.tune.closeGrace) {
+		if time.Now().After(deadline) || (closing && time.Since(prog) > w.tune.closeGrace) {
 			return errors.New("the reader stopped acknowledging slot ", w.slotID(seq)).Base(err)
 		}
 		if err != nil {
