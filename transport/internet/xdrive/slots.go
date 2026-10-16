@@ -761,28 +761,39 @@ func (r *slotReader) run() {
 	}
 }
 
+func (r *slotReader) isHead(seq int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seq == seq
+}
+
 func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 	if offset > 0 {
 		if !r.sleep(time.Duration(float64(offset) * r.interval())) {
 			return
 		}
 	}
-	head := offset == 0
+	head := r.isHead(seq)
 	backoff, ceiling := r.tune.huntFloor, r.tune.huntCeiling
-	if offset > 0 {
-		backoff = time.Duration(r.interval() * float64(time.Second))
-		if backoff < r.tune.tailMin {
-			backoff = r.tune.tailMin
-		}
-		if backoff > r.tune.tailMax {
-			backoff = r.tune.tailMax
-		}
-		ceiling = backoff
-	}
+	wasHead := head
 	for {
 		if r.ctx.Err() != nil {
 			return
 		}
+		head = r.isHead(seq)
+		if head && !wasHead {
+			backoff, ceiling = r.tune.huntFloor, r.tune.huntCeiling
+		} else if !head {
+			backoff = time.Duration(r.interval() * float64(time.Second))
+			if backoff < r.tune.tailMin {
+				backoff = r.tune.tailMin
+			}
+			if backoff > r.tune.tailMax {
+				backoff = r.tune.tailMax
+			}
+			ceiling = backoff
+		}
+		wasHead = head
 		frame, ok, err := r.store.readSlot(r.ctx, r.slotID(seq))
 		if err == nil && ok && frame.Seq == seq {
 			switch frame.Mode {

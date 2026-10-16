@@ -1047,6 +1047,75 @@ func TestSlotDeadSessionStops(t *testing.T) {
 	}
 }
 
+func TestSlotPromotedFetchTimesOut(t *testing.T) {
+	prev := slotNotFoundTimeout
+	slotNotFoundTimeout = 300 * time.Millisecond
+	defer func() { slotNotFoundTimeout = prev }()
+
+	const depth = 4
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, inner, table, p)
+	r := newSlotReader(ctx, inner, table, p)
+
+	if r.isHead(2) {
+		t.Fatal("seq 2 reads as head before anything is consumed")
+	}
+	if !r.isHead(0) {
+		t.Fatal("seq 0 does not read as head at start")
+	}
+	for i := 0; i < 2; i++ {
+		seg := make([]byte, 1024)
+		for j := range seg {
+			seg[j] = byte(i + 1)
+		}
+		if _, err := w.Write(seg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	inner.mu.Lock()
+	delete(inner.byID, table.Slots[2])
+	inner.mu.Unlock()
+
+	start := time.Now()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for range r.ch {
+		}
+	}()
+	select {
+	case <-finished:
+	case <-time.After(8 * time.Second):
+		t.Fatal("promoted fetch never timed out on the deleted slot")
+	}
+	if d := time.Since(start); d >= 8*time.Second {
+		t.Fatalf("fatal took %v", d)
+	}
+	if !r.isHead(2) {
+		t.Fatal("seq 2 does not read as head after consuming through 1")
+	}
+	if err := r.Err(); err == nil || err == io.EOF {
+		t.Fatalf("reader Err() = %v, want non-EOF error", err)
+	}
+}
+
 type flakyOnceSlotStore struct {
 	slotStore
 	mu     sync.Mutex
