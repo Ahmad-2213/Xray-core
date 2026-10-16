@@ -81,6 +81,8 @@ type simSlots struct {
 	bodies  int64
 	marks   int64
 	markGet int64
+	markCur int64
+	markMax int64
 	bytes   int64
 }
 
@@ -177,6 +179,14 @@ func (s *simSlots) writeWatermark(ctx context.Context, id string, seq int64) err
 
 func (s *simSlots) readWatermark(ctx context.Context, id string) (int64, error) {
 	atomic.AddInt64(&s.markGet, 1)
+	cur := atomic.AddInt64(&s.markCur, 1)
+	for {
+		max := atomic.LoadInt64(&s.markMax)
+		if cur <= max || atomic.CompareAndSwapInt64(&s.markMax, max, cur) {
+			break
+		}
+	}
+	defer atomic.AddInt64(&s.markCur, -1)
 	if !simSleep(ctx, simDur(simGetMeta)) {
 		return -1, ctx.Err()
 	}
@@ -589,6 +599,44 @@ func (g *gateSlotStore) writeSlot(ctx context.Context, id string, seq int64, mod
 		return ctx.Err()
 	}
 	return g.slotStore.writeSlot(ctx, id, seq, mode, data)
+}
+
+func TestSlotWatermarkReadCoalesced(t *testing.T) {
+	const depth = 8
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, inner, table, p)
+
+	seg := make([]byte, 1024)
+	for i := 0; i < 2*depth; i++ {
+		if _, err := w.Write(seg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	time.Sleep(time.Second)
+	mg := atomic.LoadInt64(&inner.markGet)
+	if mg < 2 {
+		t.Fatalf("watermark read %d times, want repeated reads", mg)
+	}
+	if m := atomic.LoadInt64(&inner.markMax); m > 1 {
+		t.Fatalf("watermark reads overlapped %d deep, want at most 1", m)
+	}
 }
 
 func TestSlotWriterBackpressure(t *testing.T) {

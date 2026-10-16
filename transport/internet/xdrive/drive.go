@@ -25,7 +25,7 @@ const (
 	drivePageSize         = 1000
 	driveMaxAttempts      = 8
 	driveMaxInflight      = 32
-	driveReservedInflight = 4
+	driveReservedInflight = 2
 	slotHeaderAttempts    = 4
 	driveInlineLimit      = 16 * 1024
 	driveTimeout          = 60 * time.Second
@@ -1099,9 +1099,8 @@ func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64)
 }
 
 func (s *driveStorage) readWatermark(ctx context.Context, id string) (int64, error) {
-	status, payload, err := s.doBudgetReserved(ctx, http.MethodGet,
-		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil,
-		queryAttemptTimeout, queryTotalTimeout)
+	status, payload, err := s.doMeta(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
 	if err != nil {
 		return -1, err
 	}

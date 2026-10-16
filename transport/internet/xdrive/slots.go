@@ -35,7 +35,7 @@ var (
 	slotTailMin         = 150 * time.Millisecond
 	slotTailMax         = 800 * time.Millisecond
 	slotFetchAhead      = 6
-	slotAckStride       = 2
+	slotAckStride       = 1
 	slotAckRetry        = 100 * time.Millisecond
 	slotWriteAttempts   = 3
 	slotNotFoundTimeout = 60 * time.Second
@@ -267,6 +267,15 @@ type slotWriter struct {
 	slots   chan struct{}
 	pending chan struct{}
 	wg      sync.WaitGroup
+
+	wmMu     sync.Mutex
+	wmFlight *wmCall
+}
+
+type wmCall struct {
+	done  chan struct{}
+	acked int64
+	err   error
 }
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
@@ -447,6 +456,25 @@ func (w *slotWriter) slotID(seq int64) string {
 	return w.table.Slots[int(seq%int64(len(w.table.Slots)))]
 }
 
+func (w *slotWriter) readWatermarkShared() (int64, error) {
+	w.wmMu.Lock()
+	if w.wmFlight != nil {
+		f := w.wmFlight
+		w.wmMu.Unlock()
+		<-f.done
+		return f.acked, f.err
+	}
+	f := &wmCall{done: make(chan struct{})}
+	w.wmFlight = f
+	w.wmMu.Unlock()
+	f.acked, f.err = w.store.readWatermark(w.ctx, w.table.Watermark)
+	w.wmMu.Lock()
+	w.wmFlight = nil
+	w.wmMu.Unlock()
+	close(f.done)
+	return f.acked, f.err
+}
+
 func (w *slotWriter) drained(seq int64) (bool, error) {
 	depth := int64(len(w.table.Slots))
 	w.mu.Lock()
@@ -458,7 +486,7 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 	if refreshed < w.tune.ackTTL {
 		return false, nil
 	}
-	acked, err := w.store.readWatermark(w.ctx, w.table.Watermark)
+	acked, err := w.readWatermarkShared()
 	if err != nil {
 		return false, err
 	}
@@ -632,15 +660,16 @@ type slotReader struct {
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params) *slotReader {
 	r := &slotReader{
-		ctx:     ctx,
-		store:   store,
-		table:   table,
-		tune:    takeSlotTiming(),
-		params:  p,
-		ch:      make(chan []byte, p.concurrency),
-		wake:    make(chan struct{}, 1),
-		acked:   -1,
-		lastHit: time.Now(),
+		ctx:       ctx,
+		store:     store,
+		table:     table,
+		tune:      takeSlotTiming(),
+		params:    p,
+		ch:        make(chan []byte, p.concurrency),
+		wake:      make(chan struct{}, 1),
+		acked:     -1,
+		ackWanted: -1,
+		lastHit:   time.Now(),
 	}
 	go r.run()
 	go r.ackLoop()
