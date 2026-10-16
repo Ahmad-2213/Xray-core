@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -34,10 +35,22 @@ const (
 // transport behaves, so scaling both keeps the test honest while finishing in
 // seconds instead of minutes. One test restores the true timings to report the
 // numbers that actually matter.
-var simScale = 0.04
+var simScaleBits atomic.Uint64
+
+func init() {
+	simScaleBits.Store(math.Float64bits(0.04))
+}
+
+func simScaleGet() float64 {
+	return math.Float64frombits(simScaleBits.Load())
+}
+
+func simScaleSet(f float64) {
+	simScaleBits.Store(math.Float64bits(f))
+}
 
 func simDur(d time.Duration) time.Duration {
-	scaled := time.Duration(float64(d) * simScale)
+	scaled := time.Duration(float64(d) * simScaleGet())
 	if scaled < 500*time.Microsecond {
 		scaled = 500 * time.Microsecond
 	}
@@ -47,18 +60,18 @@ func simDur(d time.Duration) time.Duration {
 // simRealTimings puts the model back on its true clock, both Drive's and the
 // transport's, for a test that reports real numbers, and restores it after.
 func simRealTimings() func() {
-	prevScale := simScale
+	prevScale := simScaleGet()
 	prevCeiling, prevFloor := slotHuntCeiling, slotHuntFloor
 	prevTailMin, prevTailMax := slotTailMin, slotTailMax
 	prevAck, prevTTL := slotAckRetry, slotWatermarkTTL
 	prevStall, prevGrace := slotStallTimeout, slotCloseGrace
-	simScale = 1
+	simScaleSet(1)
 	slotHuntCeiling, slotHuntFloor = 120*time.Millisecond, 50*time.Millisecond
 	slotTailMin, slotTailMax = 150*time.Millisecond, 800*time.Millisecond
 	slotAckRetry, slotWatermarkTTL = 150*time.Millisecond, 700*time.Millisecond
 	slotStallTimeout, slotCloseGrace = 60*time.Second, 2*time.Second
 	return func() {
-		simScale = prevScale
+		simScaleSet(prevScale)
 		slotHuntCeiling, slotHuntFloor = prevCeiling, prevFloor
 		slotTailMin, slotTailMax = prevTailMin, prevTailMax
 		slotAckRetry, slotWatermarkTTL = prevAck, prevTTL
