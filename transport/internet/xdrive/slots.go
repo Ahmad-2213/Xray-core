@@ -543,7 +543,6 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 	var lastErr error
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
-		w.signalErr(id, seq)
 		return
 	}
 	for attempt := 0; attempt < slotWriteAttempts; attempt++ {
@@ -575,6 +574,12 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 }
 
 func (w *slotWriter) signalErr(id string, seq int64) {
+	w.mu.Lock()
+	consumed := w.acked >= seq-int64(len(w.table.Slots))
+	w.mu.Unlock()
+	if !consumed {
+		return
+	}
 	_ = w.store.writeSlot(w.ctx, id, seq, slotModeErr, nil)
 }
 

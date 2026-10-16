@@ -1310,3 +1310,58 @@ func TestSlotRetryNeverOverwrites(t *testing.T) {
 		}
 	})
 }
+
+func TestSlotErrorNeverOverwritesUnread(t *testing.T) {
+	prev := slotStallTimeout
+	slotStallTimeout = 3 * time.Second
+	defer func() { slotStallTimeout = prev }()
+
+	const depth = 2
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, inner, table, p)
+
+	go func() {
+		seg := make([]byte, 1024)
+		for i := 0; i < 2*depth; i++ {
+			for j := range seg {
+				seg[j] = byte(i + 1)
+			}
+			if _, err := w.Write(seg); err != nil {
+				return
+			}
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for w.Err() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("writer never failed on the stalled slots")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for i, want := range []int64{0, 1} {
+		frame, ok, err := inner.readSlot(ctx, table.Slots[i])
+		if err != nil || !ok || frame.Mode != slotModeInline || frame.Seq != want {
+			t.Fatalf("slot %d holds %+v ok=%v err=%v, want inline seq %d", i, frame, ok, err, want)
+		}
+		if len(frame.Data) != 1024 || frame.Data[0] != byte(want+1) {
+			t.Fatalf("slot %d data corrupt", i)
+		}
+	}
+}
