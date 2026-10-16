@@ -569,3 +569,78 @@ func TestSlotSustained(t *testing.T) {
 	t.Logf("   %.2f Drive requests per 256 KiB segment, %.1f requests per second",
 		float64(store.total())/segments, float64(store.total())/elapsed.Seconds())
 }
+
+type gateSlotStore struct {
+	slotStore
+	gate chan struct{}
+}
+
+func (g *gateSlotStore) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return g.slotStore.writeSlot(ctx, id, seq, mode, data)
+}
+
+func TestSlotWriterBackpressure(t *testing.T) {
+	const depth = 4
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	store := &gateSlotStore{slotStore: inner, gate: make(chan struct{})}
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+	if err := inner.writeWatermark(context.Background(), mark, 1<<30); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, store, table, p)
+
+	const total = 3*depth + 2
+	seg := make([]byte, 1024)
+	done := make(chan int, total)
+	go func() {
+		for i := 0; i < total; i++ {
+			if _, err := w.Write(seg); err != nil {
+				return
+			}
+			done <- i
+		}
+	}()
+
+	const want = depth
+	for i := 0; i < want; i++ {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("write %d blocked, want first %d to complete", i, want)
+		}
+	}
+	select {
+	case n := <-done:
+		t.Fatalf("write %d completed against a blocked store, want backpressure after %d", n, want)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(store.gate)
+	for i := want; i < total; i++ {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("write %d stuck after release", i)
+		}
+	}
+}

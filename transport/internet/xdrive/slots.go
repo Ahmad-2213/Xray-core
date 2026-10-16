@@ -190,8 +190,9 @@ type slotWriter struct {
 	ackAt    time.Time
 	wake     func()
 
-	slots chan struct{}
-	wg    sync.WaitGroup
+	slots   chan struct{}
+	pending chan struct{}
+	wg      sync.WaitGroup
 }
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
@@ -203,6 +204,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		params:   p,
 		segBytes: p.segmentBytes,
 		slots:    make(chan struct{}, len(table.Slots)),
+		pending:  make(chan struct{}, 2*len(table.Slots)),
 		acked:    -1,
 	}
 	if start := slotRampStart(p.segmentBytes); start < p.segmentBytes {
@@ -287,6 +289,34 @@ func (w *slotWriter) flushLocked() error {
 	}
 	if w.err != nil {
 		return w.err
+	}
+
+	w.mu.Unlock()
+	select {
+	case w.pending <- struct{}{}:
+	case <-w.ctx.Done():
+		w.mu.Lock()
+		return w.ctx.Err()
+	}
+	select {
+	case w.slots <- struct{}{}:
+	case <-w.ctx.Done():
+		<-w.pending
+		w.mu.Lock()
+		return w.ctx.Err()
+	}
+	w.mu.Lock()
+	if len(w.buf) == 0 || w.err != nil {
+		err := w.err
+		if err == nil {
+			err = w.ctx.Err()
+		}
+		<-w.slots
+		<-w.pending
+		if err != nil {
+			return err
+		}
+		return nil
 	}
 
 	n := len(w.buf)
@@ -395,22 +425,12 @@ func (w *slotWriter) await(seq int64) error {
 }
 
 func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
-	acquired := false
 	defer func() {
-		if acquired {
-			w.unpark(part)
-		} else {
-			w.release(part)
-		}
+		<-w.pending
+		w.unpark(part)
 		w.wg.Done()
 	}()
 
-	select {
-	case w.slots <- struct{}{}:
-		acquired = true
-	case <-w.ctx.Done():
-		return
-	}
 	var lastErr error
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
