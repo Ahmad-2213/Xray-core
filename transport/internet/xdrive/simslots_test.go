@@ -827,6 +827,127 @@ func TestSlotStaleBodyNeverDelivered(t *testing.T) {
 	}
 }
 
+func TestSlotCleanEndIsEOF(t *testing.T) {
+	const depth = 2
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, inner, table, p)
+	r := newSlotReader(ctx, inner, table, p)
+
+	for i := 0; i < 2; i++ {
+		seg := make([]byte, 1024)
+		for j := range seg {
+			seg[j] = byte(i + 1)
+		}
+		if _, err := w.Write(seg); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	finished := make(chan [][]byte, 1)
+	go func() {
+		var out [][]byte
+		for data := range r.ch {
+			out = append(out, data)
+		}
+		finished <- out
+	}()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case out := <-finished:
+		if len(out) != 2 {
+			t.Fatalf("delivered %d chunks, want 2", len(out))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("reader did not stop")
+	}
+	if err := r.Err(); err != io.EOF {
+		t.Fatalf("reader Err() = %v, want io.EOF", err)
+	}
+}
+
+type failDataSlotStore struct {
+	slotStore
+}
+
+func (f *failDataSlotStore) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	if mode == slotModeInline || mode == slotModeMedia {
+		return fmt.Errorf("injected store failure")
+	}
+	return f.slotStore.writeSlot(ctx, id, seq, mode, data)
+}
+
+func TestSlotWriterFailureSignalsReader(t *testing.T) {
+	const depth = 2
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	store := &failDataSlotStore{slotStore: inner}
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, store, table, p)
+	r := newSlotReader(ctx, store, table, p)
+
+	if _, err := w.Write(make([]byte, 1024)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for w.Err() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("writer never failed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for range r.ch {
+		}
+	}()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reader never stopped")
+	}
+	if err := r.Err(); err == nil || err == io.EOF {
+		t.Fatalf("reader Err() = %v, want non-EOF error", err)
+	}
+	frame, ok, err := inner.readSlot(ctx, table.Slots[0])
+	if err != nil || !ok || frame.Mode != slotModeErr || frame.Seq != 0 {
+		t.Fatalf("slot holds %+v ok=%v err=%v, want err frame seq 0", frame, ok, err)
+	}
+}
+
 type flakyOnceSlotStore struct {
 	slotStore
 	mu     sync.Mutex

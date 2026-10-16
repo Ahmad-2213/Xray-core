@@ -23,6 +23,7 @@ const (
 	slotModeInline = 1
 	slotModeMedia  = 2
 	slotModeEnd    = 3
+	slotModeErr    = 4
 
 	slotHeaderLen   = len(slotMagic) + 8 + 1 + 4 + 4
 	slotHeaderLenV1 = len(slotMagicV1) + 8 + 1 + 4
@@ -511,6 +512,7 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 	var lastErr error
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
+		w.signalErr(id, seq)
 		return
 	}
 	for attempt := 0; attempt < slotWriteAttempts; attempt++ {
@@ -538,6 +540,11 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 		return
 	}
 	w.fail(errors.New("failed to store segment ", seq).Base(lastErr))
+	w.signalErr(id, seq)
+}
+
+func (w *slotWriter) signalErr(id string, seq int64) {
+	_ = w.store.writeSlot(w.ctx, id, seq, slotModeErr, nil)
 }
 
 func (w *slotWriter) unpark(part bool) {
@@ -589,6 +596,7 @@ func (w *slotWriter) Close() error {
 	err := w.err
 	w.mu.Unlock()
 	if err != nil {
+		w.signalErr(w.slotID(seq), seq)
 		return err
 	}
 	if err := w.await(seq); err != nil {
@@ -614,6 +622,7 @@ type slotReader struct {
 	started     bool
 	lastHit     time.Time
 	intervalAvg float64
+	eof         bool
 	stopped     string
 }
 
@@ -652,6 +661,7 @@ type slotFetch struct {
 	ready chan struct{}
 	body  []byte
 	end   bool
+	fatal bool
 }
 
 func (r *slotReader) run() {
@@ -690,7 +700,14 @@ func (r *slotReader) run() {
 			return
 		}
 		if fetch.end {
+			r.mu.Lock()
+			r.eof = true
+			r.mu.Unlock()
 			r.stop("the peer closed the stream")
+			return
+		}
+		if fetch.fatal {
+			r.stop("the peer failed to store segment " + strconv.FormatInt(head, 10))
 			return
 		}
 		delete(pending, head)
@@ -732,6 +749,8 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			switch frame.Mode {
 			case slotModeEnd:
 				f.end = true
+			case slotModeErr:
+				f.fatal = true
 			case slotModeInline:
 				f.body = frame.Data
 			case slotModeMedia:
@@ -902,5 +921,10 @@ func (r *slotReader) Stopped() string {
 }
 
 func (r *slotReader) Err() error {
-	return errors.New(r.Stopped())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.eof {
+		return io.EOF
+	}
+	return errors.New(r.stopped)
 }
