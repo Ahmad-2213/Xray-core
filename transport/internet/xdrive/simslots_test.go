@@ -116,7 +116,13 @@ func (s *simSlots) writeSlot(ctx context.Context, id string, seq int64, mode uin
 		object = &simSlotObject{}
 		s.byID[id] = object
 	}
-	object.description = encodeSlot(slotFrame{Seq: seq, Mode: mode, Data: data})
+	frame := newMediaFrame(seq, data)
+	if mode == slotModeInline {
+		frame = newInlineFrame(seq, data)
+	} else if mode != slotModeMedia {
+		frame = slotFrame{Seq: seq, Mode: mode}
+	}
+	object.description = encodeSlot(frame)
 	if mode == slotModeMedia {
 		object.content = append([]byte(nil), data...)
 	}
@@ -734,6 +740,93 @@ func TestSlotCloseDrainsSlowReader(t *testing.T) {
 	}
 }
 
+type corruptBodySlotStore struct {
+	slotStore
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *corruptBodySlotStore) readSlotBody(ctx context.Context, id string) ([]byte, error) {
+	c.mu.Lock()
+	c.calls++
+	n := c.calls
+	c.mu.Unlock()
+	body, err := c.slotStore.readSlotBody(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if n == 1 {
+		return append(append([]byte(nil), body...), 0x00), nil
+	}
+	if n == 2 {
+		out := append([]byte(nil), body...)
+		out[0] ^= 0xff
+		return out, nil
+	}
+	return body, nil
+}
+
+func (c *corruptBodySlotStore) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+func TestSlotStaleBodyNeverDelivered(t *testing.T) {
+	const depth = 4
+	p := simSlotParams(262144, depth)
+	inner := newSimSlots()
+	store := &corruptBodySlotStore{slotStore: inner}
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newSlotWriter(ctx, store, table, p)
+	w.mu.Lock()
+	w.segBytes = 262144
+	w.mu.Unlock()
+	r := newSlotReader(ctx, store, table, p)
+
+	payload := make([]byte, 64*1024)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	go func() {
+		_, _ = w.Write(payload)
+	}()
+	select {
+	case got := <-r.ch:
+		if string(got) != string(payload) {
+			t.Fatal("delivered corrupt body")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("reader never delivered")
+	}
+	if n := store.count(); n < 3 {
+		t.Fatalf("body fetched %d times, want at least 3", n)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for range r.ch {
+	}
+	if got := r.Stopped(); got != "the peer closed the stream" {
+		t.Fatalf("reader stopped with %q, want clean end", got)
+	}
+}
+
 type flakyOnceSlotStore struct {
 	slotStore
 	mu     sync.Mutex
@@ -825,7 +918,7 @@ func TestSlotRetryNeverOverwrites(t *testing.T) {
 			t.Fatal("first write never landed")
 		}
 		inner.mu.Lock()
-		inner.byID[table.Slots[0]] = &simSlotObject{description: encodeSlot(slotFrame{Seq: 2, Mode: slotModeInline, Data: []byte("newer")})}
+		inner.byID[table.Slots[0]] = &simSlotObject{description: encodeSlot(newInlineFrame(2, []byte("newer")))}
 		inner.mu.Unlock()
 		time.Sleep(600 * time.Millisecond)
 		if n := store.count(); n != 1 {

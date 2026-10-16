@@ -701,7 +701,7 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 
 func (s *driveStorage) putMultipartSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) (bool, error) {
 	meta, err := json.Marshal(map[string]interface{}{
-		"description": encodeSlot(slotFrame{Seq: seq, Mode: mode}),
+		"description": encodeSlot(newMediaFrame(seq, data)),
 	})
 	if err != nil {
 		return false, err
@@ -983,7 +983,7 @@ func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error
 func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
 	if mode == slotModeInline {
 		body, err := json.Marshal(map[string]interface{}{
-			"description": encodeSlot(slotFrame{Seq: seq, Mode: mode, Data: data}),
+			"description": encodeSlot(newInlineFrame(seq, data)),
 		})
 		if err != nil {
 			return errors.New("failed to build the slot update").Base(err)
@@ -1012,7 +1012,7 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 		return err
 	}
 	body, err := json.Marshal(map[string]interface{}{
-		"description": encodeSlot(slotFrame{Seq: seq, Mode: mode}),
+		"description": encodeSlot(newMediaFrame(seq, data)),
 	})
 	if err != nil {
 		return errors.New("failed to build the slot header").Base(err)

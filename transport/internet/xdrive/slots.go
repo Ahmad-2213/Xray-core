@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"io"
 	"strconv"
 	"sync"
@@ -14,7 +15,8 @@ import (
 )
 
 const (
-	slotMagic       = "XDRVSL01"
+	slotMagic       = "XDRVSL02"
+	slotMagicV1     = "XDRVSL01"
 	slotInlineLimit = 14 * 1024
 	slotDepthLimit  = 8
 
@@ -22,7 +24,8 @@ const (
 	slotModeMedia  = 2
 	slotModeEnd    = 3
 
-	slotHeaderLen = len(slotMagic) + 8 + 1 + 4
+	slotHeaderLen   = len(slotMagic) + 8 + 1 + 4 + 4
+	slotHeaderLenV1 = len(slotMagicV1) + 8 + 1 + 4
 )
 
 var (
@@ -68,9 +71,33 @@ func takeSlotTiming() slotTiming {
 }
 
 type slotFrame struct {
-	Seq  int64
-	Mode uint8
-	Data []byte
+	Seq     int64
+	Mode    uint8
+	Data    []byte
+	Len     int
+	Crc     uint32
+	Checked bool
+}
+
+func newInlineFrame(seq int64, data []byte) slotFrame {
+	return slotFrame{
+		Seq:     seq,
+		Mode:    slotModeInline,
+		Data:    data,
+		Len:     len(data),
+		Crc:     crc32.ChecksumIEEE(data),
+		Checked: true,
+	}
+}
+
+func newMediaFrame(seq int64, data []byte) slotFrame {
+	return slotFrame{
+		Seq:     seq,
+		Mode:    slotModeMedia,
+		Len:     len(data),
+		Crc:     crc32.ChecksumIEEE(data),
+		Checked: true,
+	}
 }
 
 func encodeSlot(f slotFrame) string {
@@ -81,7 +108,9 @@ func encodeSlot(f slotFrame) string {
 	pos += 8
 	buf[pos] = f.Mode
 	pos++
-	binary.BigEndian.PutUint32(buf[pos:], uint32(len(f.Data)))
+	binary.BigEndian.PutUint32(buf[pos:], uint32(f.Len))
+	pos += 4
+	binary.BigEndian.PutUint32(buf[pos:], f.Crc)
 	pos += 4
 	copy(buf[pos:], f.Data)
 	return base64.StdEncoding.EncodeToString(buf)
@@ -92,22 +121,62 @@ func decodeSlot(description string) (slotFrame, bool) {
 		return slotFrame{}, false
 	}
 	raw, err := base64.StdEncoding.DecodeString(description)
-	if err != nil || len(raw) < slotHeaderLen {
+	if err != nil || len(raw) < slotHeaderLenV1 {
 		return slotFrame{}, false
 	}
-	if string(raw[:len(slotMagic)]) != slotMagic {
+	switch string(raw[:len(slotMagic)]) {
+	case slotMagic:
+		return decodeSlotV2(raw)
+	case slotMagicV1:
+		return decodeSlotV1(raw)
+	default:
+		return slotFrame{}, false
+	}
+}
+
+func decodeSlotV2(raw []byte) (slotFrame, bool) {
+	if len(raw) < slotHeaderLen {
 		return slotFrame{}, false
 	}
 	pos := len(slotMagic)
+	f := slotFrame{Checked: true, Seq: int64(binary.BigEndian.Uint64(raw[pos:]))}
+	pos += 8
+	f.Mode = raw[pos]
+	pos++
+	f.Len = int(binary.BigEndian.Uint32(raw[pos:]))
+	pos += 4
+	f.Crc = binary.BigEndian.Uint32(raw[pos:])
+	pos += 4
+	if f.Mode != slotModeInline {
+		return f, true
+	}
+	if f.Len <= 0 || f.Len != len(raw)-pos {
+		return slotFrame{}, false
+	}
+	payload := raw[pos:]
+	if crc32.ChecksumIEEE(payload) != f.Crc {
+		return slotFrame{}, false
+	}
+	f.Data = payload
+	return f, true
+}
+
+func decodeSlotV1(raw []byte) (slotFrame, bool) {
+	pos := len(slotMagicV1)
 	f := slotFrame{Seq: int64(binary.BigEndian.Uint64(raw[pos:]))}
 	pos += 8
 	f.Mode = raw[pos]
 	pos++
 	length := int(binary.BigEndian.Uint32(raw[pos:]))
 	pos += 4
-	if f.Mode == slotModeInline && length == len(raw)-pos {
-		f.Data = raw[pos:]
+	if f.Mode != slotModeInline {
+		return f, true
 	}
+	if length <= 0 || length != len(raw)-pos {
+		return slotFrame{}, false
+	}
+	f.Data = raw[pos:]
+	f.Len = length
 	return f, true
 }
 
@@ -668,6 +737,12 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			case slotModeMedia:
 				body, berr := r.store.readSlotBody(r.ctx, r.slotID(seq))
 				if berr != nil {
+					if !r.hold(backoff, ceiling) {
+						return
+					}
+					continue
+				}
+				if frame.Checked && (len(body) != frame.Len || crc32.ChecksumIEEE(body) != frame.Crc) {
 					if !r.hold(backoff, ceiling) {
 						return
 					}
