@@ -39,7 +39,7 @@ var (
 	slotAckRetry        = 100 * time.Millisecond
 	slotWriteAttempts   = 3
 	slotNotFoundTimeout = 60 * time.Second
-	slotWatermarkTTL    = 700 * time.Millisecond
+	slotWatermarkTTL    = 250 * time.Millisecond
 	slotStallTimeout    = 60 * time.Second
 	slotCloseGrace      = 10 * time.Second
 )

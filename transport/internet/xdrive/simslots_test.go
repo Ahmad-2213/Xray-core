@@ -574,6 +574,7 @@ func TestSlotSustained(t *testing.T) {
 		elapsed.Seconds(), float64(total)/elapsed.Seconds()/1024, stalls, maxGap.Round(time.Millisecond), w, r, b, mk, mg)
 	t.Logf("   %.2f Drive requests per 256 KiB segment, %.1f requests per second",
 		float64(store.total())/segments, float64(store.total())/elapsed.Seconds())
+	t.Logf("   %.2f calls per MB", float64(store.total())/4.0)
 }
 
 type gateSlotStore struct {
