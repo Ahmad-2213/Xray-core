@@ -733,3 +733,110 @@ func TestSlotCloseDrainsSlowReader(t *testing.T) {
 		t.Fatalf("reader stopped with %q, want clean end", got)
 	}
 }
+
+type flakyOnceSlotStore struct {
+	slotStore
+	mu     sync.Mutex
+	calls  int
+	landed chan struct{}
+}
+
+func (f *flakyOnceSlotStore) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	f.mu.Lock()
+	f.calls++
+	first := f.calls == 1
+	f.mu.Unlock()
+	if first {
+		err := f.slotStore.writeSlot(ctx, id, seq, mode, data)
+		close(f.landed)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("injected timeout")
+	}
+	return f.slotStore.writeSlot(ctx, id, seq, mode, data)
+}
+
+func (f *flakyOnceSlotStore) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func TestSlotRetryNeverOverwrites(t *testing.T) {
+	const depth = 2
+	setup := func(t *testing.T) (context.Context, context.CancelFunc, *slotWriter, *flakyOnceSlotStore, *simSlots, slotTable) {
+		p := simSlotParams(1024, depth)
+		inner := newSimSlots()
+		store := &flakyOnceSlotStore{slotStore: inner, landed: make(chan struct{})}
+		table := slotTable{}
+		for i := 0; i < depth; i++ {
+			id, err := inner.makeSlot(context.Background(), "")
+			if err != nil {
+				t.Fatalf("makeSlot: %v", err)
+			}
+			table.Slots = append(table.Slots, id)
+		}
+		mark, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Watermark = mark
+		if err := inner.writeWatermark(context.Background(), mark, 1<<30); err != nil {
+			t.Fatalf("seed watermark: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		return ctx, cancel, newSlotWriter(ctx, store, table, p), store, inner, table
+	}
+
+	t.Run("landed", func(t *testing.T) {
+		ctx, cancel, w, store, inner, table := setup(t)
+		defer cancel()
+		if _, err := w.Write(make([]byte, 1024)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		select {
+		case <-store.landed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("first write never landed")
+		}
+		time.Sleep(600 * time.Millisecond)
+		if n := store.count(); n != 1 {
+			t.Fatalf("writeSlot ran %d times, want 1", n)
+		}
+		frame, ok, err := inner.readSlot(ctx, table.Slots[0])
+		if err != nil || !ok || frame.Seq != 0 {
+			t.Fatalf("slot holds %+v ok=%v err=%v, want seq 0", frame, ok, err)
+		}
+		if err := w.Err(); err != nil {
+			t.Fatalf("writer failed: %v", err)
+		}
+	})
+
+	t.Run("reused", func(t *testing.T) {
+		ctx, cancel, w, store, inner, table := setup(t)
+		defer cancel()
+		if _, err := w.Write(make([]byte, 1024)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		select {
+		case <-store.landed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("first write never landed")
+		}
+		inner.mu.Lock()
+		inner.byID[table.Slots[0]] = &simSlotObject{description: encodeSlot(slotFrame{Seq: 2, Mode: slotModeInline, Data: []byte("newer")})}
+		inner.mu.Unlock()
+		time.Sleep(600 * time.Millisecond)
+		if n := store.count(); n != 1 {
+			t.Fatalf("writeSlot ran %d times, want 1", n)
+		}
+		frame, ok, err := inner.readSlot(ctx, table.Slots[0])
+		if err != nil || !ok || frame.Seq != 2 || string(frame.Data) != "newer" {
+			t.Fatalf("slot holds %+v ok=%v err=%v, want newer seq 2", frame, ok, err)
+		}
+		if err := w.Err(); err != nil {
+			t.Fatalf("writer failed: %v", err)
+		}
+	})
+}

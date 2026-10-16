@@ -451,6 +451,9 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 				return
 			case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
 			}
+			if frame, ok, err := w.store.readSlot(w.ctx, id); err == nil && ok && frame.Seq >= seq {
+				return
+			}
 		}
 		mode := uint8(slotModeMedia)
 		if len(chunk) <= slotInlineLimit {
