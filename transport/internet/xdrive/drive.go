@@ -1050,7 +1050,7 @@ func (s *driveStorage) readSlot(ctx context.Context, id string) (slotFrame, bool
 		return slotFrame{}, false, err
 	}
 	if status == http.StatusNotFound {
-		return slotFrame{}, false, nil
+		return slotFrame{}, false, errNotFound
 	}
 	if status != http.StatusOK {
 		return slotFrame{}, false, errors.New("Drive answered ", status, " for a slot: ", string(payload))

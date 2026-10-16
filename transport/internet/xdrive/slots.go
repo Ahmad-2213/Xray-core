@@ -30,44 +30,47 @@ const (
 )
 
 var (
-	slotHuntCeiling   = 200 * time.Millisecond
-	slotHuntFloor     = 50 * time.Millisecond
-	slotTailMin       = 150 * time.Millisecond
-	slotTailMax       = 800 * time.Millisecond
-	slotFetchAhead    = 6
-	slotAckStride     = 2
-	slotAckRetry      = 100 * time.Millisecond
-	slotWriteAttempts = 3
-	slotWatermarkTTL  = 700 * time.Millisecond
-	slotStallTimeout  = 60 * time.Second
-	slotCloseGrace    = 10 * time.Second
+	slotHuntCeiling     = 200 * time.Millisecond
+	slotHuntFloor       = 50 * time.Millisecond
+	slotTailMin         = 150 * time.Millisecond
+	slotTailMax         = 800 * time.Millisecond
+	slotFetchAhead      = 6
+	slotAckStride       = 2
+	slotAckRetry        = 100 * time.Millisecond
+	slotWriteAttempts   = 3
+	slotNotFoundTimeout = 60 * time.Second
+	slotWatermarkTTL    = 700 * time.Millisecond
+	slotStallTimeout    = 60 * time.Second
+	slotCloseGrace      = 10 * time.Second
 )
 
 type slotTiming struct {
-	ackRetry     time.Duration
-	ackStride    int
-	ackTTL       time.Duration
-	stallTimeout time.Duration
-	closeGrace   time.Duration
-	huntFloor    time.Duration
-	huntCeiling  time.Duration
-	tailMin      time.Duration
-	tailMax      time.Duration
-	fetchAhead   int
+	ackRetry        time.Duration
+	ackStride       int
+	ackTTL          time.Duration
+	stallTimeout    time.Duration
+	closeGrace      time.Duration
+	huntFloor       time.Duration
+	huntCeiling     time.Duration
+	tailMin         time.Duration
+	tailMax         time.Duration
+	fetchAhead      int
+	notFoundTimeout time.Duration
 }
 
 func takeSlotTiming() slotTiming {
 	return slotTiming{
-		ackRetry:     slotAckRetry,
-		ackStride:    slotAckStride,
-		ackTTL:       slotWatermarkTTL,
-		stallTimeout: slotStallTimeout,
-		closeGrace:   slotCloseGrace,
-		huntFloor:    slotHuntFloor,
-		huntCeiling:  slotHuntCeiling,
-		tailMin:      slotTailMin,
-		tailMax:      slotTailMax,
-		fetchAhead:   slotFetchAhead,
+		ackRetry:        slotAckRetry,
+		ackStride:       slotAckStride,
+		ackTTL:          slotWatermarkTTL,
+		stallTimeout:    slotStallTimeout,
+		closeGrace:      slotCloseGrace,
+		huntFloor:       slotHuntFloor,
+		huntCeiling:     slotHuntCeiling,
+		tailMin:         slotTailMin,
+		tailMax:         slotTailMax,
+		fetchAhead:      slotFetchAhead,
+		notFoundTimeout: slotNotFoundTimeout,
 	}
 }
 
@@ -622,6 +625,7 @@ type slotReader struct {
 	started     bool
 	lastHit     time.Time
 	intervalAvg float64
+	warnAt      time.Time
 	eof         bool
 	stopped     string
 }
@@ -658,10 +662,12 @@ func (r *slotReader) slotID(seq int64) string {
 }
 
 type slotFetch struct {
-	ready chan struct{}
-	body  []byte
-	end   bool
-	fatal bool
+	ready   chan struct{}
+	body    []byte
+	end     bool
+	fatal   bool
+	err     error
+	nfSince time.Time
 }
 
 func (r *slotReader) run() {
@@ -704,6 +710,10 @@ func (r *slotReader) run() {
 			r.eof = true
 			r.mu.Unlock()
 			r.stop("the peer closed the stream")
+			return
+		}
+		if fetch.err != nil {
+			r.stop(fetch.err.Error())
 			return
 		}
 		if fetch.fatal {
@@ -777,6 +787,30 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			r.armed()
 			close(f.ready)
 			return
+		}
+
+		if err == errNotFound {
+			if f.nfSince.IsZero() {
+				f.nfSince = time.Now()
+			} else if head && time.Since(f.nfSince) >= r.tune.notFoundTimeout {
+				f.err = errors.New("slot ", r.slotID(seq), " for segment ", seq, " is gone").Base(errNotFound)
+				close(f.ready)
+				return
+			}
+		} else {
+			f.nfSince = time.Time{}
+			if err != nil && r.ctx.Err() == nil {
+				warn := false
+				r.mu.Lock()
+				if time.Since(r.warnAt) >= 10*time.Second {
+					r.warnAt = time.Now()
+					warn = true
+				}
+				r.mu.Unlock()
+				if warn {
+					errors.LogWarning(r.ctx, "xdrive slot read failed: ", err)
+				}
+			}
 		}
 
 		if head {

@@ -139,7 +139,7 @@ func (s *simSlots) readSlot(ctx context.Context, id string) (slotFrame, bool, er
 	defer s.mu.Unlock()
 	object, ok := s.byID[id]
 	if !ok {
-		return slotFrame{}, false, nil
+		return slotFrame{}, false, errNotFound
 	}
 	frame, good := decodeSlot(object.description)
 	return frame, good, nil
@@ -945,6 +945,56 @@ func TestSlotWriterFailureSignalsReader(t *testing.T) {
 	frame, ok, err := inner.readSlot(ctx, table.Slots[0])
 	if err != nil || !ok || frame.Mode != slotModeErr || frame.Seq != 0 {
 		t.Fatalf("slot holds %+v ok=%v err=%v, want err frame seq 0", frame, ok, err)
+	}
+}
+
+type missingSlotStore struct {
+	slotStore
+}
+
+func (m *missingSlotStore) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	return slotFrame{}, false, errNotFound
+}
+
+func TestSlotDeadSessionStops(t *testing.T) {
+	prev := slotNotFoundTimeout
+	slotNotFoundTimeout = 300 * time.Millisecond
+	defer func() { slotNotFoundTimeout = prev }()
+
+	const depth = 2
+	p := simSlotParams(1024, depth)
+	inner := newSimSlots()
+	store := &missingSlotStore{slotStore: inner}
+	table := slotTable{}
+	for i := 0; i < depth; i++ {
+		id, err := inner.makeSlot(context.Background(), "")
+		if err != nil {
+			t.Fatalf("makeSlot: %v", err)
+		}
+		table.Slots = append(table.Slots, id)
+	}
+	mark, err := inner.makeSlot(context.Background(), "")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	table.Watermark = mark
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := newSlotReader(ctx, store, table, p)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for range r.ch {
+		}
+	}()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reader never stopped on deleted slots")
+	}
+	if err := r.Err(); err == nil || err == io.EOF {
+		t.Fatalf("reader Err() = %v, want non-EOF error", err)
 	}
 }
 
