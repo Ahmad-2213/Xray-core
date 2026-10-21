@@ -35,7 +35,7 @@ func newStorage(streamSettings *internet.MemoryStreamConfig) (Storage, error) {
 	switch config.Service {
 	case "local":
 		return newLocalStorage(config.RemoteFolder)
-	case "google-drive", "Google Drive":
+	case "Google Drive":
 		return sharedStorage(streamSettings, config, func() (Storage, error) {
 			return newDriveStorage(streamSettings, config)
 		})
