@@ -26,8 +26,7 @@ const (
 	driveMaxAttempts = 8
 	driveMaxInflight = 32
 	driveInlineLimit = 12000
-	// driveTimeout ends a request that makes no progress for that long
-	driveTimeout = 60 * time.Second
+	driveTimeout     = 60 * time.Second
 )
 
 var (
