@@ -266,6 +266,11 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	uplinkReader, upLinkWriter := pipe.New(opts...)
 	downlinkReader, downlinkWriter := pipe.New(opts...)
 
+	select {
+	case <-m.negReply: // drop a stale signal from an earlier attempt
+	default:
+	}
+
 	m.epoch.Add(1)
 	myEpoch := m.epoch.Load()
 	// Seal here, not just at suspend: the reader may be blocked
@@ -313,6 +318,7 @@ func (m *ClientWorker) redialAttempt(p proxy.Outbound, d internet.Dialer, target
 	select {
 	case <-pumpDone:
 	case <-m.done.Wait():
+	case <-m.negReply:
 	case <-time.After(8 * time.Second):
 	}
 }
@@ -408,5 +414,30 @@ func (m *ClientWorker) watchHalfOpen(p proxy.Outbound, d internet.Dialer, target
 			m.enterSuspend()
 			m.startSupervisor(p, d, target)
 		}
+	}
+}
+
+// ackHeartbeat re-sends the current cumulative Ack once per second while the
+// worker has live sessions, even when rx did not advance. The reader loop can
+// be blocked delivering to a slow consumer; without this the peer's half-open
+// detector would see ack silence and tear down a healthy carrier.
+func (m *ClientWorker) ackHeartbeat() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.done.Wait():
+			return
+		case <-t.C:
+		}
+		if m.gate == nil || m.IsSuspended() || m.sessionManager.Size() == 0 {
+			continue
+		}
+		count, tip := m.rx.tipSnapshot()
+		m.ackMu.mu.Lock()
+		m.ackMu.lastSent = count
+		m.ackMu.lastTime = time.Now()
+		m.ackMu.mu.Unlock()
+		m.gate.writeAck(count, tip)
 	}
 }

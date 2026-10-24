@@ -195,6 +195,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 
 	if useV2 {
 		go c.watchHalfOpen(f.Proxy, f.Dialer, target)
+		go c.ackHeartbeat()
 	}
 
 	return c, nil
@@ -231,9 +232,9 @@ type ClientWorker struct {
 	// together under pipeMu: it is newGeneration()'s return value, the
 	// single source for reader identity (a swap that installs a new
 	// reader always retires the old generation with it).
-	downGen    uint64
-	downPipe   buf.Reader
-	upPipe     buf.Writer
+	downGen  uint64
+	downPipe buf.Reader
+	upPipe   buf.Writer
 	// banKey scopes the v2 fallback ban to this outbound tag + server.
 	banKey string
 	// suppressedEnds counts reactive Ends withheld for unknown sessions
@@ -245,6 +246,9 @@ type ClientWorker struct {
 	// counters can't serve: the first payload is stored within ~100ms
 	// while a real-path rejection is still traveling.
 	sawResumeReply atomic.Bool
+	// negReply wakes redialAttempt when the server answers epoch 0
+	// ("nothing parked yet"), so the supervisor retries on cadence.
+	negReply chan struct{}
 	// dialProbe records whether the initial carrier dial succeeded; only
 	// post-connect deaths count toward the v2 ban (see serveCarrier).
 	dialProbe  *banTrackingDialer
@@ -293,6 +297,7 @@ func NewClientWorkerWithResume(stream transport.Link, s ClientStrategy, policy R
 		strategy:       s,
 		resume:         policy,
 		createdAt:      time.Now(),
+		negReply:       make(chan struct{}, 1),
 	}
 	c.epoch.Store(uint64(time.Now().UnixNano()))
 	if policy.Enabled {
@@ -649,6 +654,10 @@ func (m *ClientWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		// Negative reply: the server has nothing parked (fresh carrier
 		// raced a park, or a previous park expired). Stay suspended and
 		// keep redialing on cadence; do NOT resume, flush, or clear.
+		select {
+		case m.negReply <- struct{}{}:
+		default:
+		}
 		return nil
 	}
 	// Stale reply: a newer redial has since been sent (epochs advance

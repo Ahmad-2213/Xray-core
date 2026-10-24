@@ -134,7 +134,13 @@ func (m *MuxResumeConfig) ToPolicy() mux.ResumePolicy {
 	}
 	p.Enabled = true
 	if m.SuspendTimeoutSec > 0 {
-		p.SuspendTimeout = time.Duration(m.SuspendTimeoutSec) * time.Second
+		// Server parks a session for a fixed 10s (hsTTL in common/mux/resume_handover.go):
+		// waiting longer on the client only retries against an expired park.
+		sec := m.SuspendTimeoutSec
+		if sec > 10 {
+			sec = 10
+		}
+		p.SuspendTimeout = time.Duration(sec) * time.Second
 	}
 	if m.MaxStreamBufferKB > 0 {
 		// Floor at 64KB (one pipe chunk): anything smaller blocks every
@@ -149,10 +155,23 @@ func (m *MuxResumeConfig) ToPolicy() mux.ResumePolicy {
 		p.MaxWorkerBuffer = int64(m.MaxWorkerBufferMB) * 1024 * 1024
 	}
 	if m.AckEveryMs > 0 {
-		p.AckEveryMs = int64(m.AckEveryMs)
+		// Peer half-open timeout is 4s: keep acks well inside it.
+		ms := m.AckEveryMs
+		if ms < 100 {
+			ms = 100
+		}
+		if ms > 1000 {
+			ms = 1000
+		}
+		p.AckEveryMs = int64(ms)
 	}
 	if m.AckTimeoutSec > 0 {
-		p.AckTimeout = time.Duration(m.AckTimeoutSec) * time.Second
+		// Below 3s a normal ack gap would trip the half-open detector.
+		sec := m.AckTimeoutSec
+		if sec < 3 {
+			sec = 3
+		}
+		p.AckTimeout = time.Duration(sec) * time.Second
 	}
 	if m.NoV2CacheTTLSec > 0 {
 		p.NoV2CacheTTL = time.Duration(m.NoV2CacheTTLSec) * time.Second

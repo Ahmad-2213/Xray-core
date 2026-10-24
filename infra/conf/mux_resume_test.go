@@ -53,3 +53,16 @@ func TestVLessVisionFlowDetect(t *testing.T) {
 		t.Fatal("empty config must not report vision")
 	}
 }
+
+func TestMuxResumeConfigClamps(t *testing.T) {
+	p := (&MuxResumeConfig{Enabled: true, SuspendTimeoutSec: 60, AckEveryMs: 5000, AckTimeoutSec: 1}).ToPolicy()
+	if p.SuspendTimeout.Seconds() != 10 {
+		t.Fatalf("suspend timeout must clamp to 10s, got %v", p.SuspendTimeout)
+	}
+	if p.AckEveryMs != 1000 {
+		t.Fatalf("ackEveryMs must clamp to 1000, got %v", p.AckEveryMs)
+	}
+	if p.AckTimeout.Seconds() != 3 {
+		t.Fatalf("ackTimeout must clamp to 3s, got %v", p.AckTimeout)
+	}
+}

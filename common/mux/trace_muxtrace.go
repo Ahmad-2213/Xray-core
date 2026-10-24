@@ -117,6 +117,12 @@ func traceLogRecv(prefix string, snapRx uint64) {
 // mode: every adopt adds an episode block, so multi-episode runs keep
 // full history instead of overwriting.
 func traceDumpAdopt(path string, snapRx, peerRx uint64) {
+	if path == "" {
+		path = os.Getenv("XRAY_MUXTRACE_ADOPT_LOG")
+	}
+	if path == "" {
+		return
+	}
 	traceMu.Lock()
 	defer traceMu.Unlock()
 	var sb strings.Builder

@@ -116,7 +116,7 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 	w.rx.restore(entry.rx, entry.tipRx)
 	traceLogRecv("adopt", entry.rx)
 	traceLogSendWindow("adopt", rp.RxCount)
-	traceDumpAdopt(`G:\Cache\Temp\opencode\adopt-tuples.log`, entry.rx, rp.RxCount)
+	traceDumpAdopt("", entry.rx, rp.RxCount)
 	w.rsMu.Lock()
 	if entry.gate != nil {
 		w.gate.Store(entry.gate)
@@ -151,6 +151,7 @@ func (w *ServerWorker) adoptEntry(rp ResumePayload, entry *suspendedWorker) erro
 			w.parkForResume(context.Background())
 		})
 		go w.watchHalfOpen()
+		go w.ackHeartbeat()
 	}
 	// Reply with our rx so the client replays exactly what we
 	// missed, then flush our retained suffix past the client's rx,
@@ -265,6 +266,7 @@ func (w *ServerWorker) handleStatusResume(meta *FrameMetadata, reader *buf.Buffe
 		})
 		w.gate.Store(g)
 		go w.watchHalfOpen()
+		go w.ackHeartbeat()
 	}
 	w.rsMu.Unlock()
 	if g := w.gate.Load(); g != nil {
@@ -335,5 +337,33 @@ func (w *ServerWorker) watchHalfOpen() {
 			w.parkForResume(context.Background())
 			return
 		}
+	}
+}
+
+// ackHeartbeat: server twin of ClientWorker.ackHeartbeat. Stops when this
+// worker parks (the adopting worker runs its own heartbeat on the shared gate,
+// so a parked worker must never keep sending its stale rx).
+func (w *ServerWorker) ackHeartbeat() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.done.Wait():
+			return
+		case <-t.C:
+		}
+		if w.parkOnce.Load() {
+			return
+		}
+		g := w.gate.Load()
+		if g == nil || w.sessionManager.Load().Size() == 0 {
+			continue
+		}
+		count, tip := w.rx.tipSnapshot()
+		w.ackMu.mu.Lock()
+		w.ackMu.lastSent = count
+		w.ackMu.lastTime = time.Now()
+		w.ackMu.mu.Unlock()
+		g.writeAck(count, tip)
 	}
 }
