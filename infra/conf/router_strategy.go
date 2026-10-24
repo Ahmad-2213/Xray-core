@@ -1,9 +1,11 @@
 package conf
 
 import (
+	"encoding/json"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/xtls/xray-core/app/observatory/burst"
 	"github.com/xtls/xray-core/app/router"
@@ -11,17 +13,19 @@ import (
 )
 
 const (
-	strategyRandom     string = "random"
-	strategyLeastPing  string = "leastping"
-	strategyRoundRobin string = "roundrobin"
-	strategyLeastLoad  string = "leastload"
+	strategyRandom            string = "random"
+	strategyLeastPing         string = "leastping"
+	strategyRoundRobin        string = "roundrobin"
+	strategyLeastLoad         string = "leastload"
+	strategySessionRoundRobin string = "sessionroundrobin"
 )
 
 var strategyConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
-	strategyRandom:     func() interface{} { return new(strategyEmptyConfig) },
-	strategyLeastPing:  func() interface{} { return new(strategyEmptyConfig) },
-	strategyRoundRobin: func() interface{} { return new(strategyEmptyConfig) },
-	strategyLeastLoad:  func() interface{} { return new(strategyLeastLoadConfig) },
+	strategyRandom:            func() interface{} { return new(strategyEmptyConfig) },
+	strategyLeastPing:         func() interface{} { return new(strategyEmptyConfig) },
+	strategyRoundRobin:        func() interface{} { return new(strategyEmptyConfig) },
+	strategyLeastLoad:         func() interface{} { return new(strategyLeastLoadConfig) },
+	strategySessionRoundRobin: func() interface{} { return new(strategySessionRoundRobinConfig) },
 }, "type", "settings")
 
 type strategyEmptyConfig struct{}
@@ -97,4 +101,24 @@ func (v *strategyLeastLoadConfig) Build() (proto.Message, error) {
 		config.Baselines = append(config.Baselines, int64(b))
 	}
 	return config, nil
+}
+
+type strategySessionRoundRobinConfig struct {
+	Key        string             `json:"key"`
+	TTLSec     int                `json:"ttlSec"`
+	Balance    string             `json:"balance"`
+	Traffic    string             `json:"traffic"`
+	Weights    map[string]float64 `json:"weights"`
+	MaxEntries int                `json:"maxEntries"`
+}
+
+func (c *strategySessionRoundRobinConfig) Build() (proto.Message, error) {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := router.ParseSessionSettings(string(raw)); err != nil {
+		return nil, err
+	}
+	return wrapperspb.String(string(raw)), nil
 }

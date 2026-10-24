@@ -18,11 +18,15 @@ type Rule struct {
 	Webhook   *WebhookNotifier
 }
 
-func (r *Rule) GetTag() (string, error) {
+func (r *Rule) GetTagWithContext(ctx routing.Context) (string, error) {
 	if r.Balancer != nil {
-		return r.Balancer.PickOutbound()
+		return r.Balancer.PickOutboundWithContext(ctx)
 	}
 	return r.Tag, nil
+}
+
+func (r *Rule) GetTag() (string, error) {
+	return r.GetTagWithContext(nil)
 }
 
 // Apply checks rule matching of current routing context.
@@ -135,6 +139,17 @@ func (br *BalancingRule) Build(ohm outbound.Manager, dispatcher routing.Dispatch
 		return &Balancer{
 			selectors:   br.OutboundSelector,
 			strategy:    &RoundRobinStrategy{FallbackTag: br.FallbackTag},
+			fallbackTag: br.FallbackTag,
+			ohm:         ohm,
+		}, nil
+	case "sessionroundrobin":
+		s, err := NewSessionRoundRobinStrategy(br.FallbackTag, br.StrategySettings)
+		if err != nil {
+			return nil, err
+		}
+		return &Balancer{
+			selectors:   br.OutboundSelector,
+			strategy:    s,
 			fallbackTag: br.FallbackTag,
 			ohm:         ohm,
 		}, nil

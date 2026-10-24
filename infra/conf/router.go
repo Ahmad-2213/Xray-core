@@ -15,6 +15,7 @@ import (
 // StrategyConfig represents a strategy config
 type StrategyConfig struct {
 	Type     string           `json:"type"`
+	Mode     string           `json:"mode"`
 	Settings *json.RawMessage `json:"settings"`
 }
 
@@ -35,10 +36,20 @@ func (r *BalancingRule) Build() (*router.BalancingRule, error) {
 	}
 
 	r.Strategy.Type = strings.ToLower(r.Strategy.Type)
+	switch strings.ToLower(r.Strategy.Mode) {
+	case "", "request":
+	case "session":
+		if r.Strategy.Type != strategyRoundRobin {
+			return nil, errors.New(`"mode": "session" is only supported by the roundRobin strategy`)
+		}
+		r.Strategy.Type = strategySessionRoundRobin
+	default:
+		return nil, errors.New("unknown balancing mode: " + r.Strategy.Mode)
+	}
 	switch r.Strategy.Type {
 	case "":
 		r.Strategy.Type = strategyRandom
-	case strategyRandom, strategyLeastLoad, strategyLeastPing, strategyRoundRobin:
+	case strategyRandom, strategyLeastLoad, strategyLeastPing, strategyRoundRobin, strategySessionRoundRobin:
 	default:
 		return nil, errors.New("unknown balancing strategy: " + r.Strategy.Type)
 	}

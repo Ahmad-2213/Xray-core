@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/extension"
 	"github.com/xtls/xray-core/features/outbound"
+	"github.com/xtls/xray-core/features/routing"
 )
 
 type BalancingStrategy interface {
@@ -18,6 +19,10 @@ type BalancingStrategy interface {
 
 type BalancingPrincipleTarget interface {
 	GetPrincipleTarget([]string) []string
+}
+
+type ContextBalancingStrategy interface {
+	PickOutboundWithContext(ctx routing.Context, tags []string) string
 }
 
 type RoundRobinStrategy struct {
@@ -43,38 +48,38 @@ func (s *RoundRobinStrategy) GetPrincipleTarget(strings []string) []string {
 	return strings
 }
 
-func (s *RoundRobinStrategy) PickOutbound(tags []string) string {
-	if s.observatory != nil {
-		observeReport, err := s.observatory.GetObservation(s.ctx)
-		if err == nil {
-			aliveTags := make([]string, 0)
-			if result, ok := observeReport.(*observatory.ObservationResult); ok {
-				status := result.Status
-				statusMap := make(map[string]*observatory.OutboundStatus)
-				for _, outboundStatus := range status {
-					statusMap[outboundStatus.OutboundTag] = outboundStatus
-				}
-				for _, candidate := range tags {
-					if outboundStatus, found := statusMap[candidate]; found {
-						if outboundStatus.Alive {
-							aliveTags = append(aliveTags, candidate)
-						}
-					} else {
-						// unfound candidate is considered alive
-						aliveTags = append(aliveTags, candidate)
-					}
-				}
-				tags = aliveTags
-			}
-		}
+func (s *RoundRobinStrategy) aliveTags(tags []string) []string {
+	if s.observatory == nil {
+		return tags
 	}
+	observeReport, err := s.observatory.GetObservation(s.ctx)
+	if err != nil {
+		return tags
+	}
+	result, ok := observeReport.(*observatory.ObservationResult)
+	if !ok {
+		return tags
+	}
+	statusMap := make(map[string]*observatory.OutboundStatus, len(result.Status))
+	for _, st := range result.Status {
+		statusMap[st.OutboundTag] = st
+	}
+	alive := make([]string, 0, len(tags))
+	for _, candidate := range tags {
+		if st, found := statusMap[candidate]; found && !st.Alive {
+			continue
+		}
+		alive = append(alive, candidate)
+	}
+	return alive
+}
 
+func (s *RoundRobinStrategy) PickOutbound(tags []string) string {
+	tags = s.aliveTags(tags)
 	n := len(tags)
 	if n == 0 {
-		// goes to fallbackTag
 		return ""
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tag := tags[s.index%n]
@@ -91,8 +96,11 @@ type Balancer struct {
 	override override
 }
 
-// PickOutbound picks the tag of a outbound
 func (b *Balancer) PickOutbound() (string, error) {
+	return b.PickOutboundWithContext(nil)
+}
+
+func (b *Balancer) PickOutboundWithContext(ctx routing.Context) (string, error) {
 	candidates, err := b.SelectOutbounds()
 	if err != nil {
 		if b.fallbackTag != "" {
@@ -104,6 +112,8 @@ func (b *Balancer) PickOutbound() (string, error) {
 	var tag string
 	if o := b.override.Get(); o != "" {
 		tag = o
+	} else if cs, ok := b.strategy.(ContextBalancingStrategy); ok && ctx != nil {
+		tag = cs.PickOutboundWithContext(ctx, candidates)
 	} else {
 		tag = b.strategy.PickOutbound(candidates)
 	}
