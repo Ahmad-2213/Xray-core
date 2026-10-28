@@ -26,6 +26,12 @@ const (
 	sessionDefaultMax    = 100000
 )
 
+const (
+	sessionStallAssigns = 3
+	sessionStallAfter   = 20 * time.Second
+	sessionStallHold    = 120 * time.Second
+)
+
 type SessionSettings struct {
 	Key        string             `json:"key"`
 	TTLSec     int                `json:"ttlSec"`
@@ -87,6 +93,13 @@ type sessionEntry struct {
 	expires time.Time
 }
 
+type stallState struct {
+	since    time.Time
+	assigned int
+	until    time.Time
+	lastUsed int64
+}
+
 type statsHolder struct{ m stats.Manager }
 
 type SessionRoundRobinStrategy struct {
@@ -104,6 +117,7 @@ type SessionRoundRobinStrategy struct {
 	statsMgr atomic.Pointer[statsHolder]
 	warned   atomic.Bool
 	usedFn   func(tag string) (int64, bool)
+	stall    map[string]*stallState
 }
 
 func NewSessionRoundRobinStrategy(fallbackTag string, ts *serial.TypedMessage) (*SessionRoundRobinStrategy, error) {
@@ -130,6 +144,7 @@ func NewSessionRoundRobinStrategy(fallbackTag string, ts *serial.TypedMessage) (
 		sessions: make(map[string]*sessionEntry),
 		virtual:  make(map[string]float64),
 		lastReal: make(map[string]int64),
+		stall:    make(map[string]*stallState),
 	}
 	s.usedFn = s.usedFromStats
 	return s, nil
@@ -155,7 +170,12 @@ func (s *SessionRoundRobinStrategy) PickOutbound(tags []string) string {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.pickLocked(alive)
+	now := time.Now()
+	s.observeLocked(alive, now)
+	alive = s.withoutHeldLocked(alive, now)
+	tag := s.pickLocked(alive)
+	s.noteAssignLocked(tag, now)
+	return tag
 }
 
 func (s *SessionRoundRobinStrategy) PickOutboundWithContext(ctx routing.Context, tags []string) string {
@@ -167,15 +187,21 @@ func (s *SessionRoundRobinStrategy) PickOutboundWithContext(ctx routing.Context,
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.observeLocked(alive, now)
+	alive = s.withoutHeldLocked(alive, now)
 	if key == "" {
-		return s.pickLocked(alive)
+		tag := s.pickLocked(alive)
+		s.noteAssignLocked(tag, now)
+		return tag
 	}
 	s.purgeLocked(now)
 	if e, ok := s.sessions[key]; ok && e.expires.After(now) && containsTag(alive, e.tag) {
 		e.expires = now.Add(s.ttl)
+		s.noteAssignLocked(e.tag, now)
 		return e.tag
 	}
 	tag := s.pickLocked(alive)
+	s.noteAssignLocked(tag, now)
 	s.sessions[key] = &sessionEntry{tag: tag, expires: now.Add(s.ttl)}
 	return tag
 }
@@ -310,4 +336,64 @@ func (s *SessionRoundRobinStrategy) pickLocked(tags []string) string {
 	}
 	s.virtual[best] += sessionHerdBytes
 	return best
+}
+
+func (s *SessionRoundRobinStrategy) stallOf(tag string) *stallState {
+	st := s.stall[tag]
+	if st == nil {
+		st = &stallState{}
+		s.stall[tag] = st
+	}
+	return st
+}
+
+func (s *SessionRoundRobinStrategy) observeLocked(tags []string, now time.Time) {
+	if s.cfg.Balance != "traffic" {
+		return
+	}
+	for _, tag := range tags {
+		used, ok := s.usedFn(tag)
+		if !ok {
+			continue
+		}
+		st := s.stallOf(tag)
+		if used > st.lastUsed {
+			st.lastUsed = used
+			st.assigned = 0
+			st.until = time.Time{}
+			continue
+		}
+		if st.until.IsZero() && st.assigned >= sessionStallAssigns && now.Sub(st.since) >= sessionStallAfter {
+			st.until = now.Add(sessionStallHold)
+			errors.LogWarning(context.Background(), "sessionRoundRobin: outbound ", tag, " carried no traffic for ", st.assigned, " new connections, skipping it for ", sessionStallHold)
+		} else if !st.until.IsZero() && now.After(st.until) {
+			st.until = time.Time{}
+			st.assigned = 0
+		}
+	}
+}
+
+func (s *SessionRoundRobinStrategy) withoutHeldLocked(tags []string, now time.Time) []string {
+	out := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		if st := s.stall[tag]; st != nil && !st.until.IsZero() && now.Before(st.until) {
+			continue
+		}
+		out = append(out, tag)
+	}
+	if len(out) == 0 {
+		return tags
+	}
+	return out
+}
+
+func (s *SessionRoundRobinStrategy) noteAssignLocked(tag string, now time.Time) {
+	if s.cfg.Balance != "traffic" {
+		return
+	}
+	st := s.stallOf(tag)
+	if st.assigned == 0 {
+		st.since = now
+	}
+	st.assigned++
 }

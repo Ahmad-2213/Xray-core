@@ -130,3 +130,70 @@ func TestSessionSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionStallEjection(t *testing.T) {
+	s := newTestSession(t, `{"key":"none","balance":"traffic"}`)
+	used := map[string]int64{"A": 5000000, "B": 5000000, "C": 0}
+	s.usedFn = func(tag string) (int64, bool) {
+		return used[tag], true
+	}
+	tags := []string{"A", "B", "C"}
+	ctx := fakeRouteCtx{src: "1.1.1.1", domain: "a.com"}
+	for i := 0; i < 3; i++ {
+		if got := s.PickOutboundWithContext(ctx, tags); got != "C" {
+			t.Fatalf("pick %d: want C got %s", i, got)
+		}
+	}
+	s.mu.Lock()
+	s.stall["C"].since = time.Now().Add(-30 * time.Second)
+	s.mu.Unlock()
+	if got := s.PickOutboundWithContext(ctx, tags); got == "C" {
+		t.Fatal("stalled C must be ejected")
+	}
+	s.mu.Lock()
+	s.stall["C"].until = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	if got := s.PickOutboundWithContext(ctx, tags); got != "C" {
+		t.Fatalf("want C after hold expiry got %s", got)
+	}
+}
+
+func TestSessionStallUnpinsDomain(t *testing.T) {
+	s := newTestSession(t, `{"key":"domain","balance":"traffic"}`)
+	used := map[string]int64{"A": 5000000, "B": 5000000, "C": 0}
+	s.usedFn = func(tag string) (int64, bool) {
+		return used[tag], true
+	}
+	tags := []string{"A", "B", "C"}
+	ctx := fakeRouteCtx{src: "1.1.1.1", domain: "a.com"}
+	for i := 0; i < 3; i++ {
+		if got := s.PickOutboundWithContext(ctx, tags); got != "C" {
+			t.Fatalf("pick %d: want C got %s", i, got)
+		}
+	}
+	s.mu.Lock()
+	s.stall["C"].since = time.Now().Add(-30 * time.Second)
+	s.mu.Unlock()
+	if got := s.PickOutboundWithContext(ctx, tags); got == "C" {
+		t.Fatal("held C must not stay pinned to the session")
+	}
+}
+
+func TestSessionStallProgressClears(t *testing.T) {
+	s := newTestSession(t, `{"key":"none","balance":"traffic"}`)
+	used := map[string]int64{"A": 5000000, "B": 5000000, "C": 0}
+	s.usedFn = func(tag string) (int64, bool) {
+		return used[tag], true
+	}
+	tags := []string{"A", "B", "C"}
+	for i := 0; i < 6; i++ {
+		used["C"] += 1000
+		s.PickOutboundWithContext(fakeRouteCtx{src: "1.1.1.1", domain: "a.com"}, tags)
+	}
+	s.mu.Lock()
+	held := !s.stall["C"].until.IsZero()
+	s.mu.Unlock()
+	if held {
+		t.Fatal("progressing outbound must not be held")
+	}
+}
