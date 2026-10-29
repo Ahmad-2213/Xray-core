@@ -730,21 +730,11 @@ func (r *slotReader) run() {
 		r.mu.Lock()
 		head := r.seq
 		started := r.started
-		hot := time.Since(r.lastHit) < r.eagerWindow
 		r.mu.Unlock()
 
 		window := 1
 		if started {
 			window = r.tune.fetchAhead
-			if hot {
-				wide := 2 * r.tune.fetchAhead
-				if depth := len(r.table.Slots); wide > depth {
-					wide = depth
-				}
-				if wide > window {
-					window = wide
-				}
-			}
 		}
 		for i := 0; i < window; i++ {
 			next := head + int64(i)
