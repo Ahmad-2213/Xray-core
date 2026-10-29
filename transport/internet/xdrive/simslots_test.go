@@ -1446,3 +1446,48 @@ func TestSlotSlowReaderIsNotStalled(t *testing.T) {
 	client.Close()
 	t.Logf("wrote %d segments past a reader at one per %s | store=%d", segs, simDur(stall/2).Round(time.Millisecond), store.total())
 }
+
+func TestSlotBulkJumpsRamp(t *testing.T) {
+	p := simSlotParams(262144, 8)
+	client, server, _ := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	go func() {
+		chunk := make([]byte, 8*1024)
+		for i := 0; i < 128; i++ {
+			if _, err := server.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	if err := simReadN(t, client, 128*8*1024); err != nil {
+		t.Fatal(err)
+	}
+	server.writer.mu.Lock()
+	got := server.writer.segBytes
+	server.writer.mu.Unlock()
+	if got != p.segmentBytes {
+		t.Fatalf("segBytes = %d, want %d", got, p.segmentBytes)
+	}
+}
+
+func TestSlotIdleKeepsRamp(t *testing.T) {
+	p := simSlotParams(262144, 8)
+	client, server, _ := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	for i := 0; i < 5; i++ {
+		if _, err := server.Write(make([]byte, 1024)); err != nil {
+			t.Fatal(err)
+		}
+		if err := simReadN(t, client, 1024); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.writer.mu.Lock()
+	got := server.writer.segBytes
+	server.writer.mu.Unlock()
+	if got != slotInlineLimit {
+		t.Fatalf("segBytes = %d, want %d", got, slotInlineLimit)
+	}
+}

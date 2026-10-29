@@ -382,12 +382,18 @@ func (w *slotWriter) flushLocked() error {
 		w.mu.Lock()
 		return w.ctx.Err()
 	}
+	saturated := false
 	select {
 	case w.slots <- struct{}{}:
-	case <-w.ctx.Done():
-		<-w.pending
-		w.mu.Lock()
-		return w.ctx.Err()
+	default:
+		saturated = true
+		select {
+		case w.slots <- struct{}{}:
+		case <-w.ctx.Done():
+			<-w.pending
+			w.mu.Lock()
+			return w.ctx.Err()
+		}
 	}
 	w.mu.Lock()
 	if len(w.buf) == 0 || w.err != nil {
@@ -401,6 +407,10 @@ func (w *slotWriter) flushLocked() error {
 			return err
 		}
 		return nil
+	}
+	if saturated && len(w.buf) >= w.segBytes && w.segBytes < w.segmentBytes {
+		w.segBytes = w.segmentBytes
+		w.ramped = 0
 	}
 
 	n := len(w.buf)
