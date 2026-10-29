@@ -1491,3 +1491,24 @@ func TestSlotIdleKeepsRamp(t *testing.T) {
 		t.Fatalf("segBytes = %d, want %d", got, slotInlineLimit)
 	}
 }
+
+func TestSlotDeepRing(t *testing.T) {
+	p := simSlotParams(262144, 16)
+	client, server, _ := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	if n := len(client.writer.table.Slots); n != 16 {
+		t.Fatalf("ring depth = %d, want 16", n)
+	}
+	go func() {
+		chunk := make([]byte, 8*1024)
+		for i := 0; i < 256; i++ {
+			if _, err := server.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	if err := simReadN(t, client, 256*8*1024); err != nil {
+		t.Fatal(err)
+	}
+}
