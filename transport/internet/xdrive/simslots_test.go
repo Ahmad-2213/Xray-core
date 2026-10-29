@@ -1512,3 +1512,27 @@ func TestSlotDeepRing(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBuildSlotTableParallel(t *testing.T) {
+	p := simSlotParams(262144, 16)
+	store := newSimSlots()
+	start := time.Now()
+	table, err := buildSlotTable(context.Background(), store, "s1", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	for d, tb := range table {
+		if len(tb.Slots) != 16 || tb.Watermark == "" {
+			t.Fatalf("table %d: %d slots, watermark %q", d, len(tb.Slots), tb.Watermark)
+		}
+		for i, id := range tb.Slots {
+			if id == "" {
+				t.Fatalf("table %d slot %d is empty", d, i)
+			}
+		}
+	}
+	if limit := 3 * simDur(simPatchInline); took > limit {
+		t.Fatalf("building the ring took %s, want under %s", took, limit)
+	}
+}

@@ -142,42 +142,46 @@ func buildSlotTable(ctx context.Context, store slotStore, session string, p para
 	}
 
 	var out [2]slotTable
-	for _, direction := range []string{uplinkDir, downlinkDir} {
-		table := slotTable{Slots: make([]string, depth)}
-		type made struct {
-			at   int
-			id   string
-			fail error
-		}
-		results := make([]made, depth)
-		var wg sync.WaitGroup
-		for i := 0; i < depth; i++ {
-			wg.Add(1)
-			go func(at int) {
-				defer wg.Done()
-				id, err := store.makeSlot(ctx, sessionPrefix(session)+"/"+direction+"/s"+strconv.Itoa(at))
-				results[at] = made{at: at, id: id, fail: err}
-			}(i)
-		}
-		wg.Wait()
-		for _, r := range results {
-			if r.fail != nil {
-				return out, r.fail
-			}
-			table.Slots[r.at] = r.id
-		}
+	for i := range out {
+		out[i] = slotTable{Slots: make([]string, depth)}
+	}
+	dirs := [2]string{uplinkDir, downlinkDir}
 
-		mark, err := store.makeSlot(ctx, sessionPrefix(session)+"/"+direction+"/w")
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		fail error
+	)
+	create := func(name string, set func(id string)) {
+		defer wg.Done()
+		id, err := store.makeSlot(ctx, name)
+		mu.Lock()
+		defer mu.Unlock()
 		if err != nil {
-			return out, err
+			if fail == nil {
+				fail = err
+			}
+			return
 		}
-		table.Watermark = mark
-
-		if direction == uplinkDir {
-			out[0] = table
-		} else {
-			out[1] = table
+		set(id)
+	}
+	for d := range dirs {
+		for i := 0; i < depth; i++ {
+			d, i := d, i
+			wg.Add(1)
+			go create(sessionPrefix(session)+"/"+dirs[d]+"/s"+strconv.Itoa(i), func(id string) {
+				out[d].Slots[i] = id
+			})
 		}
+		d := d
+		wg.Add(1)
+		go create(sessionPrefix(session)+"/"+dirs[d]+"/w", func(id string) {
+			out[d].Watermark = id
+		})
+	}
+	wg.Wait()
+	if fail != nil {
+		return out, fail
 	}
 	return out, nil
 }
