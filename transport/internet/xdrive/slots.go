@@ -503,7 +503,6 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 
 func (w *slotWriter) await(seq int64) error {
 	start := time.Now()
-	deadline := start.Add(w.tune.stallTimeout)
 	wait := 100 * time.Millisecond
 	for {
 		ok, err := w.drained(seq)
@@ -514,7 +513,11 @@ func (w *slotWriter) await(seq int64) error {
 		closing := w.closed
 		prog := w.progAt
 		w.mu.Unlock()
-		if time.Now().After(deadline) || (closing && time.Since(prog) > w.tune.closeGrace) {
+		stalled := time.Since(prog)
+		if s := time.Since(start); s < stalled {
+			stalled = s
+		}
+		if stalled > w.tune.stallTimeout || (closing && time.Since(prog) > w.tune.closeGrace) {
 			return errors.New("the reader stopped acknowledging slot ", w.slotID(seq)).Base(err)
 		}
 		if err != nil {

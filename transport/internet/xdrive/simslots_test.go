@@ -1365,3 +1365,84 @@ func TestSlotErrorNeverOverwritesUnread(t *testing.T) {
 		}
 	}
 }
+
+func TestSlotSlowReaderIsNotStalled(t *testing.T) {
+	const depth = 8
+	const segs = 24
+	stall := 3 * time.Second
+	prev := slotStallTimeout
+	slotStallTimeout = stall
+	defer func() { slotStallTimeout = prev }()
+
+	p := simSlotParams(1024, depth)
+	client, server, store := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+
+	writeErr := make(chan error, 1)
+	go func() {
+		for i := 0; i < segs; i++ {
+			seg := make([]byte, 1024)
+			for j := range seg {
+				seg[j] = byte(i + 1)
+			}
+			if _, err := server.Write(seg); err != nil {
+				writeErr <- err
+				return
+			}
+		}
+		writeErr <- nil
+	}()
+
+	drained := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1024)
+		for i := 0; i < segs; i++ {
+			if !simSleep(context.Background(), simDur(stall/2)) {
+				drained <- context.Canceled
+				return
+			}
+			got := 0
+			for got < len(buf) {
+				n, err := client.Read(buf[got:])
+				if err != nil {
+					drained <- err
+					return
+				}
+				got += n
+			}
+			for _, b := range buf {
+				if b != byte(i+1) {
+					drained <- fmt.Errorf("segment %d arrived out of order", i)
+					return
+				}
+			}
+		}
+		drained <- nil
+	}()
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("the writer failed on a slow reader: %v | clientReader=%q serverReader=%q",
+				err, client.reader.Stopped(), server.reader.Stopped())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the writer stalled on a slow reader | clientReader=%q serverReader=%q",
+			client.reader.Stopped(), server.reader.Stopped())
+	}
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("the reader missed or reordered a segment: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reader never drained the slow stream")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("the writer reported an error on Close: %v | clientReader=%q serverReader=%q",
+			err, client.reader.Stopped(), server.reader.Stopped())
+	}
+	client.Close()
+	t.Logf("wrote %d segments past a reader at one per %s | store=%d", segs, simDur(stall/2).Round(time.Millisecond), store.total())
+}
