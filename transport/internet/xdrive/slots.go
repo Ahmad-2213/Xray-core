@@ -408,7 +408,7 @@ func (w *slotWriter) flushLocked() error {
 		}
 		return nil
 	}
-	if saturated && len(w.buf) >= w.segBytes && w.segBytes < w.segmentBytes {
+	if (saturated || len(w.slots)*4 > cap(w.slots)*3) && len(w.buf) >= w.segBytes && w.segBytes < w.segmentBytes {
 		w.segBytes = w.segmentBytes
 		w.ramped = 0
 	}

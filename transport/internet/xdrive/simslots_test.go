@@ -1536,3 +1536,28 @@ func TestBuildSlotTableParallel(t *testing.T) {
 		t.Fatalf("building the ring took %s, want under %s", took, limit)
 	}
 }
+
+func TestSlotJumpsBeforeRingFull(t *testing.T) {
+	p := simSlotParams(262144, 16)
+	client, server, _ := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	const chunks = 18
+	go func() {
+		chunk := make([]byte, 14*1024)
+		for i := 0; i < chunks; i++ {
+			if _, err := server.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	if err := simReadN(t, client, chunks*14*1024); err != nil {
+		t.Fatal(err)
+	}
+	server.writer.mu.Lock()
+	got := server.writer.segBytes
+	server.writer.mu.Unlock()
+	if got != p.segmentBytes {
+		t.Fatalf("segBytes = %d, want %d", got, p.segmentBytes)
+	}
+}
