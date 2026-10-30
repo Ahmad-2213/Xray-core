@@ -30,16 +30,16 @@ const (
 )
 
 var (
-	slotHuntCeiling     = 200 * time.Millisecond
+	slotHuntCeiling     = 100 * time.Millisecond
 	slotHuntFloor       = 50 * time.Millisecond
 	slotTailMin         = 150 * time.Millisecond
 	slotTailMax         = 800 * time.Millisecond
-	slotFetchAhead      = 6
+	slotFetchAhead      = 10
 	slotAckStride       = 1
-	slotAckRetry        = 100 * time.Millisecond
+	slotAckRetry        = 30 * time.Millisecond
 	slotWriteAttempts   = 3
 	slotNotFoundTimeout = 60 * time.Second
-	slotWatermarkTTL    = 250 * time.Millisecond
+	slotWatermarkTTL    = 100 * time.Millisecond
 	slotStallTimeout    = 60 * time.Second
 	slotCloseGrace      = 10 * time.Second
 )
@@ -735,6 +735,9 @@ func (r *slotReader) run() {
 		window := 1
 		if started {
 			window = r.tune.fetchAhead
+			if depth := len(r.table.Slots); window > depth {
+				window = depth
+			}
 		}
 		for i := 0; i < window; i++ {
 			next := head + int64(i)
