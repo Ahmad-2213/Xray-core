@@ -24,7 +24,7 @@ const (
 	driveBoundary         = "xdrive-boundary"
 	drivePageSize         = 1000
 	driveMaxAttempts      = 8
-	driveMaxInflight      = 32
+	driveMaxInflight      = 40
 	driveReservedInflight = 2
 	driveTailInflight     = 6
 	slotHeaderAttempts    = 4
