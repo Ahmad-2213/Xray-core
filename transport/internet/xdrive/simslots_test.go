@@ -1770,3 +1770,23 @@ func TestSlotTailsParkWhenIdle(t *testing.T) {
 		t.Fatalf("far slots resumed after %v, want <= 500ms", d)
 	}
 }
+
+func TestSlotMediumPayloadSplitsInline(t *testing.T) {
+	p := simSlotParams(262144, 16)
+	client, server, store := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	server.writer.mu.Lock()
+	server.writer.segBytes = p.segmentBytes
+	server.writer.mu.Unlock()
+	const size = 50 * 1024
+	if _, err := server.Write(make([]byte, size)); err != nil {
+		t.Fatal(err)
+	}
+	if err := simReadN(t, client, size); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, bodies, _, _ := store.counters(); bodies != 0 {
+		t.Fatalf("bodies = %d, want 0: a 50 KiB flush should travel as inline slices", bodies)
+	}
+}

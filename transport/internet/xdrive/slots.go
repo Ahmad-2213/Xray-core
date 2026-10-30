@@ -18,6 +18,7 @@ const (
 	slotMagic       = "XDRVSL02"
 	slotMagicV1     = "XDRVSL01"
 	slotInlineLimit = 14 * 1024
+	slotSplitLimit  = 4 * slotInlineLimit
 	slotDepthLimit  = 16
 
 	slotModeInline = 1
@@ -429,7 +430,11 @@ func (w *slotWriter) flushLocked() error {
 			n = len(w.buf)
 		}
 	}
-	part := n < w.segBytes
+	split := n > slotInlineLimit && n <= slotSplitLimit && cap(w.slots)-len(w.slots) >= (n+slotInlineLimit-1)/slotInlineLimit
+	if split {
+		n = slotInlineLimit
+	}
+	part := n < w.segBytes && !split
 
 	chunk := make([]byte, n)
 	copy(chunk, w.buf[:n])
@@ -465,6 +470,9 @@ func (w *slotWriter) flushLocked() error {
 	go w.upload(id, seq, chunk, part)
 
 	w.mu.Lock()
+	if split && len(w.buf) > 0 {
+		return w.flushLocked()
+	}
 	return nil
 }
 
