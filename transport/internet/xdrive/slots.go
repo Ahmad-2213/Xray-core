@@ -857,6 +857,10 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 				continue
 			}
 		}
+		readCtx := r.ctx
+		if !head {
+			readCtx = context.WithValue(r.ctx, tailMark{}, true)
+		}
 		var (
 			frame slotFrame
 			ok    bool
@@ -865,7 +869,7 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 		if head && r.tune.hedgeTick > 0 {
 			frame, ok, err = r.readPipelined(seq)
 		} else {
-			frame, ok, err = r.store.readSlot(r.ctx, r.slotID(seq))
+			frame, ok, err = r.store.readSlot(readCtx, r.slotID(seq))
 		}
 		if err == nil && ok && frame.Seq == seq {
 			switch frame.Mode {
@@ -876,7 +880,7 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			case slotModeInline:
 				f.body = frame.Data
 			case slotModeMedia:
-				body, berr := r.store.readSlotBody(r.ctx, r.slotID(seq))
+				body, berr := r.store.readSlotBody(readCtx, r.slotID(seq))
 				if berr != nil {
 					if !r.hold(backoff, ceiling, head) {
 						return
@@ -942,6 +946,8 @@ type slotRead struct {
 	ok    bool
 	err   error
 }
+
+type tailMark struct{}
 
 func (r *slotReader) hot() bool {
 	r.mu.Lock()

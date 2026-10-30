@@ -49,6 +49,12 @@ type fakeDrive struct {
 	createStatus     int
 	mediaUploads     int
 	multipartUploads int
+	hold             time.Duration
+	holdPrefix       string
+	inflight         int
+	maxInflight      int
+	starts           int
+	lastStart        time.Time
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -71,7 +77,25 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 			drive.mu.Lock()
 			drive.hosts[r.Host] = true
 			drive.addrs[r.RemoteAddr] = true
+			hold := drive.hold
+			if drive.holdPrefix != "" && !strings.HasPrefix(r.URL.Path, drive.holdPrefix) {
+				hold = 0
+			}
+			drive.starts++
+			drive.lastStart = time.Now()
 			drive.mu.Unlock()
+			if hold > 0 {
+				drive.mu.Lock()
+				drive.inflight++
+				if drive.inflight > drive.maxInflight {
+					drive.maxInflight = drive.inflight
+				}
+				drive.mu.Unlock()
+				time.Sleep(hold)
+				drive.mu.Lock()
+				drive.inflight--
+				drive.mu.Unlock()
+			}
 			next(w, r)
 		}
 	}
@@ -1361,6 +1385,71 @@ func TestSlotReadSurvivesStalledAttempt(t *testing.T) {
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("readSlot took %v, want the stalled attempt cut short", d)
 	}
+}
+
+func TestTailReadsAreCapped(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	id, err := storage.makeSlot(ctx, "streams/tailcap/s0")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+
+	drive.mu.Lock()
+	drive.hold = 100 * time.Millisecond
+	drive.holdPrefix = "/files/" + id
+	wave := drive.starts
+	drive.mu.Unlock()
+	var pending sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		marked := context.WithValue(ctx, tailMark{}, true)
+		pending.Add(1)
+		go func() {
+			defer pending.Done()
+			_, _, _ = storage.readSlot(marked, id)
+		}()
+	}
+	waitFor(t, "the tail wave to reach the fake Drive", func() bool {
+		drive.mu.Lock()
+		defer drive.mu.Unlock()
+		return drive.starts >= wave+driveTailInflight
+	})
+	drive.mu.Lock()
+	peak := drive.maxInflight
+	drive.mu.Unlock()
+	if peak > driveTailInflight {
+		t.Fatalf("max concurrent tail requests = %d, want <= %d", peak, driveTailInflight)
+	}
+	if peak == 0 {
+		t.Fatal("no tail requests reached the fake Drive")
+	}
+
+	drive.mu.Lock()
+	before := drive.starts
+	drive.mu.Unlock()
+	issued := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := storage.readSlot(ctx, id)
+		done <- err
+	}()
+	waitFor(t, "the unmarked read to start", func() bool {
+		drive.mu.Lock()
+		defer drive.mu.Unlock()
+		return drive.starts > before
+	})
+	drive.mu.Lock()
+	arrived := drive.lastStart
+	drive.mu.Unlock()
+	if d := arrived.Sub(issued); d > 50*time.Millisecond {
+		t.Fatalf("the unmarked read started after %v, want <= 50ms", d)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("unmarked readSlot: %v", err)
+	}
+	pending.Wait()
 }
 
 func TestSlotMediaSingleRequest(t *testing.T) {

@@ -26,6 +26,7 @@ const (
 	driveMaxAttempts      = 8
 	driveMaxInflight      = 32
 	driveReservedInflight = 2
+	driveTailInflight     = 6
 	slotHeaderAttempts    = 4
 	driveInlineLimit      = 16 * 1024
 	driveTimeout          = 60 * time.Second
@@ -88,6 +89,7 @@ type driveStorage struct {
 
 	inflight chan struct{}
 	reserved chan struct{}
+	tails    chan struct{}
 
 	coolMu    sync.Mutex
 	coolUntil time.Time
@@ -145,6 +147,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		backoff:      driveInitialBackoff,
 		inflight:     make(chan struct{}, driveMaxInflight),
 		reserved:     make(chan struct{}, driveReservedInflight),
+		tails:        make(chan struct{}, driveTailInflight),
 		ids:          make(map[string]string),
 		lists: make(map[string]struct {
 			entries []Entry
@@ -306,6 +309,15 @@ func (s *driveStorage) doBudgetPooled(ctx context.Context, method, target, conte
 		defer cancel()
 	}
 
+	if ctx.Value(tailMark{}) != nil && s.tails != nil {
+		select {
+		case s.tails <- struct{}{}:
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		}
+		defer func() { <-s.tails }()
+	}
+
 	s.coolMu.Lock()
 	until := s.coolUntil
 	s.coolMu.Unlock()
@@ -347,10 +359,14 @@ func (s *driveStorage) doBudgetPooled(ctx context.Context, method, target, conte
 		if reserved {
 			pool = s.reserved
 		}
+		waited := time.Now()
 		select {
 		case pool <- struct{}{}:
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
+		}
+		if d := time.Since(waited); d > 100*time.Millisecond {
+			errors.LogDebug(ctx, "xdrive drive pool wait ", d, " method=", method, " reserved=", reserved)
 		}
 
 		var reader io.Reader
