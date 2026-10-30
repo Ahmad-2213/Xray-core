@@ -670,6 +670,7 @@ type slotReader struct {
 
 	ch   chan []byte
 	wake chan struct{}
+	kick chan struct{}
 
 	mu          sync.Mutex
 	seq         int64
@@ -703,12 +704,35 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 
 func (r *slotReader) Wake() {
 	r.mu.Lock()
-	r.lastHit = time.Now()
+	r.touch()
 	r.mu.Unlock()
 	select {
 	case r.wake <- struct{}{}:
 	default:
 	}
+}
+
+func (r *slotReader) touch() {
+	if r.kick == nil {
+		r.kick = make(chan struct{})
+	}
+	if time.Since(r.lastHit) > r.eagerWindow {
+		close(r.kick)
+		r.kick = make(chan struct{})
+	}
+	r.lastHit = time.Now()
+}
+
+func (r *slotReader) parked(seq int64) <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.eagerWindow <= 0 || r.seq >= seq-1 || time.Since(r.lastHit) <= r.eagerWindow {
+		return nil
+	}
+	if r.kick == nil {
+		r.kick = make(chan struct{})
+	}
+	return r.kick
 }
 
 func (r *slotReader) slotID(seq int64) string {
@@ -822,12 +846,23 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			ceiling = backoff
 		}
 		wasHead = head
+		if !head {
+			if ch := r.parked(seq); ch != nil {
+				select {
+				case <-ch:
+				case <-r.ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+		}
 		var (
 			frame slotFrame
 			ok    bool
 			err   error
 		)
-		if head && r.tune.hedgeTick > 0 && r.hot() {
+		if head && r.tune.hedgeTick > 0 {
 			frame, ok, err = r.readPipelined(seq)
 		} else {
 			frame, ok, err = r.store.readSlot(r.ctx, r.slotID(seq))
@@ -843,20 +878,20 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			case slotModeMedia:
 				body, berr := r.store.readSlotBody(r.ctx, r.slotID(seq))
 				if berr != nil {
-					if !r.hold(backoff, ceiling) {
+					if !r.hold(backoff, ceiling, head) {
 						return
 					}
 					continue
 				}
 				if frame.Checked && (len(body) != frame.Len || crc32.ChecksumIEEE(body) != frame.Crc) {
-					if !r.hold(backoff, ceiling) {
+					if !r.hold(backoff, ceiling, head) {
 						return
 					}
 					continue
 				}
 				f.body = body
 			default:
-				if !r.hold(backoff, ceiling) {
+				if !r.hold(backoff, ceiling, head) {
 					return
 				}
 				continue
@@ -896,7 +931,7 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 				backoff = ceiling
 			}
 		}
-		if !r.hold(backoff, ceiling) {
+		if !r.hold(backoff, ceiling, head) {
 			return
 		}
 	}
@@ -1001,11 +1036,11 @@ func (r *slotReader) sleep(d time.Duration) bool {
 func (r *slotReader) armed() {
 	r.noteInterval()
 	r.mu.Lock()
-	r.lastHit = time.Now()
+	r.touch()
 	r.mu.Unlock()
 }
 
-func (r *slotReader) hold(d, ceiling time.Duration) bool {
+func (r *slotReader) hold(d, ceiling time.Duration, head bool) bool {
 	r.mu.Lock()
 	if time.Since(r.lastHit) > r.eagerWindow && ceiling < r.maxPollInterval {
 		ceiling = r.maxPollInterval
@@ -1018,12 +1053,16 @@ func (r *slotReader) hold(d, ceiling time.Duration) bool {
 	if d < 5*time.Millisecond {
 		d = 5 * time.Millisecond
 	}
+	var wake <-chan struct{}
+	if head {
+		wake = r.wake
+	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-r.ctx.Done():
 		return false
-	case <-r.wake:
+	case <-wake:
 		return true
 	case <-timer.C:
 		return true

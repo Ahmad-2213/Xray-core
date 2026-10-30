@@ -1657,3 +1657,116 @@ func TestSlotPipelinedHeadPollGivesUp(t *testing.T) {
 		t.Fatal("readPipelined did not return after its budget")
 	}
 }
+
+type parkStore struct {
+	slotStore
+	mu     sync.Mutex
+	frames map[string]slotFrame
+	calls  map[string]int
+}
+
+func newParkStore() *parkStore {
+	return &parkStore{frames: make(map[string]slotFrame), calls: make(map[string]int)}
+}
+
+func (p *parkStore) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.frames[id] = newInlineFrame(seq, data)
+	return nil
+}
+
+func (p *parkStore) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls[id]++
+	frame, ok := p.frames[id]
+	if !ok {
+		return slotFrame{}, false, errNotFound
+	}
+	return frame, true, nil
+}
+
+func (p *parkStore) count(id string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls[id]
+}
+
+func (p *parkStore) snapshot() map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]int, len(p.calls))
+	for id, n := range p.calls {
+		out[id] = n
+	}
+	return out
+}
+
+func TestSlotTailsParkWhenIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newParkStore()
+	p := simSlotParams(slotInlineLimit, 6)
+	p.eagerWindow = 100 * time.Millisecond
+	table := slotTable{Slots: []string{"s0", "s1", "s2", "s3", "s4", "s5"}}
+	if err := store.writeSlot(ctx, "s0", 0, slotModeInline, []byte("warm")); err != nil {
+		t.Fatalf("warm write: %v", err)
+	}
+	r := &slotReader{
+		ctx:   ctx,
+		store: store,
+		table: table,
+		tune: slotTiming{
+			huntFloor:       20 * time.Millisecond,
+			huntCeiling:     150 * time.Millisecond,
+			tailMin:         200 * time.Millisecond,
+			tailMax:         400 * time.Millisecond,
+			fetchAhead:      6,
+			notFoundTimeout: time.Minute,
+		},
+		params:    p,
+		ch:        make(chan []byte, 8),
+		wake:      make(chan struct{}, 1),
+		acked:     -1,
+		ackWanted: -1,
+		lastHit:   time.Now(),
+	}
+	go r.run()
+	select {
+	case <-r.ch:
+	case <-time.After(time.Second):
+		t.Fatal("warm segment not delivered")
+	}
+
+	time.Sleep(600 * time.Millisecond)
+	before := store.snapshot()
+	time.Sleep(300 * time.Millisecond)
+	after := store.snapshot()
+	for _, seq := range []int64{3, 4, 5, 6} {
+		id := table.Slots[int(seq)%len(table.Slots)]
+		if d := after[id] - before[id]; d > 2 {
+			t.Fatalf("parked slot %s (seq %d) grew by %d calls, want <= 2", id, seq, d)
+		}
+	}
+	if d := after["s1"] - before["s1"]; d <= 0 {
+		t.Fatal("head slot calls did not grow while tails were parked")
+	}
+
+	if err := store.writeSlot(ctx, "s1", 1, slotModeInline, []byte("wake")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	published := time.Now()
+	waitFor(t, "far slots to resume", func() bool {
+		for _, seq := range []int64{3, 4, 5, 6} {
+			id := table.Slots[int(seq)%len(table.Slots)]
+			if store.count(id) > after[id] {
+				return true
+			}
+		}
+		return false
+	})
+	if d := time.Since(published); d > 500*time.Millisecond {
+		t.Fatalf("far slots resumed after %v, want <= 500ms", d)
+	}
+}
