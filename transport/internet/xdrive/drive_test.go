@@ -1282,6 +1282,87 @@ func TestMetaWriteSurvivesSlowAttempt(t *testing.T) {
 	}
 }
 
+func TestSlotReadSurvivesStalledAttempt(t *testing.T) {
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+
+	id, err := storage.makeSlot(ctx, "streams/stallread/s0")
+	if err != nil {
+		t.Fatalf("makeSlot: %v", err)
+	}
+	if err := storage.writeSlot(ctx, id, 0, slotModeInline, []byte("x")); err != nil {
+		t.Fatalf("writeSlot: %v", err)
+	}
+
+	fakeAddr := strings.TrimPrefix(drive.server.URL, "http://")
+	ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	var mu sync.Mutex
+	conns := 0
+	go func() {
+		for {
+			downstream, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns++
+			first := conns == 1
+			mu.Unlock()
+			if first {
+				go func() {
+					time.Sleep(2 * time.Second)
+					downstream.Close()
+				}()
+				continue
+			}
+			upstream, err := stdnet.Dial("tcp", fakeAddr)
+			if err != nil {
+				downstream.Close()
+				continue
+			}
+			go func() {
+				io.Copy(upstream, downstream)
+				upstream.Close()
+				downstream.Close()
+			}()
+			go func() {
+				io.Copy(downstream, upstream)
+				upstream.Close()
+				downstream.Close()
+			}()
+		}
+	}()
+
+	previousFilesURL := storage.filesURL
+	previousAttempt := slotReadAttemptTimeout
+	previousFastWait := driveFastRetryWait
+	storage.filesURL = "http://" + ln.Addr().String() + "/files"
+	slotReadAttemptTimeout = 150 * time.Millisecond
+	driveFastRetryWait = 5 * time.Millisecond
+	t.Cleanup(func() {
+		storage.filesURL = previousFilesURL
+		slotReadAttemptTimeout = previousAttempt
+		driveFastRetryWait = previousFastWait
+	})
+
+	start := time.Now()
+	frame, ok, err := storage.readSlot(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("readSlot: %v ok=%v", ok, err)
+	}
+	if frame.Seq != 0 {
+		t.Fatalf("read seq %d, want 0", frame.Seq)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("readSlot took %v, want the stalled attempt cut short", d)
+	}
+}
+
 func TestSlotMediaSingleRequest(t *testing.T) {
 	drive := newFakeDrive(t)
 	storage := newDriveBackend(t)

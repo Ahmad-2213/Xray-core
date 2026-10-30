@@ -65,6 +65,9 @@ var (
 
 	driveMetaAttemptTimeout = 10 * time.Second
 	driveMetaTotalTimeout   = 60 * time.Second
+
+	slotReadAttemptTimeout  = 3 * time.Second
+	slotWriteAttemptTimeout = 5 * time.Second
 )
 
 type driveStorage struct {
@@ -988,9 +991,9 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 		if err != nil {
 			return errors.New("failed to build the slot update").Base(err)
 		}
-		status, payload, err := s.doMetaWrite(ctx, http.MethodPatch,
+		status, payload, err := s.doBudget(ctx, http.MethodPatch,
 			s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
-			"application/json; charset=UTF-8", body)
+			"application/json; charset=UTF-8", body, slotWriteAttemptTimeout, driveMetaTotalTimeout)
 		if err != nil {
 			return err
 		}
@@ -1044,8 +1047,9 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 }
 
 func (s *driveStorage) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
-	status, payload, err := s.doMeta(ctx, http.MethodGet,
-		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
+	status, payload, err := s.doBudget(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil,
+		slotReadAttemptTimeout, queryTotalTimeout)
 	if err != nil {
 		return slotFrame{}, false, err
 	}
@@ -1088,7 +1092,7 @@ func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64)
 	status, payload, err := s.doBudgetReserved(ctx, http.MethodPatch,
 		s.filesURL+"/"+url.PathEscape(id)+"?fields=id&supportsAllDrives=true",
 		"application/json; charset=UTF-8", body,
-		driveMetaAttemptTimeout, driveMetaTotalTimeout)
+		slotWriteAttemptTimeout, driveMetaTotalTimeout)
 	if err != nil {
 		return err
 	}
@@ -1099,8 +1103,9 @@ func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64)
 }
 
 func (s *driveStorage) readWatermark(ctx context.Context, id string) (int64, error) {
-	status, payload, err := s.doMeta(ctx, http.MethodGet,
-		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
+	status, payload, err := s.doBudget(ctx, http.MethodGet,
+		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil,
+		slotReadAttemptTimeout, queryTotalTimeout)
 	if err != nil {
 		return -1, err
 	}
