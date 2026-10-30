@@ -1561,3 +1561,27 @@ func TestSlotJumpsBeforeRingFull(t *testing.T) {
 		t.Fatalf("segBytes = %d, want %d", got, p.segmentBytes)
 	}
 }
+
+func TestSlotRampWaitsForFullRing(t *testing.T) {
+	p := simSlotParams(262144, 16)
+	client, server, _ := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	go func() {
+		chunk := make([]byte, slotInlineLimit)
+		for i := 0; i < 8; i++ {
+			if _, err := server.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	if err := simReadN(t, client, 8*slotInlineLimit); err != nil {
+		t.Fatal(err)
+	}
+	server.writer.mu.Lock()
+	got := server.writer.segBytes
+	server.writer.mu.Unlock()
+	if got != slotInlineLimit {
+		t.Fatalf("segBytes = %d, want %d", got, slotInlineLimit)
+	}
+}

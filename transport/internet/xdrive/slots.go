@@ -437,7 +437,7 @@ func (w *slotWriter) flushLocked() error {
 
 	if !part && n == w.segBytes && w.segBytes < w.segmentBytes {
 		w.ramped++
-		if w.ramped >= inlineRampSegments {
+		if w.ramped >= len(w.table.Slots) {
 			w.ramped = 0
 			if m := w.segBytes * 2; m <= w.segmentBytes {
 				w.segBytes = m
