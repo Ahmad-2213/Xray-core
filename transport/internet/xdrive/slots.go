@@ -949,6 +949,8 @@ func (r *slotReader) readPipelined(seq int64) (slotFrame, bool, error) {
 			if outstanding < 2 && time.Now().Before(deadline) {
 				launch()
 				outstanding++
+			} else if outstanding == 0 {
+				return last.frame, last.ok, nil
 			}
 		case <-r.ctx.Done():
 			return slotFrame{}, false, r.ctx.Err()

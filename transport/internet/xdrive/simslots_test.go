@@ -1632,3 +1632,28 @@ func TestSlotPipelinedHeadPoll(t *testing.T) {
 		t.Fatalf("max concurrent reads = %d, want 2", m)
 	}
 }
+
+func TestSlotPipelinedHeadPollGivesUp(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &hedgeStore{t0: time.Now(), hitAfter: time.Hour, lat: 40 * time.Millisecond}
+	r := &slotReader{
+		ctx:   ctx,
+		store: store,
+		table: slotTable{Slots: []string{"a", "b"}},
+		tune:  slotTiming{hedgeTick: 100 * time.Millisecond, hedgeBudget: 380 * time.Millisecond},
+	}
+	done := make(chan bool, 1)
+	go func() {
+		_, ok, err := r.readPipelined(7)
+		done <- !ok && err == nil
+	}()
+	select {
+	case good := <-done:
+		if !good {
+			t.Fatal("expected a clean miss after the budget")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readPipelined did not return after its budget")
+	}
+}
