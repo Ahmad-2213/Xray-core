@@ -1790,3 +1790,51 @@ func TestSlotMediumPayloadSplitsInline(t *testing.T) {
 		t.Fatalf("bodies = %d, want 0: a 50 KiB flush should travel as inline slices", bodies)
 	}
 }
+
+type markStore struct {
+	slotStore
+	frame  slotFrame
+	body   []byte
+	marked atomic.Bool
+}
+
+func (m *markStore) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	return m.frame, true, nil
+}
+
+func (m *markStore) readSlotBody(ctx context.Context, id string) ([]byte, error) {
+	m.marked.Store(ctx.Value(tailMark{}) != nil)
+	return m.body, nil
+}
+
+func TestSlotTailBodyIsNotTailMarked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body := []byte("0123456789")
+	store := &markStore{frame: newMediaFrame(1, body), body: body}
+	r := &slotReader{
+		ctx:   ctx,
+		store: store,
+		table: slotTable{Slots: []string{"a", "b"}},
+		tune: slotTiming{
+			huntFloor:       5 * time.Millisecond,
+			huntCeiling:     10 * time.Millisecond,
+			tailMin:         10 * time.Millisecond,
+			tailMax:         20 * time.Millisecond,
+			notFoundTimeout: time.Minute,
+		},
+	}
+	f := &slotFetch{ready: make(chan struct{})}
+	go r.collect(1, 1, f)
+	select {
+	case <-f.ready:
+	case <-time.After(time.Second):
+		t.Fatal("tail segment was not fetched")
+	}
+	if f.err != nil || string(f.body) != string(body) {
+		t.Fatalf("tail segment: body %q err %v", f.body, f.err)
+	}
+	if store.marked.Load() {
+		t.Fatal("a body download must not use the tail request pool")
+	}
+}

@@ -888,7 +888,7 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			case slotModeInline:
 				f.body = frame.Data
 			case slotModeMedia:
-				body, berr := r.store.readSlotBody(readCtx, r.slotID(seq))
+				body, berr := r.store.readSlotBody(r.ctx, r.slotID(seq))
 				if berr != nil {
 					if !r.hold(backoff, ceiling, head) {
 						return
