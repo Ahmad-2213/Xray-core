@@ -42,6 +42,8 @@ var (
 	slotWatermarkTTL    = 100 * time.Millisecond
 	slotStallTimeout    = 60 * time.Second
 	slotCloseGrace      = 10 * time.Second
+	slotHedgeTick       = 250 * time.Millisecond
+	slotHedgeBudget     = time.Second
 )
 
 type slotTiming struct {
@@ -56,6 +58,8 @@ type slotTiming struct {
 	tailMax         time.Duration
 	fetchAhead      int
 	notFoundTimeout time.Duration
+	hedgeTick       time.Duration
+	hedgeBudget     time.Duration
 }
 
 func takeSlotTiming() slotTiming {
@@ -71,6 +75,8 @@ func takeSlotTiming() slotTiming {
 		tailMax:         slotTailMax,
 		fetchAhead:      slotFetchAhead,
 		notFoundTimeout: slotNotFoundTimeout,
+		hedgeTick:       slotHedgeTick,
+		hedgeBudget:     slotHedgeBudget,
 	}
 }
 
@@ -816,7 +822,16 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			ceiling = backoff
 		}
 		wasHead = head
-		frame, ok, err := r.store.readSlot(r.ctx, r.slotID(seq))
+		var (
+			frame slotFrame
+			ok    bool
+			err   error
+		)
+		if head && r.tune.hedgeTick > 0 && r.hot() {
+			frame, ok, err = r.readPipelined(seq)
+		} else {
+			frame, ok, err = r.store.readSlot(r.ctx, r.slotID(seq))
+		}
 		if err == nil && ok && frame.Seq == seq {
 			switch frame.Mode {
 			case slotModeEnd:
@@ -883,6 +898,60 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 		}
 		if !r.hold(backoff, ceiling) {
 			return
+		}
+	}
+}
+
+type slotRead struct {
+	frame slotFrame
+	ok    bool
+	err   error
+}
+
+func (r *slotReader) hot() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return time.Since(r.lastHit) < r.eagerWindow
+}
+
+func (r *slotReader) readPipelined(seq int64) (slotFrame, bool, error) {
+	id := r.slotID(seq)
+	ctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+
+	results := make(chan slotRead, 32)
+	launch := func() {
+		go func() {
+			frame, ok, err := r.store.readSlot(ctx, id)
+			results <- slotRead{frame: frame, ok: ok, err: err}
+		}()
+	}
+
+	deadline := time.Now().Add(r.tune.hedgeBudget)
+	ticker := time.NewTicker(r.tune.hedgeTick)
+	defer ticker.Stop()
+
+	launch()
+	outstanding := 1
+	var last slotRead
+	for {
+		select {
+		case res := <-results:
+			outstanding--
+			if res.err != nil || (res.ok && res.frame.Seq == seq) {
+				return res.frame, res.ok, res.err
+			}
+			last = res
+			if outstanding == 0 && !time.Now().Before(deadline) {
+				return last.frame, last.ok, nil
+			}
+		case <-ticker.C:
+			if outstanding < 2 && time.Now().Before(deadline) {
+				launch()
+				outstanding++
+			}
+		case <-r.ctx.Done():
+			return slotFrame{}, false, r.ctx.Err()
 		}
 	}
 }

@@ -1585,3 +1585,50 @@ func TestSlotRampWaitsForFullRing(t *testing.T) {
 		t.Fatalf("segBytes = %d, want %d", got, slotInlineLimit)
 	}
 }
+
+type hedgeStore struct {
+	slotStore
+	t0       time.Time
+	hitAfter time.Duration
+	lat      time.Duration
+	cur      int32
+	max      int32
+}
+
+func (h *hedgeStore) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	start := time.Since(h.t0)
+	n := atomic.AddInt32(&h.cur, 1)
+	defer atomic.AddInt32(&h.cur, -1)
+	for {
+		m := atomic.LoadInt32(&h.max)
+		if n <= m || atomic.CompareAndSwapInt32(&h.max, m, n) {
+			break
+		}
+	}
+	select {
+	case <-time.After(h.lat):
+	case <-ctx.Done():
+		return slotFrame{}, false, ctx.Err()
+	}
+	if start >= h.hitAfter {
+		return newInlineFrame(7, []byte("x")), true, nil
+	}
+	return slotFrame{}, false, nil
+}
+
+func TestSlotPipelinedHeadPoll(t *testing.T) {
+	store := &hedgeStore{t0: time.Now(), hitAfter: 30 * time.Millisecond, lat: 80 * time.Millisecond}
+	r := &slotReader{
+		ctx:   context.Background(),
+		store: store,
+		table: slotTable{Slots: []string{"a", "b"}},
+		tune:  slotTiming{hedgeTick: 20 * time.Millisecond, hedgeBudget: time.Second},
+	}
+	frame, ok, err := r.readPipelined(7)
+	if err != nil || !ok || frame.Seq != 7 {
+		t.Fatalf("got frame %d ok=%v err=%v, want seq 7", frame.Seq, ok, err)
+	}
+	if m := atomic.LoadInt32(&store.max); m != 2 {
+		t.Fatalf("max concurrent reads = %d, want 2", m)
+	}
+}
